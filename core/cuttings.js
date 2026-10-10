@@ -1,0 +1,170 @@
+'use strict';
+
+/**
+ * 从"保留区间"推导实际执行的切割计划。
+ *
+ * 切割计划项：
+ * {
+ *   kind: 'copy' | 'reencode',
+ *   start: number,      // 源上的入点（秒）
+ *   duration: number,   // 时长（秒）→ 传给 ffmpeg -t
+ *   snapFrom: number,   // 用户原始选择的区间起点（UI 提示"少掉多少"用）
+ *   keepEnd: number,    // 用户原始选择的区间终点
+ *   note?: string
+ * }
+ *
+ * 语义（已用 ffmpeg N-113109 实测确认，见 docs/02-技术方案.md §3）：
+ *  - 入点：前移到 ≤ start 的最后一个关键帧。非关键帧入点交给 ffmpeg 只会**更晚**开始
+ *    （实测 -ss 3.4 → 实际从 4.0 起），所以必须自己吸附，否则用户想删的开头会被带出去。
+ *  - 出点：只需要时长。帧会被"多带一帧"，时长可精确指定，无需吸附到关键帧。
+ *  - 精确模式：只把 [start, 下一个关键帧) 这一小段重编码，其余流拷贝再拼接。
+ */
+
+const { snap, EPS } = require('./segments');
+
+/**
+ * @param {Array<{start:number,end:number}>} keeps 已规整的保留区间
+ * @param {{keyframes:number[], precise:boolean, duration:number}} opts
+ * @returns {{plan:Array, warnings:string[]}}
+ */
+function buildPlan(keeps, opts) {
+  const { keyframes = [], precise = false, duration, fps } = opts;
+  const fpsNum = Number(fps) > 0 ? Number(fps) : null;
+  // 帧长一律按"第 N 帧 = N/fps 秒"推导：1/30 = 0.0333… 用定点小数会引入误差，
+  // 产生 .310 / .014 这类看着像整帧其实不是的时刻，concat 时仍会落半格。
+  const roundToFrames = (sec) => (fpsNum ? snap(Math.round(sec * fpsNum) / fpsNum) : snap(sec));
+  const warnings = [];
+  const plan = [];
+
+  for (const keep of keeps) {
+    const kfStart = lastKeyframeAtMost(keep.start, keyframes);   // ≤ start
+    let start;
+    if (kfStart === null) {
+      // 第一个关键帧晚于入点：只能从 0 开始，这不是"吸附偏差"，是唯一可行解
+      start = 0;
+      warnings.push(`区间起点 ${keep.start.toFixed(3)}s 之前没有关键帧，已从 0 开始（会多出 ${keep.start.toFixed(3)}s 内容）`);
+    } else {
+      start = kfStart;
+    }
+    const end = Math.min(keep.end, Number.isFinite(duration) ? duration : keep.end);
+    if (end - start <= EPS) {
+      warnings.push(`区间 ${keep.start.toFixed(3)}s–${keep.end.toFixed(3)}s 与关键帧对齐后为空，已忽略`);
+      continue;
+    }
+
+    // 吸附只会让起点前移，终点必须仍是用户选的 keep.end。
+    // 时长 = keep.end - start（不是 keep.end - keep.start），否则会把用户已经删掉的开头又导出去。
+    // 取整到整帧：非整帧时长会让 concat 的 PTS 落半格，被就近取整后出现 1 帧回跳。
+    const durationSec = roundToFrames(end - start);
+
+    const headNote = start === 0 && kfStart === null
+      ? '入点之前没有关键帧，从 0 开始'
+      : (start < keep.start - EPS
+        ? `入点已前移至关键帧 ${start.toFixed(3)}s（多 ${(keep.start - start).toFixed(3)}s 内容）`
+        : '入点正好落在关键帧上');
+
+    if (!precise || start >= keep.start - EPS) {
+      plan.push({ kind: 'copy', start, duration: durationSec, snapFrom: keep.start, keepEnd: keep.end, note: headNote });
+      continue;
+    }
+
+    pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames);
+  }
+
+  return { plan: dedupePlan(plan), warnings };
+}
+
+/**
+ * 精确模式：入点侧重编码一小段，其余流拷贝。
+ * @param {(sec:number)=>number} roundToFrames 帧取整函数（由 buildPlan 注入，含 fps）
+ */
+function pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames) {
+  const kfAfter = nextKeyAfter(keep.start, keyframes);
+
+  // 没有更晚的关键帧，或重编码段会吞掉整个区间：整段重编码以换取帧级入点
+  if (kfAfter === null || kfAfter >= end - EPS) {
+    plan.push({
+      kind: 'reencode', start: keep.start, duration: roundToFrames(keep.end - keep.start),
+      snapFrom: keep.start, keepEnd: keep.end, note: '精确模式：区间落在一个 GOP 内，整段有损重编码',
+    });
+    return;
+  }
+
+  // 重编码段时长取整到整帧：否则 concat 时后段首帧 PTS 落在两帧之间，
+  // 被 -video_track_timescale 就近取整后会出现 1 帧 PTS 回跳（实测 2.500→2.467）。
+  plan.push({
+    kind: 'reencode', start: keep.start, duration: roundToFrames(kfAfter - keep.start),
+    snapFrom: keep.start, keepEnd: keep.end, note: '精确模式：入点小段有损重编码',
+  });
+
+  // 精确模式下，[keep.end, 下一个关键帧) 这一段既不属于重编码段也不可被流拷贝，
+  // 只能丢弃。用 keepEnd 标记真实终点，让 UI/自检知道产物比用户选区短。
+  const nextKfEnd = nextKeyAfter(keep.end, keyframes);
+  if (nextKfEnd !== null && nextKfEnd > keep.end + EPS) {
+    warnings.push(
+      `精确模式：出点 ${keep.end.toFixed(3)}s 到下一个关键帧 ${nextKfEnd.toFixed(3)}s 之间的内容无法保留（半个 GOP 既不能拷贝也不值得编码），已丢弃`,
+    );
+  }
+
+  plan.push({
+    kind: 'copy', start: kfAfter, duration: roundToFrames(end - kfAfter),
+    snapFrom: keep.start, keepEnd: keep.end, note: `精确模式：其余部分流拷贝；${headNote}`,
+    actualEnd: keep.end,
+  });
+}
+
+/** ≤ t 的最后一个关键帧。 */
+function lastKeyframeAtMost(t, keyframes) {
+  let best = null;
+  for (const k of keyframes) {
+    if (k <= t + EPS) best = k;
+    else break; // keyframes 已升序
+  }
+  return best;
+}
+
+function nextKeyAfter(t, keyframes) {
+  for (const k of keyframes) {
+    if (k > t + EPS) return k;
+  }
+  return null;
+}
+
+/**
+ * 把相邻的同类段合并，避免生成零长或重复片段。
+ * 相邻 = 前段结束时刻 ≥ 后段开始（允许重叠，不允许留下空洞）。
+ * 同类型合并；不同类型在时间上重叠时，把后段起点对齐到前段结束时刻，
+ * 保证拼接点严格重合，既不空洞也不把同一段内容导出两遍。
+ */
+function dedupePlan(plan) {
+  const out = [];
+  for (const raw of plan) {
+    const prev = out[out.length - 1];
+    if (!prev) {
+      out.push({ ...raw });
+      continue;
+    }
+    const prevEnd = prev.start + prev.duration;
+    const itemEnd = raw.start + raw.duration;
+
+    if (prev.kind === raw.kind && raw.start <= prevEnd + EPS) {
+      // 同类型：吸收后段新增的部分（可能重叠，不重复计算时长）
+      prev.duration = Math.max(prev.duration, itemEnd - prev.start);
+      prev.keepEnd = Math.max(prev.keepEnd, raw.keepEnd);
+      continue;
+    }
+
+    if (raw.start < prevEnd - EPS) {
+      // 不同类型且重叠：后段起点对齐到前段结束时刻
+      const newStart = Math.min(prevEnd, itemEnd);
+      if (itemEnd - newStart <= EPS) continue; // 整段被前段覆盖，丢弃
+      out.push({ ...raw, start: newStart, duration: itemEnd - newStart });
+      continue;
+    }
+
+    out.push({ ...raw });
+  }
+  return out.filter((p) => p.duration > EPS);
+}
+
+module.exports = { buildPlan };

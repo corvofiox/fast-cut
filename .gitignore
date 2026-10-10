@@ -1,0 +1,13 @@
+node_modules/
+vendor/
+out/
+dist/
+*.log
+.env
+.DS_Store
+
+# 测试产物：tmp/ 只保留诊断脚本，视频/中间文件不入库
+tmp/**/*.mp4
+tmp/**/*.txt
+tmp/**/*.csv
+tmp/**/*.ps1
