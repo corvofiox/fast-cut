@@ -8,9 +8,11 @@
 
 const fs = require('fs');
 const path = require('path');
+const { execFileSync } = require('child_process');
 const { app, BrowserWindow } = require('electron');
 
 const { registerIpc } = require('../src/main/api');
+const { resolveBin } = require('../core/ffmpegPath');
 
 // J/K/L 要真的播起来才有速率可查
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -704,8 +706,64 @@ async function main() {
 
   const outs = fs.readdirSync(OUT_DIR);
   check('产物落在指定目录', outs.length > 0, outs.join(', '));
+
+  // 13) remux 换封装：mp4 源出 mkv，自检必须认"所选容器"，不能再拿"与源一致"当判据
+  await js(win, '__smoke.setContainer("mkv"); "ok"');
+  await waitFor('document.getElementById("outExt").textContent === ".mkv"', win);
+  const extShown = await js(win, 'document.getElementById("outExt").textContent');
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'remux'); 'ok'`);
+  await wait(200);
+  res = await runExport(win);
+  const remuxChecks = await js(win,
+    `[...document.querySelectorAll('#checks li')].map((li) => (li.classList.contains('bad') ? '✗' : '✓') + li.textContent).join(' | ')`);
+  check('remux 成 MKV 通过自检',
+    res.ok && extShown === '.mkv' && /容器为所选封装/.test(remuxChecks) && !/容器一致/.test(remuxChecks),
+    `后缀 ${extShown} · ${String(remuxChecks).replace(/\s+/g, ' ').slice(0, 100)}`);
+
+  // 14) 目标装不下的字幕轨：导出前就要在预估里说清楚，导出后整条省略而不是让 ffmpeg 崩
+  const subMkv = ensureSubtitleSource();
+  await js(win, `__smoke.importFile(${JSON.stringify(subMkv)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(subMkv)}`, win);
+  await js(win, '__smoke.setContainer("mp4"); "ok"');
+  const warned = await waitFor('document.getElementById("estimate").textContent.includes("装不下字幕轨")', win);
+  const warnLine = await js(win, 'document.getElementById("estimate").textContent.split("\\n").find((l) => l.includes("字幕")) || ""');
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'remux-sub'); 'ok'`);
+  await wait(200);
+  res = await runExport(win);
+  const subChecks = await js(win,
+    `[...document.querySelectorAll('#checks li')].map((li) => (li.classList.contains('bad') ? '✗' : '✓') + li.textContent).join(' | ')`);
+  check('字幕装不下时整条省略且仍通过自检',
+    warned && res.ok && /容器为所选封装/.test(subChecks) && /✓字幕轨已按所选容器省略/.test(subChecks)
+      && /音轨数量一致/.test(subChecks) && !/字幕轨数量一致/.test(subChecks),
+    `预估「${String(warnLine).trim().slice(0, 46)}」· ${String(subChecks).replace(/\s+/g, ' ').slice(0, 90)}`);
+  await js(win, '__smoke.setContainer("source"); "ok"');
+
   await longFileCheck(win);
   finish(win);
+}
+
+/**
+ * remux 字幕用例的素材：H.264 + 两条 AAC + 一条 subrip。
+ * 只有 mkv 装得下 subrip（实测 mp4 muxer 直接 "Could not find tag for codec subrip"），
+ * 所以它同时是"跟随源"和"换封装省略字幕"两条路的样本。
+ */
+function ensureSubtitleSource() {
+  const out = path.join(ROOT, 'tmp', 'smoke-subtitles.mkv');
+  if (fs.existsSync(out) && fs.statSync(out).size > 10000) return out;
+  const ffmpeg = resolveBin('ffmpeg', [path.join(ROOT, 'vendor', 'ffmpeg')]);
+  const srt = path.join(ROOT, 'tmp', 'smoke-subtitles.srt');
+  fs.writeFileSync(srt, '1\n00:00:00.500 --> 00:00:02.000\n第一条字幕\n\n2\n00:00:04.000 --> 00:00:06.000\n第二条字幕\n');
+  execFileSync(ffmpeg, [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=10',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=10',
+    '-f', 'lavfi', '-i', 'sine=frequency=880:duration=10',
+    '-i', srt,
+    '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:s',
+    '-c:v', 'libx264', '-g', '60', '-keyint_min', '60', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-c:s', 'srt', out,
+  ], { stdio: 'ignore' });
+  return out;
 }
 
 async function runExport(win) {

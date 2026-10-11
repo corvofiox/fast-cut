@@ -370,6 +370,14 @@ button.m-row:hover, label.m-row:hover { background: #23272e; }
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 7px;
 }
 .m-field input[type="text"]:focus { outline: none; border-color: #3b4250; }
+/* 容器下拉与输入框同一长相，只多一个原生箭头 */
+.m-select {
+  font: 12px/1.4 "Cascadia Mono", Consolas, monospace; color: var(--fg);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px;
+  cursor: pointer;
+}
+.m-select:focus { outline: none; border-color: #3b4250; }
+.m-select:disabled { opacity: .45; cursor: not-allowed; }
 /* 勾选框画成拨杆：原生方框在暗面板里像个没画完的控件，和右边的键帽也不是一路的 */
 .m-row input[type="checkbox"] {
   appearance: none; -webkit-appearance: none; position: relative;

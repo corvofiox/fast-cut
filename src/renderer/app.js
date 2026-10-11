@@ -205,6 +205,7 @@ async function refreshEnv() {
   } catch (err) {
     state.env = { ok: false, version: null, settings: {} };
   }
+  paintContainers();
   if (state.env.ok) {
     $('emptyNote').textContent = '导入只读取文件信息（ffprobe 探流 + 扫关键帧），不转码、不复制、不上传。';
   } else {
@@ -212,6 +213,20 @@ async function refreshEnv() {
     toast('内置 ffmpeg 不可用：请完整解压 Fast Cut 目录', 'warn');
   }
   $('btnImportEmpty').disabled = !state.env.ok;
+}
+
+/** 容器下拉：第一项恒为"跟随源"，其余取自 core/containers.js 的白名单（判据只在主进程那份）。 */
+function paintContainers() {
+  const sel = $('outContainer');
+  const keep = sel.value;
+  sel.innerHTML = '';
+  sel.append(new Option('跟随源', 'source'));
+  for (const c of state.env.containers || []) sel.append(new Option(c.label, c.id));
+  sel.value = [].some.call(sel.options, (o) => o.value === keep) ? keep : 'source';
+}
+
+function containerChoice() {
+  return $('outContainer').value || 'source';
 }
 
 // ---------------------------------------------------------------- 导入
@@ -745,6 +760,7 @@ async function runPlan() {
       file: state.src.file,
       segments: state.clips.map((c) => ({ start: c.start, end: c.end })),
       precise: $('optPrecise').checked,
+      container: containerChoice(),
     });
   } catch (err) {
     showError(cleanErr(err));
@@ -815,6 +831,11 @@ function overlapSeconds() {
   return round3(secs);
 }
 
+/** 预估行是 innerHTML 拼的，凡是来自文件元数据/主进程的字样都先过这一道。 */
+function esc(s) {
+  return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+
 function updateEstimate() {
   const box = $('estimate');
   if (!state.src || !state.clips.length) { box.textContent = '—'; return; }
@@ -835,7 +856,15 @@ function updateEstimate() {
   if (state.src.media.video && state.src.media.video.codec === 'hevc' && state.clips.length > 1 && !split) {
     lines.push('⚠ HEVC 开 GOP 多段拼接会被自检拦下，改每段一个文件');
   }
-  if (bytes > 4e9 && ['.mp4', '.mov', '.m4v'].includes(extOf(state.src.file))) lines.push('⚠ 预计 >4GB，建议改用 mkv');
+  // 换封装的代价必须在这里说清楚，而不是等 ffmpeg 报 "Could not find tag for codec"
+  const cont = state.plan && state.plan.container;
+  if (cont) {
+    $('outExt').textContent = cont.ext;
+    const dropped = cont.droppedSubtitles || [];
+    if (dropped.length) {
+      lines.push(`⚠ ${esc(cont.label)} 装不下字幕轨（${esc(dropped.join('、'))}），将整条省略；要保留字幕请选 MKV`);
+    }
+  }
   box.innerHTML = lines.join('<br>');
 }
 
@@ -874,6 +903,7 @@ async function runExport() {
     baseName: $('outName').value,
     precise: $('optPrecise').checked,
     split: $('optSplit').checked,
+    container: containerChoice(),
   };
 
   setBusy(true);
@@ -917,7 +947,7 @@ function setBusy(busy) {
   $('btnExport').classList.toggle('hidden', busy);
   $('btnCancelExport').classList.toggle('hidden', !busy);
   $('btnImportEmpty').disabled = busy;
-  for (const id of ['optPrecise', 'optSplit', 'outName', 'btnChooseDir']) $(id).disabled = busy;
+  for (const id of ['optPrecise', 'optSplit', 'outName', 'outContainer', 'btnChooseDir']) $(id).disabled = busy;
   updateToolButtons();
   updateExportEnabled();
 }
@@ -1282,6 +1312,8 @@ function bindUi() {
     });
   }
 
+  $('outContainer').addEventListener('change', refreshPlan);   // 换容器会改后缀，也可能装不下字幕
+
   $('btnExport').addEventListener('click', runExport);
   $('btnCancelExport').addEventListener('click', cancelExport);
   $('btnReveal').addEventListener('click', () => state.outputs[0] && window.fc.reveal(state.outputs[0]));
@@ -1397,5 +1429,6 @@ window.__smoke = {
   runExport,
   setOption(id, on) { $(id).checked = !!on; $(id).dispatchEvent(new Event('change')); },
   setOut(dir, name) { $('outDir').value = dir; $('outName').value = name; updateExportEnabled(); },
+  setContainer(id) { $('outContainer').value = id; $('outContainer').dispatchEvent(new Event('change')); },
   ready: () => !!window.fc && !!tl,
 };

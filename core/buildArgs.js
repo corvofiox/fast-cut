@@ -7,6 +7,7 @@
 
 const path = require('path');
 const { snap } = require('./segments');
+const { familyOfExt } = require('./containers');
 
 /**
  * 构造单段切割命令。
@@ -18,9 +19,16 @@ const { snap } = require('./segments');
  *    concat 时后段会被接到这个偏短的位置，引发 PTS 错位/回跳。
  *  - `-avoid_negative_ts make_zero` 必须加，否则时间戳不归零，播放器可能显示错乱
  *  - 不要把 `-ss` 放在 -i 之后再用 `-to`：输入定位时 `-to` 会被当成输出总时长
+ *
+ * remux 换容器时由目标文件的扩展名决定 muxer，两处按家族分支：
+ *  - `-display_rotation` 只有 mov muxer 认（写给 mkv 会当非法输出选项整条命令失败）
+ *  - 目标装不下的字幕轨用 `-map -0:s` **整条排除**，而不是让 ffmpeg 报
+ *    "Could not find tag for codec subrip"；也不改成 `-c:s mov_text` 偷偷转码
  */
 function argsForSegment(item, media, outPath, opts = {}) {
   const args = ['-hide_banner', '-loglevel', 'error', '-y'];
+  const family = familyOfExt(path.extname(outPath));
+  const mapArgs = opts.dropSubtitles ? ['-map', '0', '-map', '-0:s'] : ['-map', '0'];
   args.push('-ss', fmtTime(item.start));
   args.push('-i', media.file);
 
@@ -39,19 +47,19 @@ function argsForSegment(item, media, outPath, opts = {}) {
     // 与重编码段保持同一时间轴刻度，否则 concat 混拼会把帧率拉歪
     // 单段时间基无需干预：各段输出都是规整的 30/1，歪帧发生在 concat 阶段，
     // 由 argsForConcat 的 -video_track_timescale 统一修正（实测 ts=15360 无效、ts=fps 有效）。
-    args.push('-map', '0');                       // 保留全部音轨 / 字幕轨
+    args.push(...mapArgs);                        // 保留全部音轨 / 字幕轨
     args.push('-map_metadata', '0');             // 保留元数据与章节
     args.push('-dn');                            // 丢弃数据轨（章节附件字体常导致失败）
-    if (media.rotation && media.rotation !== 0) {
+    if (media.rotation && media.rotation !== 0 && family === 'mov') {
       args.push('-display_rotation', 'copy');    // 保留旋转信息，避免竖屏视频方向错乱
     }
   } else {
     const codec = pickVideoCodec(media, opts);
-    args.push('-map', '0');
+    args.push(...mapArgs);
     args.push('-map_metadata', '0');
     args.push('-c:v', codec);
     args.push('-c:a', 'copy');
-    args.push('-c:s', 'copy');
+    if (!opts.dropSubtitles) args.push('-c:s', 'copy');
     args.push('-crf', String(opts.crf ?? 18));
     args.push(...speedArgs(codec));
     // 精确模式的小段用同 profile 编码，减少与源不一致造成的兼容问题

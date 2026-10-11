@@ -7,6 +7,7 @@
 
 const { run } = require('./probe');
 const { snap } = require('./segments');
+const { familyOfFormat } = require('./containers');
 
 /**
  * @param {string} ffmpegPath  ffmpeg 可执行文件（全量解码校验用）
@@ -38,7 +39,15 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
   const sName = String(srcMeta.format.format_name || '');
   const oName = String(outMeta.format.format_name || '');
   const sameContainer = sName.split(',').some((n) => oName.split(',').includes(n));
-  add('容器一致', sameContainer, `源 ${sName} → 导出 ${oName}`);
+  if (expect.container) {
+    // remux 换封装是用户主动选的，这时"和源不一致"才是对的：只比对目标家族
+    const want = expect.container;
+    const got = familyOfFormat(oName);
+    add('容器为所选封装', got === want.family,
+      `所选 ${want.label}（${want.ext}）→ 导出 ${oName}${sameContainer ? '' : `，与源 ${sName} 不同`}`);
+  } else {
+    add('容器一致', sameContainer, `源 ${sName} → 导出 ${oName}`);
+  }
 
   const sVideo = first(srcMeta.streams, 'video');
   const oVideo = first(outMeta.streams, 'video');
@@ -70,7 +79,14 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
 
   const sSubs = all(srcMeta.streams, 'subtitle').length;
   const oSubs = all(outMeta.streams, 'subtitle').length;
-  if (sSubs > 0) add('字幕轨数量一致', sSubs === oSubs, `源 ${sSubs} → 导出 ${oSubs}`);
+  if (sSubs > 0) {
+    if (expect.dropSubtitles) {
+      add('字幕轨已按所选容器省略', oSubs === 0,
+        `源 ${sSubs} 条装不进所选容器，导出 ${oSubs} 条（要保留字幕请选 MKV）`);
+    } else {
+      add('字幕轨数量一致', sSubs === oSubs, `源 ${sSubs} → 导出 ${oSubs}`);
+    }
+  }
 
   // 时长：关键帧吸附只会让产物变长（多带内容），绝不会变短。
   // 因此只校验下界；上界留足一个 GOP 的余量。

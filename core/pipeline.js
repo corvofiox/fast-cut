@@ -133,6 +133,7 @@ async function exportSegments(loaded, segments, opts) {
   const { file, media, bins } = loaded;
   const {
     outPath, precise = false, split = false, crf = 18, ordered = false,
+    dropSubtitles = false, container = null,
     onProgress = () => {}, token = createToken(),
   } = opts;
 
@@ -156,7 +157,7 @@ async function exportSegments(loaded, segments, opts) {
     for (let i = 0; i < plan.length; i++) {
       const item = plan[i];
       const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${ext}`);
-      const args = argsForSegment(item, { ...media, file }, partFile, { crf, fps: media.video?.fps });
+      const args = argsForSegment(item, { ...media, file }, partFile, { crf, fps: media.video?.fps, dropSubtitles });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);
       partFiles.push(partFile);
@@ -185,7 +186,8 @@ async function exportSegments(loaded, segments, opts) {
     onProgress({ phase: 'verify' });
     const results = [];
     for (let i = 0; i < outputs.length; i++) {
-      const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i], { duration: expectSecs[i] });
+      const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i],
+        { duration: expectSecs[i], container, dropSubtitles });
       results.push({ file: outputs[i], ...r });
     }
     onProgress({ phase: 'done', outputs, warnings, results });

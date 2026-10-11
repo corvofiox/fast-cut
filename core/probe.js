@@ -165,6 +165,8 @@ function normalizeProbe(raw, file = '(unknown)') {
       title: a.tags?.title ?? null,
     })),
     subtitleTracks: subs.length,
+    /** 字幕编码名：remux 换封装时要靠它判断"这个容器装不装得下"（见 core/containers.js）。 */
+    subtitleCodecs: subs.map((s) => s.codec_name),
     rotation,
     hdr,
   };

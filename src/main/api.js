@@ -18,6 +18,7 @@ const {
 const { snap } = require('../../core/segments');
 const { resolveBin } = require('../../core/ffmpegPath');
 const { run: spawnRun } = require('../../core/probe');
+const { EXPORT_CONTAINERS, byId, familyOfExt, unmuxableSubtitles } = require('../../core/containers');
 
 const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm', 'flv', 'ts', 'mts'];
 
@@ -371,7 +372,15 @@ function previewPlan(payload) {
     precise: !!payload.precise,
     ordered: isReordered(segments),
   });
-  return { plan, warnings, keeps, keepSecs, ordered: isReordered(segments) };
+  const target = targetFor(payload.container, loaded, path.resolve(String(payload.file)));
+  return {
+    plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
+    container: {
+      ext: target.ext,
+      label: target.container ? target.container.label : '跟随源',
+      droppedSubtitles: target.droppedSubCodecs,
+    },
+  };
 }
 
 /** 数组顺序不再等于源顺序 = 用户拖动改过位置，必须走"按顺序逐段导出"这条路。 */
@@ -410,6 +419,27 @@ function extForSource(media, file) {
   return firstFormat ? `.${firstFormat}` : '.mp4';
 }
 
+/**
+ * 目标封装：默认跟随源，也允许用户显式换容器（remux —— 仍然流拷贝，只换封装）。
+ * 只认白名单里的 id；装不下的字幕轨在这里一次算清：参数拼装据此排除字幕流，
+ * 自检据此核对"该省略的确实省略了"，界面据此提前告诉用户，谁都不偷偷做事。
+ */
+function targetFor(requested, loaded, abs) {
+  const id = String(requested || 'source').toLowerCase();
+  let ext;
+  let container = null;
+  if (id === 'source') {
+    ext = extForSource(loaded.media, abs);
+  } else {
+    const picked = byId(id);
+    if (!picked) throw new Error(`不支持的导出容器：${requested}`);
+    ext = picked.ext;
+    container = { family: picked.family, label: picked.label, ext: picked.ext };
+  }
+  const droppedSubCodecs = unmuxableSubtitles(familyOfExt(ext), loaded.media.subtitleCodecs);
+  return { ext, container, dropSubtitles: droppedSubCodecs.length > 0, droppedSubCodecs };
+}
+
 async function startExport(win, payload) {
   if (state.job) throw new Error('已有导出任务在进行中');
 
@@ -418,7 +448,8 @@ async function startExport(win, payload) {
   const segments = sanitizeSegments(payload.segments);
   const outDir = path.resolve(String(payload.outDir || ''));
   if (!fs.existsSync(outDir)) throw new Error(`输出目录不存在：${outDir}`);
-  const ext = extForSource(loaded.media, abs);
+  const target = targetFor(payload.container, loaded, abs);
+  const ext = target.ext;
   const outPath = path.join(outDir, sanitizeBaseName(payload.baseName) + ext);
 
   if (!loaded.media.keyframes || !loaded.media.keyframes.length) {
@@ -441,6 +472,8 @@ async function startExport(win, payload) {
       split,
       crf: 18,
       ordered: isReordered(segments),
+      container: target.container,
+      dropSubtitles: target.dropSubtitles,
       token,
       onProgress: send,
     });
@@ -499,6 +532,8 @@ function registerIpc(getWindow) {
       bundled: !!bundledFfmpegDir(),
       settings: { ...state.settings },
       extensions: VIDEO_EXTENSIONS,
+      /** 可以 remux 成的容器（界面据此填下拉，判据仍只在 core/containers.js 里） */
+      containers: EXPORT_CONTAINERS.map(({ id, label }) => ({ id, label })),
     };
   });
 

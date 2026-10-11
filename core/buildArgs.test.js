@@ -41,6 +41,30 @@ test('有旋转信息的源显式携带 display_rotation', () => {
   assert.strictEqual(args[i + 1], 'copy');
 });
 
+test('remux 到 mkv 不下发 display_rotation：它是 mov muxer 私有选项，写给 mkv 整条命令失败（实测）', () => {
+  const args = argsForSegment({ kind: 'copy', start: 0, duration: 1 }, { ...MEDIA, rotation: -90 }, 'out.mkv');
+  assert.ok(!args.includes('-display_rotation'));
+  assert.ok(args.includes('-c'));
+});
+
+test('目标容器装不下字幕时用 -map -0:s 整条排除，而不是等 ffmpeg 报 Could not find tag', () => {
+  const args = argsForSegment({ kind: 'copy', start: 0, duration: 1 }, MEDIA, 'out.mp4', { dropSubtitles: true });
+  assert.strictEqual(args[args.lastIndexOf('-map') + 1], '-0:s');
+  assert.ok(!args.includes('-c:s'));
+});
+
+test('重编码段排除字幕时同样不再下发 -c:s copy', () => {
+  const args = argsForSegment({ kind: 'reencode', start: 0, duration: 1 }, MEDIA, 'out.mp4', { dropSubtitles: true });
+  assert.ok(args.includes('-0:s'));
+  assert.ok(!args.includes('-c:s'));
+});
+
+test('不排除字幕时保持原样：-map 0 且带 -c:s copy', () => {
+  const args = argsForSegment({ kind: 'reencode', start: 0, duration: 1 }, MEDIA, 'out.mkv');
+  assert.ok(!args.includes('-0:s'));
+  assert.ok(args.includes('-c:s'));
+});
+
 test('重编码段沿用源的编码参数，音轨仍拷贝', () => {
   const args = argsForSegment({ kind: 'reencode', start: 3, end: 4 }, MEDIA, 'out.mp4');
   const i = (x) => args.indexOf(x);
