@@ -30,11 +30,6 @@ npm run dist           # 打包 → dist/Fast-Cut-<版本>-x64.exe（免安装�
 npm run dist:dir       # 只出 dist/win-unpacked/，调打包配置时快得多
 ```
 
-## 文档
-
-- [docs/01-需求文档.md](docs/01-需求文档.md) — 功能范围、交互约定、非目标
-- [docs/02-技术方案.md](docs/02-技术方案.md) — 架构、ffmpeg 参数与踩坑记录、自检清单、打包
-
 ## 隐私
 
 无遥测、无网络请求。导出只写用户指定的目标文件：目标已存在或目标就是源文件时直接拒绝，

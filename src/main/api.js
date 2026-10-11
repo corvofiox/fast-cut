@@ -597,7 +597,7 @@ function registerIpc(getWindow) {
     type: 'info',
     title: 'Fast Cut',
     message: 'Fast Cut v0.1',
-    detail: '只做裁剪的极简视频工具：流拷贝导出，不重编码、不上传、不写源文件。\n配套文档：docs/01-需求文档.md、docs/02-技术方案.md',
+    detail: '只做裁剪的极简视频工具：流拷贝导出，不重编码、不上传、不写源文件。',
     buttons: ['知道了'],
   }));
   ipcMain.handle('fc:app:quit', () => app.quit());
