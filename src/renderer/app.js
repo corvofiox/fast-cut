@@ -1260,7 +1260,7 @@ function bindUi() {
   });
   p.addEventListener('error', () => {
     if (!state.src) return;
-    toast('预览器无法解码该视频（常见于 HEVC／AV1）。这只影响预览，流拷贝导出不受影响。', 'warn');
+    toast('预览器无法解码该视频（常见于 HEVC／AV1）。这只影响预览，导出不受影响：该拷的照拷，拷不动的只重编码入点那一小段。', 'warn');
   });
 
   $('btnImportEmpty').addEventListener('click', pickAndImport);
