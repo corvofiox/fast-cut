@@ -160,13 +160,34 @@ function keptSeconds() {
 }
 
 /** 每个片段的真实导出入点（吸附后），给时间轴角标和"多带几秒"用。 */
+/**
+ * 每条保留段"实际从哪儿开始切"。优先按主进程给的切割计划来（那才是真相：
+ * 关键帧比剪辑粒度粗时会走自动局部精确，客户端自己重算会算成"回溯吃掉间隙"），
+ * 计划还没回来时才退回本地按关键帧吸附估算。
+ */
 function snapMap() {
+  const parts = state.plan && state.plan.plan;
+  if (Array.isArray(parts) && parts.length) {
+    const map = {};
+    for (const p of parts) {
+      if (p.keepIndex == null || map[p.keepIndex] != null) continue;
+      map[p.keepIndex] = p.start;
+    }
+    return map;
+  }
   const precise = $('optPrecise').checked;
   const kfs = state.src ? state.src.media.keyframes : [];
   const map = {};
   if (precise || state.scanning || !kfs || !kfs.length) return map;
   state.clips.forEach((c, i) => { map[i] = snapStartOf(c.start, kfs); });
   return map;
+}
+
+/** 被"自动局部精确"处理的段数：这些段的入点那一小段是有损重编码，必须告知。 */
+function autoPreciseCount() {
+  const parts = state.plan && state.plan.plan;
+  if (!Array.isArray(parts)) return 0;
+  return new Set(parts.filter((p) => p.autoPrecise && p.kind === 'reencode').map((p) => p.keepIndex)).size;
 }
 
 // ---------------------------------------------------------------- 启动
@@ -819,7 +840,11 @@ function snapExtra() {
   return extra;
 }
 
-/** 相邻保留段被吸附"吃掉"的重叠秒数：这些内容会被导出两遍或把间隙带回来。 */
+/**
+ * 相邻保留段被吸附"吃掉"的重叠秒数：内容会被导出两遍或把已删的间隙带回来。
+ * 主进程的计划已不会再让这种事发生（跨界的段自动走局部精确），这里留着是给
+ * "计划还没回来"的窗口期做保守提示，正常路径下应当恒为 0。
+ */
 function overlapSeconds() {
   const map = snapMap();
   let secs = 0;
@@ -840,11 +865,12 @@ function updateEstimate() {
   const box = $('estimate');
   if (!state.src || !state.clips.length) { box.textContent = '—'; return; }
   const keepSecs = keptSeconds();
+  // extra 取自真实计划：精确模式下入点不回溯，天然是 0；吸附模式多带多少就说多少
   const extra = snapExtra();
   const precise = $('optPrecise').checked;
   const split = $('optSplit').checked;
   const cut = round3(Math.max(0, (state.src.media.duration || 0) - keepSecs));
-  const estSecs = precise ? keepSecs : keepSecs + extra;
+  const estSecs = keepSecs + extra;
   const rate = state.src.media.bitRate || 8e6;
   const bytes = rate / 8 * estSecs * 1.05;
   const lines = [
@@ -852,6 +878,10 @@ function updateEstimate() {
   ];
   const over = precise ? 0 : overlapSeconds();
   if (over > 0.001) lines.push(`⚠ 缝隙会被带回 ${over.toFixed(3)}s`);
+  // 入点回溯多带的部分（流拷贝只能从关键帧起）：说清楚比让用户发现强
+  if (!precise && extra > 0.05) lines.push(`⚠ 吸附关键帧会多带 ${round3(extra).toFixed(3)}s 片段开头`);
+  const autoN = autoPreciseCount();
+  if (autoN) lines.push(`⚠ 关键帧间隔比剪辑粒度粗：${autoN} 段已自动局部精确（入点那一小段重编码，其余仍是流拷贝）`);
   if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 疑似 VFR，建议每段一个文件');
   // HEVC 多段拼接以前会提示"会被自检拦下"：那是开放 GOP 的 RASL 前导帧造成的，
   // 现在切割时直接在封装层剔掉（仍然 -c copy），这句话已经不成立，别再吓唬用户。

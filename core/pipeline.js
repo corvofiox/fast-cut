@@ -176,6 +176,7 @@ async function exportSegments(loaded, segments, opts) {
 
     let outputs = [];
     const expectSecs = [];
+    const userSecs = [];
     if (split) {
       // 需求文档 §4.3：「每段一个文件」= 每条保留区间一个文件。
       // 精确模式下一条区间会被切成"重编码小段 + 流拷贝段"，这里再把它们拼回同一个文件。
@@ -186,11 +187,16 @@ async function exportSegments(loaded, segments, opts) {
         else await concatInto(files, target, media, bins);
         outputs.push(target);
         expectSecs.push(snap(groups[i].reduce((acc, n) => acc + plan[n].duration, 0)));
+        const ki = plan[groups[i][0]].keepIndex;
+        userSecs.push(ki != null && keeps[ki] ? snap(keeps[ki].end - keeps[ki].start) : undefined);
       }
     } else {
       await concatInto(partFiles, outPath, media, bins);
       outputs = [outPath];
-      expectSecs.push(totalKeep);
+      // 上界要按计划实算，不能拿"用户选区"当基准：吸附本来就会多带内容，
+      // 按选区判会把正常的回溯也报成故障；按源长百分比判又宽到吞掉剪辑都查不出来。
+      expectSecs.push(snap(plan.reduce((acc, p) => acc + p.duration, 0)));
+      userSecs.push(totalKeep);
     }
 
     // 自检：每个输出文件与"它自己那组切割计划的时长"比对，不和总时长比。
@@ -198,7 +204,7 @@ async function exportSegments(loaded, segments, opts) {
     const results = [];
     for (let i = 0; i < outputs.length; i++) {
       const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i],
-        { duration: expectSecs[i], container, dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length, sourceFormat: media.format });
+        { duration: expectSecs[i], userSecs: userSecs[i], container, dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length, sourceFormat: media.format });
       results.push({ file: outputs[i], ...r });
     }
     onProgress({ phase: 'done', outputs, warnings, results });

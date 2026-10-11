@@ -20,7 +20,7 @@ const fs = require('fs');
 const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
-const { loadSource, exportSegments } = require('../core/pipeline');
+const { loadSource, exportSegments, planFor } = require('../core/pipeline');
 const { decodeErrors } = require('../core/verify');
 const { byExt, unmuxableSubtitles } = require('../core/containers');
 
@@ -84,7 +84,9 @@ const FIXTURES = [
   {
     name: 'h264 偏移-ts',
     file: 'offset.ts',
-    note: '首帧 pts 不是 0：时间轴要归零，且各段刻度必须统一，否则拼接摊成十倍长',
+    note: '首帧 pts 不是 0：时间轴归零与刻度统一已解决；但段内视频比音频晚起步，'
+      + '接缝时间线被拉长（四种重定时开关都压不掉）—— 必须响亮失败并指出「每段一个文件」',
+    expectLoudFail: true,
     args: [...V, ...A(), '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-output_ts_offset', '13.7'],
   },
   {
@@ -92,6 +94,12 @@ const FIXTURES = [
     file: 'vfr.mp4',
     note: '可变帧率：不该拿标称帧率判"帧率不一致"',
     args: [...V, ...A(), '-vf', "select='lt(mod(t,1),0.8)'", '-fps_mode', 'passthrough', '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac'],
+  },
+  {
+    name: 'h264 12s超长GOP-mp4',
+    file: 'longgop.mp4',
+    note: '整片只有一个关键帧：入点回溯会吃掉已删间隙，必须自动局部精确，且产物时长要贴着计划',
+    args: [...V, ...A(), '-c:v', 'libx264', '-g', '360', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'],
   },
 ];
 
@@ -162,6 +170,30 @@ function avSpread(file) {
   return (a.hi - a.lo) - (v.hi - v.lo);
 }
 
+/** 视频的独立时间线跨度（逐报文）：与"切割计划实算时长"比对，抓静默多带。 */
+function videoSpan(file) {
+  const j = probePackets(file);
+  if (!j) return null;
+  const vids = new Set((j.streams || []).filter((s) => s.codec_type === 'video').map((s) => Number(s.index)));
+  let lo = Infinity; let hi = -Infinity;
+  for (const p of j.packets || []) {
+    if (!vids.has(Number(p.stream_index))) continue;
+    const pts = Number(p.pts_time);
+    if (!Number.isFinite(pts)) continue;
+    lo = Math.min(lo, pts);
+    hi = Math.max(hi, pts + (Number(p.duration_time) || 0));
+  }
+  return hi > lo ? hi - lo : null;
+}
+
+function probePackets(file) {
+  try {
+    return JSON.parse(execFileSync('ffprobe', ['-v', 'error', '-print_format', 'json', '-show_entries',
+      'packet=stream_index,pts_time,duration_time', '-show_entries', 'stream=index,codec_type', file],
+    { encoding: 'utf8', maxBuffer: 128e6 }));
+  } catch { return null; }
+}
+
 function targetFor(fx, loaded, target) {
   if (!target) return { ext: path.extname(fx.file), container: null, dropSubtitles: false };
   const container = byExt(target);
@@ -203,17 +235,25 @@ async function runMatrix() {
         const noise = r.ok ? r.outputs.flatMap(decodeNoise) : [];
         const spread = r.ok ? r.outputs.map(avSpread).filter((x) => x != null) : [];
         const badAv = spread.filter((x) => Math.abs(x) > mode.avBudget);
-        const ok = r.ok && noise.length === 0 && badAv.length === 0;
+        // 独立复核"有没有静默多带"：视频时间线不得超过切割计划 + 0.6s。
+        // 吸附回溯只该发生在"没跨过别的保留段"的入点上；跨过去就会把已删素材并回导出。
+        const planned = planFor(loaded, SEGS, { precise: !!mode.opts.precise }).plan
+          .reduce((acc, p) => acc + p.duration, 0);
+        const spans = r.ok ? r.outputs.map(videoSpan).filter((x) => x != null) : [];
+        const overran = spans.filter((x) => x > planned + 0.6);
+        const ok = r.ok && noise.length === 0 && badAv.length === 0 && overran.length === 0;
         console.log(`${pad(label, 34)}${ok ? '✓' : '✗'}  ${
           r.ok
             ? (noise.length ? `自检漏判：${cut(noise[0], 40)}`
               : badAv.length ? `自检漏判：音视频时间线差 ${badAv.map((x) => x.toFixed(3)).join('/')}s（允差 ${mode.avBudget}s）`
+              : overran.length ? `自检漏判：视频时间线 ${overran.map((x) => x.toFixed(2)).join('/')}s > 计划 ${planned.toFixed(2)}s`
               : `${r.outputs.length} 个文件`)
             : cut(failed.map((c) => `${c.name}：${c.detail}`).join('、'), 62)
         }`);
         // 静默交差 = 自检说通过但独立复核发现问题，一律算事故
         if (r.ok && noise.length) problems.push(`${label}：产物解码有错但自检判为通过 —— ${noise[0]}`);
         if (r.ok && badAv.length) problems.push(`${label}：音视频时间线差 ${badAv.map((x) => x.toFixed(3)).join('/')}s 但自检判为通过`);
+        if (r.ok && overran.length) problems.push(`${label}：静默多带 —— 视频时间线 ${overran.map((x) => x.toFixed(2)).join('/')}s 超出切割计划 ${planned.toFixed(2)}s`);
         if (!r.ok) {
           if (failed.length === 0) problems.push(`${label}：ok=false 却说不出原因`);
           if (!fx.expectLoudFail) {

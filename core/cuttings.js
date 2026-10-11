@@ -65,7 +65,31 @@ function buildPlan(keeps, opts) {
         ? `入点已前移至关键帧 ${start.toFixed(3)}s（多 ${(keep.start - start).toFixed(3)}s 内容）`
         : '入点正好落在关键帧上');
 
-    if (!precise || start >= keep.start - EPS) {
+    /**
+     * 吸附回溯跨过上一条保留段的出点 = 把用户删掉的间隙吞回导出；两段还会被 dedupe 并成一段，
+     * 剪辑等于没做（实测 98 分钟 .mkv，关键帧间隔 ~10.4s：删掉 1.9s，产物却是整部片，
+     * 而自检因为"允许多出 5%"照样判通过）。流拷贝没法从非关键帧起，所以这种保留段
+     * 就地改成"局部精确"：入点那一小段重编码，其余仍然拷贝 —— 用户剪掉的就是剪掉了。
+     *
+     * 但只在"重编码不换编码"时才自动做：源是 mpeg4/mjpeg 这类没有同编码重编码器时，
+     * 自动精确会把 h264 段混进拷贝段，拼出来是坏文件（矩阵实测：产物解码报错 +
+     * "源 mpeg4 → 导出 h264"）。那种情况宁可照旧吸附，并把带回多少秒说清楚。
+     */
+    const prevEnd = ki > 0 ? keeps[ki - 1].end : null;
+    const crosses = start < keep.start - EPS && prevEnd != null && start < prevEnd - EPS;
+    const swallowsGap = crosses && sameCodec;
+    if (crosses && !sameCodec) {
+      warnings.push(
+        `关键帧间隔比剪辑粒度粗：入点回溯到 ${start.toFixed(3)}s 会带回已删的 ${(prevEnd - start).toFixed(3)}s；`
+        + '源编码没有同编码重编码器，不能自动局部精确（会把两种编码混拼）—— 勾「精确模式」整段重编码可避免',
+      );
+    } else if (swallowsGap) {
+      warnings.push(
+        `关键帧间隔比剪辑粒度粗（入点要回溯到 ${start.toFixed(3)}s，会吃掉已删的 ${(prevEnd - start).toFixed(3)}s）：这一段已自动局部精确（入点一小段重编码，其余仍流拷贝）`,
+      );
+    }
+
+    if ((!precise && !swallowsGap) || start >= keep.start - EPS) {
       plan.push({ kind: 'copy', start, duration: durationSec, snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, note: headNote });
       continue;
     }
@@ -76,7 +100,13 @@ function buildPlan(keeps, opts) {
       fpsNum ? 2 / fpsNum : 1 / 15);
     // 精确模式会往一条保留区间里塞两段（重编码 + 流拷贝），统一标记归属，
     // 上层按 keepIndex 分组才能做到"每条保留区间一个文件"。
-    for (let n = before; n < plan.length; n++) plan[n].keepIndex = ki;
+    for (let n = before; n < plan.length; n++) {
+      plan[n].keepIndex = ki;
+      if (swallowsGap && !precise) {
+        plan[n].autoPrecise = true;
+        plan[n].note = `关键帧比剪辑粒度粗，自动局部精确 · ${plan[n].note}`;
+      }
+    }
   }
 
   // 乱序（用户拖动改过顺序）时必须跳过 dedupePlan：它按"时间递增"假设合并相邻段，

@@ -66,6 +66,33 @@ test('对齐后为空的区间被忽略并警告', () => {
   assert.strictEqual(warnings.length, 1);
 });
 
+test('关键帧比剪辑粒度粗时自动局部精确，绝不把已删的间隙吞回来', () => {
+  // 整片只有一个关键帧（12s GOP）：三条保留段的入点回溯都会跨过上一条的出点。
+  // 以前它们被 dedupePlan 并成"从 0 拷到片尾"一整段 —— 删了等于没删，
+  // 而自检按"源长 5%"的允差照样判通过（实测 98 分钟 .mkv 就翻在这条）。
+  const { plan, warnings } = buildPlan(
+    [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8, end: 9.5 }],
+    { keyframes: [0], precise: false, fps: 30, duration: 10 },
+  );
+  assert.deepStrictEqual(plan.map((p) => p.kind), ['copy', 'reencode', 'reencode']);
+  assert.strictEqual(plan[0].start, 0);                    // 首段允许片头回溯（不会并掉别人的区间）
+  assert.strictEqual(plan[1].start, 4.1);                  // 后两段的入点必须精确
+  assert.strictEqual(plan[2].start, 8);
+  assert.ok(plan[1].autoPrecise && plan[2].autoPrecise);
+  assert.ok(!plan.some((p) => p.start < 4.1 && p.kind === 'reencode'));
+  assert.ok(warnings.some((w) => /自动局部精确/.test(w) && /吃掉已删/.test(w)), warnings.join('、'));
+});
+
+test('关键帧够密时仍是纯流拷贝，不该冒出自动重编码', () => {
+  const { plan, warnings } = buildPlan(
+    [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }],
+    { keyframes: [0, 2, 4, 6, 8], precise: false, fps: 30, duration: 10 },
+  );
+  assert.deepStrictEqual(plan.map((p) => p.kind), ['copy', 'copy']);
+  assert.ok(!plan.some((p) => p.autoPrecise));
+  assert.ok(!warnings.some((w) => /自动局部精确/.test(w)), warnings.join('、'));
+});
+
 test('精确模式：入点不是关键帧时切成 重编码+拷贝 两段', () => {
   const { plan } = buildPlan([{ start: 3.4, end: 7 }], OPTS_PRECISE);
   assertPlan(plan, [['reencode', 3.4, 0.6], ['copy', 4, 3]]); // 7 - 4

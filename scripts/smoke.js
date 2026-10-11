@@ -678,8 +678,24 @@ async function main() {
   await wait(300);
   await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'snap'); 'ok'`);
   await wait(250);
+  // 界面先给个说法：导出前那行"成片 …"说的秒数，必须和真导出来的时长对得上。
+  // （98 分钟的 .mkv 就翻在这里：界面按选区报 8 秒，产物却是整部片，自检还判通过。）
+  const promised = await js(win, `(() => {
+    const m = document.getElementById('estimate').textContent.match(/成片\\s+(\\d+):(\\d\\d):(\\d\\d)/);
+    if (!m) return -1;
+    const plan = (__smoke.state.plan.plan || []).reduce((a, p) => a + p.duration, 0);
+    return JSON.stringify({ shown: Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]), plan });
+  })()`);
+  const promise = promised === -1 ? null : JSON.parse(promised);
   let res = await runExport(win);
   check('拼接导出通过自检', res.ok && res.outputs.length === 1, res.detail);
+  if (res.ok && promise) {
+    const real = Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0',
+      path.join(OUT_DIR, 'snap.mp4')], { encoding: 'utf8' }).trim());
+    check('界面预估的成片时长 = 实际产物，且不吞掉已删素材',
+      Math.abs(promise.shown - real) <= 0.6 && Math.abs(promise.plan - real) <= 0.6,
+      `预估 ${promise.shown}s · 计划 ${promise.plan.toFixed(3)}s · 实际 ${real.toFixed(3)}s（选区 6s，多带的是吸附回溯，界面已报）`);
+  }
 
   const groups = await js(win, 'new Set(__smoke.state.plan.plan.map((p) => p.keepIndex)).size');
   await js(win, `__smoke.setOption('optSplit', true); __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'split'); 'ok'`);

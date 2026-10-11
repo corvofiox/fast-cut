@@ -107,12 +107,21 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
     }
   }
 
-  // 时长：关键帧吸附只会让产物变长（多带内容），绝不会变短。
-  // 因此只校验下界；上界留足一个 GOP 的余量。
-  const outDur = Number(outMeta.format.duration || 0);
-  const gopBudget = Math.max(8, (srcMeta?.format?.duration ?? 0) * 0.05);
-  const durOk = outDur >= expect.duration - 1.0 && outDur <= expect.duration + gopBudget;
-  add('时长符合预期', durOk, `用户选区 ≈${expect.duration.toFixed(3)}s（吸附后只增不减），实际 ${snap(outDur)}s，允许多出 ≤${gopBudget.toFixed(1)}s`);
+  // 时长：`expect.duration` 是**切割计划实算的时长之和**（不是用户选区——吸附本来就会多带内容，
+  // 按选区判会把正常回溯误报成故障）。上界也不再按"源长 5%"给：98 分钟的素材等于允许多带
+  // 5 分钟，把"整段被并回去、剪辑等于没做"那种事故直接放行（实测）。
+  // 量的必须是**视频轨**：拷贝过去的音频常常比画面长半秒，拿容器时长（各流取最大）判
+  // 会把这种音频尾巴算成"多导了内容"（实测 .ts 源 +0.6s 误报），而那类病自有"音画时间线一致"把关。
+  const outDur = videoDuration(outMeta) ?? Number(outMeta.format.duration || 0);
+  const slack = Math.max(0.5, expect.duration * 0.02);
+  const lower = expect.duration - 1.0;
+  const durOk = outDur >= lower && outDur <= expect.duration + slack;
+  const seam = outDur > expect.duration + slack && expect.parts > 1
+    ? `；比计划多 ${(outDur - expect.duration).toFixed(3)}s —— 多段拼接的接缝被拉长（源时间戳不规范时在段内就烧好了，实测偏移 .ts），勾「每段一个文件」可绕开 concat`
+    : '';
+  add('时长符合预期', durOk,
+    `切割计划 ${expect.duration.toFixed(3)}s（用户选区 ${(expect.userSecs ?? expect.duration).toFixed(3)}s）`
+    + ` → 视频轨 ${snap(outDur)}s，允差 -1.0s / +${slack.toFixed(2)}s${seam}`);
 
   // 音画时间线对齐：容器总时长看不出"音频比视频长半秒"这类接缝病。
   // 实测两种病都出在拼接：重编码段的拷贝音频不按入点收口（长 0.5s）、
@@ -159,6 +168,11 @@ function streamSpan(s) {
   const base = String(s.time_base || '').split('/').map(Number);
   if (Number.isFinite(ts) && ts > 0 && base[0] && base[1]) return (ts * base[0]) / base[1];
   return null;
+}
+
+/** 视频轨时长；mkv 一类不写流时长时返回 null，由调用方退回容器时长。 */
+function videoDuration(meta) {
+  return streamSpan(first(meta && meta.streams, 'video'));
 }
 
 /**
