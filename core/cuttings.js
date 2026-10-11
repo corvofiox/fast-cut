@@ -24,11 +24,12 @@ const { snap, EPS } = require('./segments');
 
 /**
  * @param {Array<{start:number,end:number}>} keeps 已规整的保留区间
- * @param {{keyframes:number[], precise:boolean, duration:number}} opts
+ * @param {{keyframes:number[], precise:boolean, duration:number, ordered?:boolean}} opts
+ *        ordered=true 表示 keeps 的顺序就是导出顺序（用户拖动改过），此时不做相邻合并
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], precise = false, duration, fps } = opts;
+  const { keyframes = [], precise = false, duration, fps, ordered = false } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   // 帧长一律按"第 N 帧 = N/fps 秒"推导：1/30 = 0.0333… 用定点小数会引入误差，
   // 产生 .310 / .014 这类看着像整帧其实不是的时刻，concat 时仍会落半格。
@@ -36,7 +37,8 @@ function buildPlan(keeps, opts) {
   const warnings = [];
   const plan = [];
 
-  for (const keep of keeps) {
+  for (let ki = 0; ki < keeps.length; ki++) {
+    const keep = keeps[ki];
     const kfStart = lastKeyframeAtMost(keep.start, keyframes);   // ≤ start
     let start;
     if (kfStart === null) {
@@ -64,14 +66,20 @@ function buildPlan(keeps, opts) {
         : '入点正好落在关键帧上');
 
     if (!precise || start >= keep.start - EPS) {
-      plan.push({ kind: 'copy', start, duration: durationSec, snapFrom: keep.start, keepEnd: keep.end, note: headNote });
+      plan.push({ kind: 'copy', start, duration: durationSec, snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, note: headNote });
       continue;
     }
 
+    const before = plan.length;
     pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames);
+    // 精确模式会往一条保留区间里塞两段（重编码 + 流拷贝），统一标记归属，
+    // 上层按 keepIndex 分组才能做到"每条保留区间一个文件"。
+    for (let n = before; n < plan.length; n++) plan[n].keepIndex = ki;
   }
 
-  return { plan: dedupePlan(plan), warnings };
+  // 乱序（用户拖动改过顺序）时必须跳过 dedupePlan：它按"时间递增"假设合并相邻段，
+  // 遇到 [5-10, 0-5] 这种会把后一段整个吞掉，导出就少了一半内容。
+  return { plan: ordered ? plan.filter((p) => p.duration > EPS) : dedupePlan(plan), warnings };
 }
 
 /**

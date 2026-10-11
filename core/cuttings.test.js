@@ -144,3 +144,15 @@ test('帧取整：非整帧时长被就近取整到整帧', () => {
   const dur = plan[0].duration;
   assert.ok(Math.abs(dur - Math.round(dur * 30) / 30) < 1e-9, `${dur}s 不是整帧时刻`);
 });
+
+test('乱序：用户改过顺序时绝不合并相邻段（否则后一段会被前一段吞掉）', () => {
+  // [5-10, 0-5] 顺序倒置且首尾相接；默认的 dedupePlan 会把它们并成一段，
+  // 导出就少了一半内容，所以 ordered 必须绕开那套"时间递增"假设。
+  const keeps = [{ start: 5, end: 10 }, { start: 0, end: 5 }];
+  const merged = buildPlan(keeps, OPTS);
+  const ordered = buildPlan(keeps, { ...OPTS, ordered: true });
+  assert.strictEqual(merged.plan.length, 1, '默认路径按时间合并（输入已排好序时才是这个语义）');
+  assert.strictEqual(ordered.plan.length, 2, `乱序应保留两段，实际 ${ordered.plan.length} 段`);
+  assert.deepStrictEqual(ordered.plan.map((p) => [p.start, p.duration]), [[4, 6], [0, 5]],
+    '两段都要按各自的关键帧入点导出，且顺序不变');
+});

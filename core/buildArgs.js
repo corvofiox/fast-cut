@@ -46,15 +46,17 @@ function argsForSegment(item, media, outPath, opts = {}) {
       args.push('-display_rotation', 'copy');    // 保留旋转信息，避免竖屏视频方向错乱
     }
   } else {
+    const codec = pickVideoCodec(media, opts);
     args.push('-map', '0');
     args.push('-map_metadata', '0');
-    args.push('-c:v', pickVideoCodec(media, opts));
+    args.push('-c:v', codec);
     args.push('-c:a', 'copy');
     args.push('-c:s', 'copy');
     args.push('-crf', String(opts.crf ?? 18));
-    args.push('-preset', 'veryfast');
+    args.push(...speedArgs(codec));
     // 精确模式的小段用同 profile 编码，减少与源不一致造成的兼容问题
-    if (media.video?.profile) args.push('-profile:v', media.video.profile);
+    const profile = profileArg(media.video, codec);
+    if (profile) args.push('-profile:v', profile);
     if (media.video?.pixFmt) args.push('-pix_fmt', media.video.pixFmt);
     if (media.video?.fps) args.push('-r', String(media.video.fps));
     // 定帧率输出，时间戳连续，避免拼接处 PTS 回跳
@@ -82,6 +84,33 @@ function pickVideoCodec(media, opts = {}) {
   if (c === 'av1') return 'libsvtav1';
   if (c === 'vp9') return 'libvpx-vp9';
   return 'libx264';
+}
+
+/**
+ * ffprobe 报的 profile 名能不能直接喂给编码器：
+ *  - libx264 原样接受（实测 'High' 可用）
+ *  - libx265 只认小写且不带空格：源 profile="Main" 原样传进去会
+ *    "Error while opening encoder"（实测 HEVC 精确模式必崩）
+ *  - VP9 / AV1 的 profile 写法完全不同（"Profile 0" 之类），交给编码器自己选，
+ *    自检阶段会比对 profile 是否一致，不一致会明确报错而不是静默。
+ */
+function profileArg(video, codec) {
+  const p = video && video.profile;
+  if (!p) return null;
+  if (codec === 'libx265') return String(p).toLowerCase().replace(/\s+/g, '');
+  if (codec === 'libx264') return String(p);
+  return null;
+}
+
+/**
+ * "快"这个参数每个编码器写法不同，写错了是打不开编码器（实测 libsvtav1 收到
+ * `-preset veryfast` 直接 -22 Invalid argument），所以按编码器分支。
+ */
+function speedArgs(codec) {
+  if (codec === 'libvpx-vp9') return ['-deadline', 'good', '-cpu-used', '2', '-row-mt', '1'];
+  if (codec === 'libsvtav1') return ['-preset', '8'];
+  if (codec === 'libaom-av1') return ['-cpu-used', '4'];
+  return ['-preset', 'veryfast'];
 }
 
 /**
@@ -156,4 +185,4 @@ function pad(n, w) {
   return String(n).padStart(w, '0');
 }
 
-module.exports = { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, pickVideoCodec };
+module.exports = { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, pickVideoCodec, profileArg };

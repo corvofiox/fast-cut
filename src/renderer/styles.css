@@ -1,0 +1,407 @@
+:root {
+  --bg: #14161a;
+  --bg-2: #1b1e24;
+  --bg-3: #22262e;
+  --line: #2c313a;
+  --fg: #dfe3ea;
+  --fg-dim: #8b95a5;
+  --accent: #4c9ffe;
+  --accent-2: #f0a840;
+  --ok: #4fb477;
+  --warn: #e0a33c;
+  --err: #e5534b;
+  --keep: #2f6f4f;
+  --keep-line: #57b981;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--fg);
+  font: 13px/1.5 "Microsoft YaHei UI", "Segoe UI", system-ui, sans-serif;
+  user-select: none;
+  overflow: hidden;
+}
+
+.hidden { display: none !important; }
+.grow { flex: 1 1 auto; }
+
+#shell { display: flex; flex-direction: column; height: 100%; }
+
+/* ---------- 顶栏 ---------- */
+#topbar {
+  display: flex; align-items: center; gap: 10px;
+  padding: 8px 12px; border-bottom: 1px solid var(--line);
+  background: var(--bg-2); flex: 0 0 auto;
+}
+.brand { font-weight: 700; letter-spacing: .5px; font-size: 14px; }
+.brand .ver { font-weight: 400; font-size: 11px; color: var(--fg-dim); margin-left: 6px; }
+.src-name {
+  color: var(--fg-dim); max-width: 46%; overflow: hidden;
+  text-overflow: ellipsis; white-space: nowrap;
+}
+/* 顶栏弹出面板：导出整栏搬进来，锚在导出按钮下方 */
+.pop-wrap { position: relative; flex: 0 0 auto; }
+/* 面板自己就得是不透明的一块，不能靠顺带挂的 .card 提供背景：
+   导出面板有 card、菜单面板没有，于是菜单直接成了透明玻璃 */
+.popover {
+  position: absolute; top: calc(100% + 10px); right: 0; z-index: 40;
+  width: 400px; max-height: calc(100vh - 84px); overflow-y: auto; margin: 0;
+  background: var(--bg); border: 1px solid #3b4250; border-radius: 7px;
+  box-shadow: 0 18px 44px rgba(0, 0, 0, .62);
+}
+.popover h2 { position: sticky; top: 0; background: var(--bg); }
+
+/* ---------- 自绘标题栏 ---------- */
+/* 整条可拖窗口，但按钮、输入、下拉面板必须 no-drag，否则点不动 */
+#topbar { -webkit-app-region: drag; }
+#topbar button, #topbar input, #topbar .pop-wrap, #topbar .popover, #topbar .wctl-group {
+  -webkit-app-region: no-drag;
+}
+
+.wctl-group { display: flex; align-items: stretch; margin-left: 4px; align-self: stretch; }
+.wctl {
+  width: 44px; border: 0; background: transparent; color: var(--fg-dim); cursor: pointer;
+  display: inline-flex; align-items: center; justify-content: center; padding: 0;
+  border-radius: 0; font: inherit;
+}
+.wctl:hover { background: #2b3038; color: var(--fg); }
+.wctl:active { background: #23272e; }
+.wctl.close:hover { background: #c8403a; color: #fff; }
+.wctl i { display: block; }
+.g-min { width: 11px; height: 1px; background: currentColor; margin-top: 5px; }
+.g-max { width: 10px; height: 10px; border: 1px solid currentColor; }
+.g-x { width: 12px; height: 12px; position: relative; }
+.g-x::before, .g-x::after {
+  content: ""; position: absolute; left: 0; top: 50%; width: 100%; height: 1px; background: currentColor;
+}
+.g-x::before { transform: rotate(45deg); }
+.g-x::after { transform: rotate(-45deg); }
+/* 最大化时把方框画成"两层错开"，表示还原 */
+#topbar.maxed .g-max { box-shadow: -3px -3px 0 -1px var(--bg-2), -3px -3px 0 0 currentColor; }
+
+/* 下拉菜单 */
+.popover.menu { width: 232px; padding: 5px 0; max-height: none; overflow: visible; }
+.mi {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px; width: 100%;
+  padding: 7px 12px; border: 0; border-radius: 0; background: transparent; color: var(--fg);
+  font: inherit; font-size: 13px; text-align: left; cursor: pointer;
+}
+.mi:hover { background: #2b3038; }
+.mi kbd { font: 11px/1 "Cascadia Mono", Consolas, monospace; color: var(--fg-dim); white-space: nowrap; }
+.mi-sep { height: 1px; background: var(--line); margin: 5px 0; }
+
+/* ---------- 主体 ---------- */
+#body { display: flex; flex: 1 1 auto; min-height: 0; }
+#left { display: flex; flex-direction: column; flex: 1 1 auto; min-width: 0; }
+#right {
+  width: 340px; flex: 0 0 340px; overflow-y: auto;
+  border-left: 1px solid var(--line); background: var(--bg-2); padding: 10px;
+}
+
+/* ---------- 舞台 ---------- */
+#stage {
+  position: relative; flex: 1 1 auto; min-height: 120px;
+  background: #000; display: flex; align-items: center; justify-content: center; overflow: hidden;
+}
+#player { width: 100%; height: 100%; object-fit: contain; display: block; }
+
+#empty {
+  position: absolute; inset: 0; display: flex; flex-direction: column;
+  align-items: center; justify-content: center; gap: 10px; text-align: center; padding: 20px;
+}
+/* 从系统拖入文件时覆盖整窗的落点提示 */
+#dropVeil {
+  position: fixed; inset: 0; z-index: 60; pointer-events: none;
+  display: flex; align-items: center; justify-content: center;
+  background: rgba(8, 12, 18, .74); outline: 2px dashed var(--accent); outline-offset: -10px;
+}
+.veil-box {
+  font-size: 18px; font-weight: 700; color: var(--fg);
+  background: #0d1014; border: 1px solid var(--line); border-radius: 8px; padding: 14px 24px;
+  box-shadow: 0 12px 34px rgba(0, 0, 0, .55);
+}
+.empty-title { font-size: 22px; font-weight: 700; }
+.empty-sub { color: var(--fg-dim); max-width: 520px; }
+.empty-note { color: #626d7d; font-size: 11px; max-width: 520px; }
+
+#toast {
+  position: absolute; left: 50%; bottom: 18px; transform: translateX(-50%);
+  background: #0d1014; border: 1px solid var(--line); color: var(--fg);
+  padding: 8px 14px; border-radius: 6px; box-shadow: 0 8px 24px rgba(0, 0, 0, .5);
+  max-width: 80%; font-size: 12px;
+}
+#toast.warn { border-color: #6a5320; color: #f0d9a8; }
+
+/* ---------- 走带 ---------- */
+/* 沿用原底部 HUD 那条的样式：紧凑一行、等宽读数，左边按钮 + 落位提示，右边时间码 */
+#transport {
+  display: flex; align-items: center; gap: 6px; padding: 3px 10px; min-height: 30px;
+  border-bottom: 1px solid var(--line); background: var(--bg-2);
+  flex: 0 0 auto;
+}
+#transport .hud { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+#transport .tc { color: var(--fg-dim); }
+#transport #timecode { color: var(--fg); }
+.btn {
+  font: inherit; color: var(--fg); background: var(--bg-3);
+  border: 1px solid var(--line); border-radius: 5px; padding: 5px 10px; cursor: pointer;
+}
+.btn:hover:not(:disabled) { background: #2b3038; border-color: #3b4250; }
+.btn:active:not(:disabled) { transform: translateY(1px); }
+.btn:disabled { opacity: .42; cursor: not-allowed; }
+.btn.icon { padding: 5px 9px; min-width: 32px; }
+.btn.play { min-width: 40px; }
+.btn.primary { background: #22507d; border-color: #2f6ea5; }
+.btn.primary:hover:not(:disabled) { background: #2a6095; }
+.btn.accent { background: #2c5b41; border-color: #3d7a58; }
+.btn.accent:hover:not(:disabled) { background: #35704f; }
+.btn.danger { background: #6b3330; border-color: #8a4440; }
+.btn.tiny { padding: 3px 8px; font-size: 12px; }
+.btn.big { padding: 8px 18px; font-size: 14px; }
+.tc { font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+.tc.dim { color: var(--fg-dim); }
+.tc .sep { color: var(--fg-dim); padding: 0 2px; }
+
+/* ---------- 时间轴 ---------- */
+.sep-line { width: 1px; height: 18px; background: var(--line); margin: 0 4px; }
+
+/* 顶部 0–24px 是"刻度 + 手柄"同槽的一条，下面就是胶片；整块比原来矮 30px */
+#timeline {
+  position: relative; height: 74px; flex: 0 0 auto;
+  background: var(--bg-3); border-bottom: 1px solid var(--line); overflow: hidden;
+}
+#tlCanvas { position: absolute; inset: 0; width: 100%; height: 100%; display: block; }
+#tlLane { position: absolute; left: 0; right: 0; top: 24px; height: 48px; }
+/* 播放头：效仿剪映 —— 实心胶囊贴在刻度条顶部，细线从手柄下沿的尖角接出去。
+   线不能从 top:0 画起：::after 是最后一个子元素、叠在 .knob 之上，
+   那样会从中穿过空心手柄并往上冒出一截，看起来像个气球。 */
+#tlPlayhead { position: absolute; top: 0; bottom: 0; width: 0; pointer-events: none; z-index: 4; }
+#tlPlayhead::after {
+  content: ""; position: absolute; top: 20px; bottom: 0; left: -1px; width: 2px;
+  background: #e6ebf2; box-shadow: 0 0 5px rgba(0, 0, 0, .6);
+}
+#tlPlayhead .knob {
+  position: absolute; top: 1px; left: -6.5px; width: 13px; height: 15px; pointer-events: auto; cursor: ew-resize;
+  background: #e6ebf2; border-radius: 4px;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .55);
+  transition: transform .1s, box-shadow .1s, background .1s;
+}
+#tlPlayhead .knob::after {
+  content: ""; position: absolute; left: 50%; top: 100%; transform: translateX(-50%);
+  border: 4px solid transparent; border-top-color: #e6ebf2; margin-top: -2px;
+}
+#tlPlayhead .knob:hover { background: #fff; transform: scale(1.1); }
+#tlPlayhead.dragging .knob { background: #fff; transform: scale(1.16); box-shadow: 0 2px 10px rgba(0, 0, 0, .6); }
+/* 时间气泡横着挂在手柄右边：压在胶片上就看不清画面了 */
+#tlPlayhead .ph-bubble {
+  position: absolute; top: 1px; left: 12px;
+  font: 11px/1.4 "Cascadia Mono", Consolas, monospace; color: #fff; background: #d9433a;
+  padding: 1px 7px; border-radius: 4px; white-space: nowrap; opacity: 0; transition: opacity .12s;
+  box-shadow: 0 3px 10px rgba(0, 0, 0, .5); pointer-events: none;
+}
+#tlPlayhead.dragging .ph-bubble, #tlPlayhead .knob:hover + .ph-bubble { opacity: 1; }
+
+/* 整块胶片都是拖拽改顺序的把手，所以光标直接给"可抓"的指示 */
+.seg {
+  position: absolute; top: 0; height: 100%;
+  background: linear-gradient(180deg, rgba(20, 24, 28, .08), rgba(20, 24, 28, .55));
+  border: 1px solid rgba(87, 185, 129, .75); border-radius: 5px; cursor: grab; overflow: hidden;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), 0 1px 3px rgba(0, 0, 0, .45);
+  transition: border-color .1s, box-shadow .1s, filter .1s;
+}
+.seg:active { cursor: grabbing; }
+.seg:hover { border-color: #7fd3a3; filter: brightness(1.1); }
+.seg.sel {
+  border-color: #eaf7ef;
+  box-shadow: inset 0 0 0 1px #8ee0af, 0 0 0 1px rgba(142, 224, 175, .4), 0 2px 10px rgba(0, 0, 0, .5);
+}
+.seg.moving { opacity: .35; border-style: dashed; }
+.seg .label {
+  position: absolute; left: 5px; top: 2px; right: 5px; font-size: 11px; color: #dff5e8;
+  white-space: nowrap; overflow: hidden; pointer-events: none; text-shadow: 0 1px 2px #000;
+  display: flex; justify-content: space-between; gap: 6px;
+}
+
+.seg .drop { position: absolute; bottom: 3px; left: 5px; font-size: 10px; color: var(--accent-2); pointer-events: none; }
+.seg .handle { position: absolute; top: 0; bottom: 0; width: 11px; cursor: col-resize; z-index: 2; }
+.seg .handle.l { left: 0; border-radius: 5px 0 0 5px; }
+.seg .handle.r { right: 0; border-radius: 0 5px 5px 0; }
+.seg .handle::after {
+  content: ""; position: absolute; top: 50%; left: 50%; width: 5px; height: 20px;
+  margin: -10px 0 0 -2px; border-radius: 3px;
+  background: repeating-linear-gradient(180deg, rgba(255, 255, 255, .85) 0 1px, transparent 1px 4px);
+  opacity: .35; transition: opacity .1s, background .1s;
+}
+.seg .handle:hover::after { opacity: 1; }
+.seg:hover .handle::after { opacity: .7; }
+
+.tc.rate { color: var(--accent-2); font-weight: 700; min-width: 26px; }
+
+#tlFoot {
+  display: flex; align-items: center; gap: 10px; padding: 6px 10px;
+  background: var(--bg-2); border-bottom: 1px solid var(--line); flex: 0 0 auto;
+}
+#tlScroll {
+  position: relative; flex: 1 1 auto; height: 10px; border-radius: 5px;
+  background: #191c21; border: 1px solid var(--line); cursor: pointer; overflow: hidden;
+}
+#tlScroll.full { opacity: .35; }
+#tlThumb {
+  position: absolute; top: 0; bottom: 0; left: 0; min-width: 38px; border-radius: 5px;
+  background: linear-gradient(180deg, #59616e, #414854); cursor: grab;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18);
+}
+#tlThumb:hover { background: linear-gradient(180deg, #6c7583, #4c5462); }
+#tlThumb:active { cursor: grabbing; background: linear-gradient(180deg, #7d8797, #586172); }
+#zoomGroup { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+#zoomGroup .hint { color: #626d7d; font-size: 11px; margin-right: 4px; }
+#tlFoot .hint { color: #626d7d; font-size: 11px; }
+.hud { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; color: var(--fg-dim); }
+.hud.snap-on { color: var(--accent-2); }
+#tlFoot .hint b { color: var(--fg-dim); font-weight: 600; }
+
+/* 落位 / 吸附提示已经并进走带行；这里只留它的排版 */
+
+/* ---------- 右侧卡片 ---------- */
+.card { border: 1px solid var(--line); border-radius: 7px; background: var(--bg); margin-bottom: 10px; }
+.card h2 {
+  margin: 0; padding: 8px 10px; font-size: 12px; font-weight: 700; letter-spacing: .5px;
+  color: var(--fg-dim); border-bottom: 1px solid var(--line); text-transform: uppercase;
+}
+.card h2 .count { color: var(--fg); background: var(--bg-3); border-radius: 9px; padding: 0 7px; margin-left: 6px; }
+.card > *:not(h2) { margin-left: 10px; margin-right: 10px; }
+.card > .keep-tools { margin: 8px 10px; }
+
+.info { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; padding: 8px 0 10px; margin: 0 10px; }
+.info .row { display: contents; }
+.info dt { color: var(--fg-dim); }
+.info dd { margin: 0; text-align: right; font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.info dd.ok { color: var(--ok); }
+.info dd.warn { color: var(--warn); }
+
+.keeps { list-style: none; margin: 6px 0 0; padding: 0; max-height: 220px; overflow-y: auto; }
+.keeps li {
+  display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 6px;
+  align-items: center; padding: 5px 6px; border-radius: 5px;
+  border: 1px solid transparent; cursor: pointer; font-size: 12px;
+}
+.keeps li:hover { background: var(--bg-2); }
+.keeps li.sel { background: #23301f; border-color: #3d7a58; }
+
+.keeps li .idx { color: var(--fg-dim); }
+.keeps li .tc { white-space: nowrap; }
+.keeps li .len { color: var(--fg-dim); }
+.keeps li .snap { grid-column: 1 / -1; color: var(--fg-dim); font-size: 11px; }
+.keeps li .x { color: var(--fg-dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
+.keeps li .x:hover { color: var(--err); border-color: #6b3330; }
+.keeps .empty-row { display: block; color: var(--fg-dim); padding: 8px 6px; font-size: 12px; }
+
+.hints { font-size: 11px; color: var(--warn); margin-top: 6px; }
+.keep-tools { display: flex; align-items: center; gap: 8px; }
+
+.progress { margin: 8px 10px; }
+.progress-head { display: flex; justify-content: space-between; font-size: 12px; color: var(--fg-dim); }
+.progress-bar { height: 6px; background: var(--bg-3); border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.progress-bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #2f6ea5, #57b981); transition: width .2s; }
+.progress + .tc { margin-top: 4px; }
+
+.warnbox, .errbox {
+  font-size: 12px; border-radius: 6px; padding: 8px 10px; margin: 8px 10px;
+  white-space: pre-wrap; word-break: break-word; max-height: 170px; overflow-y: auto;
+}
+.warnbox { background: #2a2314; border: 1px solid #6a5320; color: #f0d9a8; }
+.errbox { background: #2b1817; border: 1px solid #6b3330; color: #f2b3ae; }
+
+.checks { list-style: none; margin: 8px 10px; padding: 0; font-size: 12px; }
+.checks li { display: flex; gap: 6px; padding: 2px 0; align-items: baseline; }
+.checks li .st { width: 14px; flex: 0 0 14px; text-align: center; }
+.checks li.ok .st { color: var(--ok); }
+.checks li.bad .st { color: var(--err); font-weight: 700; }
+.checks li .name { flex: 0 0 auto; color: var(--fg); }
+.checks li .detail { color: var(--fg-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.checks .title { color: var(--fg-dim); font-size: 11px; margin: 6px 0 2px; }
+
+.result-row { display: flex; gap: 8px; margin: 8px 10px 12px; }
+
+.modal-mask {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .55);
+  display: flex; align-items: center; justify-content: center; z-index: 50;
+}
+/* 三个模态共用一套行语言：m-row = 左标题 / 右控件，副说明另起一行铺满。
+   谁承载信息谁就亮：导出的主角是设置名，快捷键的主角是键位，所以后者标签压暗。
+   只有真能点的行（button / label）才有 hover 底色，纯展示的 div 行不染背景。 */
+.modal {
+  background: var(--bg-2); border: 1px solid var(--line); border-radius: 8px;
+  padding: 14px 16px; width: min(460px, 90vw); box-shadow: 0 20px 60px rgba(0, 0, 0, .6);
+}
+.modal h3 { margin: 0 0 4px; font-size: 14px; }
+.modal-tip { color: var(--fg-dim); font-size: 11px; margin: 0 0 12px; line-height: 1.6; }
+.m-row {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 12px; align-items: center;
+  width: 100%; margin: 0 0 2px; padding: 6px 8px; border: 0; border-radius: 6px;
+  background: transparent; color: var(--fg); font: inherit; text-align: left;
+}
+button.m-row, label.m-row { cursor: pointer; }
+button.m-row:hover, label.m-row:hover { background: #23272e; }
+.m-label { color: var(--fg); font-size: 12px; }
+.m-label.dim { color: var(--fg-dim); }
+.m-sub { grid-column: 1 / -1; color: #626d7d; font-size: 11px; line-height: 1.5; }
+.m-row.on .m-sub { color: var(--warn); }
+/* 键帽：快捷键的键位和导入提示用的是同一颗帽，只是能不能点 */
+.m-chip {
+  font: 11px/1.5 "Cascadia Mono", Consolas, monospace; color: var(--fg-dim);
+  background: var(--bg-3); border: 1px solid var(--line); border-bottom-width: 2px;
+  border-radius: 4px; padding: 2px 8px; min-width: 96px; text-align: center; white-space: nowrap;
+}
+.m-chip.act { color: var(--fg); cursor: pointer; }
+.m-chip.act:hover { border-color: #3b4250; background: #2b3038; }
+.m-chip.capture { border-color: var(--accent); color: var(--accent); background: #16283c; }
+.m-act { display: flex; align-items: center; gap: 4px; }
+.m-reset { background: none; border: none; color: #55606e; cursor: pointer; font-size: 13px; padding: 0 3px; }
+.m-reset:hover { color: var(--fg); }
+.m-field { display: flex; align-items: center; gap: 6px; }
+.m-field input[type="text"] {
+  width: 190px; font: 12px/1.4 "Cascadia Mono", Consolas, monospace; color: var(--fg);
+  background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 7px;
+}
+.m-field input[type="text"]:focus { outline: none; border-color: #3b4250; }
+/* 勾选框画成拨杆：原生方框在暗面板里像个没画完的控件，和右边的键帽也不是一路的 */
+.m-row input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none; position: relative;
+  width: 34px; height: 18px; margin: 0; border-radius: 9px; cursor: pointer;
+  background: var(--bg-3); border: 1px solid var(--line); transition: background .12s, border-color .12s;
+}
+.m-row input[type="checkbox"]::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 12px; height: 12px;
+  border-radius: 50%; background: #8f9aa8; transition: left .12s, background .12s;
+}
+.m-row input[type="checkbox"]:checked { background: #1f4a70; border-color: #2f6ea5; }
+.m-row input[type="checkbox"]:checked::after { left: 18px; background: #e6ebf2; }
+.m-row input[type="checkbox"]:disabled { opacity: .45; cursor: not-allowed; }
+.m-estimate {
+  margin: 10px 0 0; padding: 8px 10px; border-radius: 6px; background: var(--bg);
+  border: 1px solid var(--line); font-size: 12px; color: var(--fg-dim);
+}
+.m-estimate b { color: var(--fg); }
+.m-foot {
+  display: flex; align-items: center; gap: 8px;
+  margin: 12px 0 0; padding: 10px 0 0; border-top: 1px solid var(--line);
+}
+.modal-mask.keys { z-index: 60; }
+.keys-grid { display: flex; flex-direction: column; max-height: 52vh; overflow-y: auto; padding-right: 4px; }
+/* 导出模态内容最长：面板自己滚，页脚（导出 / 取消 / 关闭）钉在底边不会滚走 */
+.modal.export { max-height: 86vh; overflow-y: auto; padding-bottom: 0; }
+.modal.export .m-foot {
+  position: sticky; bottom: 0; margin: 12px -16px 0; padding: 10px 16px 14px; background: var(--bg-2);
+}
+.modal .progress, .modal .checks, .modal .warnbox, .modal .errbox, .modal .result-row { margin-left: 0; margin-right: 0; }
+.modal .checks { padding: 0; }
+
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-thumb { background: #30353f; border-radius: 5px; border: 2px solid var(--bg); }
+::-webkit-scrollbar-track { background: transparent; }

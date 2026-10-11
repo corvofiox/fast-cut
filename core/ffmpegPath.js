@@ -2,8 +2,8 @@
 
 /**
  * ffmpeg / ffprobe 可执行文件解析。
- * 优先级：显式传入 > 环境变量 FAST_CUT_FFMPEG_DIR > PATH > 常见安装目录。
- * 打包版会把静态二进制放到 vendor/ 下，届时由 main 进程传入 vendor 路径。
+ * 优先级：显式传入的目录（可多个，打包内置的静态版排最前）> 环境变量 FAST_CUT_FFMPEG_DIR
+ * > 常见安装目录 > PATH。
  */
 
 const fs = require('fs');
@@ -27,9 +27,9 @@ const COMMON_DIRS = process.platform === 'win32'
 
 const EXE = process.platform === 'win32' ? '.exe' : '';
 
-function resolveBin(name, explicitDir) {
+function resolveBin(name, explicitDirs) {
   const dirs = [];
-  if (explicitDir) dirs.push(explicitDir);
+  for (const d of [].concat(explicitDirs || []).filter(Boolean)) dirs.push(d);
   if (process.env.FAST_CUT_FFMPEG_DIR) dirs.push(process.env.FAST_CUT_FFMPEG_DIR);
   dirs.push(...COMMON_DIRS);
 

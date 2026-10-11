@@ -8,6 +8,7 @@
  */
 
 const { execSync } = require('child_process');
+const path = require('path');
 const { loadSource, exportSegments } = require('./pipeline');
 
 const SEGS = [
@@ -27,7 +28,8 @@ function frameHash(file, from, to) {
 async function run(label, file, precise) {
   console.log(`\n===== ${label}（精确模式=${precise ? '开' : '关'}）=====`);
   const loaded = await loadSource(file);
-  const outPath = file.replace(/\.mp4$/, `-multi-${label}.mp4`);
+  const ext = path.extname(file);
+  const outPath = `${path.join(path.dirname(file), path.basename(file, ext))}-multi-${label}${ext}`;
   const r = await exportSegments(loaded, SEGS, {
     outPath,
     precise,

@@ -1,0 +1,179 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; img-src 'self' file: blob: data:; media-src 'self' file: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'" />
+  <title>Fast Cut</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+<div id="shell">
+  <header id="topbar">
+    <div class="brand">Fast Cut<span class="ver">v0.1</span></div>
+    <div class="src-name" id="srcName" title="">未导入视频</div>
+    <div class="grow"></div>
+    <div class="pop-wrap">
+      <button id="btnMenu" class="btn icon" title="菜单">☰</button>
+      <div id="menuPop" class="popover menu hidden" role="menu">
+        <button class="mi" data-action="import">导入视频…<kbd>Ctrl+O</kbd></button>
+        <button class="mi" data-action="export">导出…<kbd>Ctrl+E</kbd></button>
+        <div class="mi-sep"></div>
+        <button class="mi" data-action="undo">撤销<kbd>Ctrl+Z</kbd></button>
+        <button class="mi" data-action="redo">重做<kbd>Ctrl+Y</kbd></button>
+        <button class="mi" data-action="reset">恢复整条素材</button>
+        <div class="mi-sep"></div>
+        <button class="mi" data-action="fit">整条适应<kbd>Ctrl+0</kbd></button>
+        <button class="mi" data-action="shortcuts">快捷键设置<kbd>?</kbd></button>
+        <div class="mi-sep"></div>
+        <button class="mi" data-action="about">关于 Fast Cut</button>
+        <button class="mi" data-action="quit">退出<kbd>Alt+F4</kbd></button>
+      </div>
+    </div>
+    <button id="btnKeys" class="btn icon" title="快捷键设置">⌨</button>
+    <button id="btnImportOpen" class="btn icon" title="导入视频">⤓</button>
+    <button id="btnExportOpen" class="btn icon" title="导出视频">⤒</button>
+    <div class="wctl-group">
+      <button id="winMin" class="wctl" title="最小化"><i class="g-min"></i></button>
+      <button id="winMax" class="wctl" title="最大化"><i class="g-max"></i></button>
+      <button id="winClose" class="wctl close" title="关闭"><i class="g-x"></i></button>
+    </div>
+  </header>
+
+  <main id="body">
+    <section id="left">
+      <div id="stage">
+        <video id="player" preload="auto" playsinline></video>
+        <div id="empty">
+          <div class="empty-title">把视频文件拖进来</div>
+          <div class="empty-sub">只做裁剪 · 流拷贝导出 · mp4 / mov / mkv / webm …</div>
+          <button id="btnImportEmpty" class="btn primary big">选择文件</button>
+          <div class="empty-note" id="emptyNote"></div>
+        </div>
+        <div id="toast" class="hidden"></div>
+      </div>
+
+      <div id="transport">
+        <button id="btnPrevKf" class="btn icon" title="上一个关键帧 (Shift+←)">⇤</button>
+        <button id="btnStepBack" class="btn icon" title="上一帧 (, 或 ←)">◂</button>
+        <button id="btnPlay" class="btn icon play" title="播放 / 暂停 (空格 / K)">▶</button>
+        <button id="btnStepFwd" class="btn icon" title="下一帧 (. 或 →)">▸</button>
+        <button id="btnNextKf" class="btn icon" title="下一个关键帧 (Shift+→)">⇥</button>
+        <span class="sep-line"></span>
+        <button id="btnUndo" class="btn icon tiny" title="撤销 (Ctrl+Z)">↶</button>
+        <button id="btnRedo" class="btn icon tiny" title="重做 (Ctrl+Y)">↷</button>
+        <button id="btnReset" class="btn icon tiny" title="恢复整条素材">↺</button>
+        <span class="sep-line"></span>
+        <span id="hud" class="hud"></span>
+        <div class="grow"></div>
+        <span id="timecode" class="tc">--:--.--- <span class="sep">/</span> --:--.---</span>
+        <span id="frameNo" class="tc dim">帧 --</span>
+        <span id="rateTag" class="tc rate"></span>
+      </div>
+
+      <div id="timeline">
+        <canvas id="tlCanvas"></canvas>
+        <div id="tlLane"></div>
+        <div id="tlPlayhead" class="hidden">
+          <div class="ph-bubble"></div>
+          <div class="knob" title="按住拖动可精确定位播放头"></div>
+        </div>
+      </div>
+
+      <div id="tlFoot">
+        <div id="tlScroll" title="拖动滑块或点击轨道横向滚动"><i id="tlThumb"></i></div>
+        <div id="zoomGroup">
+          <button id="btnFit" class="btn tiny" title="整条时间线 (Ctrl+0)">适应</button>
+        </div>
+      </div>
+    </section>
+
+    <aside id="right">
+      <section class="card">
+        <h2>源信息</h2>
+        <dl id="info" class="info">
+          <div class="row"><dt>状态</dt><dd>未导入</dd></div>
+        </dl>
+      </section>
+
+      <section class="card">
+        <h2>片段 <span id="keepCount" class="count">0</span></h2>
+        <ul id="keepList" class="keeps"></ul>
+        <div id="planHints" class="hints"></div>
+        <div class="keep-tools">
+          <span class="grow"></span>
+          <span id="keepTotal" class="tc dim"></span>
+        </div>
+      </section>
+    </aside>
+  </main>
+</div>
+<div id="dropVeil" class="hidden"><div class="veil-box">松开即可导入视频</div></div>
+
+<div id="importMask" class="modal-mask hidden">
+  <div class="modal">
+    <h3>导入视频</h3>
+    <button class="m-row" id="btnImportPick">
+      <span class="m-label">选择文件…</span><kbd class="m-chip">Ctrl+O</kbd>
+    </button>
+    <div class="m-foot"><span class="grow"></span><button class="btn" data-close="importMask">关闭</button></div>
+  </div>
+</div>
+
+<div id="exportMask" class="modal-mask hidden">
+  <section class="modal export">
+    <h3>导出</h3>
+    <div class="modal-tip">默认整段流拷贝，不重编码、不改画质，切点会前移到最近的关键帧。</div>
+    <label class="m-row">
+      <span class="m-label">精确模式</span>
+      <input type="checkbox" id="optPrecise" />
+      <span class="m-sub">入点精确到帧，代价是入点小段做<b>有损重编码</b>（CRF 18、同 profile）</span>
+    </label>
+    <label class="m-row">
+      <span class="m-label">每段一个文件</span>
+      <input type="checkbox" id="optSplit" />
+      <span class="m-sub">默认按顺序拼接成一个文件；勾选后输出 part01 / part02 …</span>
+    </label>
+    <div class="m-row">
+      <span class="m-label">输出目录</span>
+      <span class="m-field">
+        <input type="text" id="outDir" readonly placeholder="尚未选择" />
+        <button id="btnChooseDir" class="btn tiny">浏览…</button>
+      </span>
+    </div>
+    <div class="m-row">
+      <span class="m-label">文件名</span>
+      <span class="m-field">
+        <input type="text" id="outName" placeholder="源文件名-cut" spellcheck="false" />
+        <span id="outExt" class="tc dim">.mp4</span>
+      </span>
+    </div>
+
+    <div id="estimate" class="m-estimate">—</div>
+
+    <div id="progress" class="progress hidden">
+      <div class="progress-head"><span id="progressPhase">准备中</span><span id="progressPct">0%</span></div>
+      <div class="progress-bar"><i id="progressFill"></i></div>
+      <div id="progressDetail" class="tc dim"></div>
+    </div>
+
+    <div id="warnings" class="warnbox hidden"></div>
+    <div id="error" class="errbox hidden"></div>
+    <ul id="checks" class="checks"></ul>
+    <div id="resultRow" class="result-row hidden">
+      <button id="btnReveal" class="btn tiny">打开所在文件夹</button>
+      <button id="btnPlayOut" class="btn tiny">用系统播放器打开</button>
+    </div>
+
+    <div class="m-foot">
+      <span class="grow"></span>
+      <button id="btnCancelExport" class="btn danger hidden">取消导出</button>
+      <button id="btnExport" class="btn primary" disabled title="按源容器与编码流拷贝导出">导出</button>
+      <button id="btnExportDone" class="btn" data-close="exportMask">关闭</button>
+    </div>
+  </section>
+</div>
+<script src="timeline.js"></script>
+<script src="app.js"></script>
+</body>
+</html>

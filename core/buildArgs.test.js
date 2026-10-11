@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { argsForSegment, argsForConcat, concatListBody, fmtTime, pickVideoCodec } = require('./buildArgs');
+const { argsForSegment, argsForConcat, concatListBody, fmtTime, pickVideoCodec, profileArg } = require('./buildArgs');
 
 const MEDIA = {
   file: 'C:\\videos\\src.mp4',
@@ -56,8 +56,18 @@ test('重编码段沿用源的编码参数，音轨仍拷贝', () => {
 test('H.265 源精确模式选 libx265，且 colorRange unknown 不注入空参数', () => {
   const hevc = { ...MEDIA, video: { codec: 'hevc', profile: 'Main', pixFmt: 'yuv420p', fps: 25, colorPrimaries: 'unknown', colorTransfer: 'unknown', colorSpace: 'unknown' } };
   const args = argsForSegment({ kind: 'reencode', start: 1, end: 2 }, hevc, 'out.mp4');
+  const i = (x) => args.indexOf(x);
   assert.ok(args.includes('libx265'));
   assert.ok(!args.includes('unknown'));
+  // libx265 只认小写无空格的 profile，原样传 "Main" 会打不开编码器（实测）
+  assert.strictEqual(args[i('-profile:v') + 1], 'main');
+});
+
+test('VP9 / AV1 源不注入 profile（写法不同，交给编码器）', () => {
+  const vp9 = { ...MEDIA, video: { codec: 'vp9', profile: 'Profile 0', pixFmt: 'yuv420p', fps: 30 } };
+  assert.ok(!argsForSegment({ kind: 'reencode', start: 1, end: 2 }, vp9, 'out.webm').includes('-profile:v'));
+  assert.strictEqual(profileArg(vp9.video, 'libvpx-vp9'), null);
+  assert.strictEqual(profileArg({ profile: 'Main 10' }, 'libx265'), 'main10');
 });
 
 test('单段输出退化为直接拷贝到目标', () => {

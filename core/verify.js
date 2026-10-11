@@ -80,14 +80,34 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
   add('时长符合预期', durOk, `用户选区 ≈${expect.duration.toFixed(3)}s（吸附后只增不减），实际 ${snap(outDur)}s，允许多出 ≤${gopBudget.toFixed(1)}s`);
 
   // 播放性：完整解码全片。比"能打开"更强的判据，能抓出索引损坏/花屏/丢帧。
+  // 注意：`-xerror` 并不能拦住所有解码错误——实测 HEVC 开 GOP 的多段拼接产物
+  // 会打 "Could not find ref with POC n"，但 ffmpeg 仍以退出码 0 结束。
+  // 因此这里以 `-v error` 的 stderr 为准：该级别下输出的都是真问题。
   try {
-    await run(ffmpegPath, ['-v', 'error', '-xerror', '-i', outFile, '-f', 'null', '-']);
-    add('完整解码无错误', true, 'ffmpeg -xerror 全量解码通过');
+    const { stderr } = await run(ffmpegPath, ['-v', 'error', '-xerror', '-i', outFile, '-f', 'null', '-']);
+    const noise = decodeErrors(stderr);
+    add('完整解码无错误', noise.length === 0,
+      noise.length ? `解码报错：${noise[0]}${noise.length > 1 ? ` （共 ${noise.length} 条）` : ''}` : 'ffmpeg -xerror 全量解码通过');
   } catch (e) {
     add('完整解码无错误', false, e.message);
   }
 
   return { ok: checks.every((c) => c.ok), checks };
+}
+
+/**
+ * `-f null` 也要过一遍 muxer：带字幕轨的 mkv 会冒出
+ * "non monotonically increasing dts to muxer"（字幕包共享同一个 DTS），
+ * 那是封装层的碎语，不是画面/声音坏了。除此以外的 -v error 输出都按真错误处理。
+ */
+const BENIGN_DECODE_NOISE = /non monotonically increasing dts to muxer/i;
+
+/** 从 ffmpeg 的 stderr 里挑出真正的错误行。 */
+function decodeErrors(stderr) {
+  return String(stderr || '')
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !BENIGN_DECODE_NOISE.test(line));
 }
 
 async function probeRaw(ffprobePath, file) {
@@ -117,4 +137,4 @@ function ratioEq(a, b) {
   return frameRateEq(a, b);
 }
 
-module.exports = { verifyExport };
+module.exports = { verifyExport, decodeErrors };

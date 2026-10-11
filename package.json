@@ -8,11 +8,47 @@
   "scripts": {
     "start": "electron .",
     "dev": "electron .",
-    "core:test": "node --test core/",
-    "core:demo": "node core/demo.js"
+    "core:test": "node --test \"core/*.test.js\"",
+    "core:demo": "node core/demo.js",
+    "core:codecs": "node scripts/codecs.js",
+    "smoke": "electron scripts/smoke.js",
+    "dist": "electron-builder --win --x64",
+    "dist:dir": "electron-builder --win --x64 --dir"
   },
-  "dependencies": {},
+  "build": {
+    "appId": "cn.fastcut.desktop",
+    "productName": "Fast Cut",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "src/**/*",
+      "core/**/*",
+      "!**/*.test.js"
+    ],
+    "extraResources": [
+      {
+        "from": "vendor/ffmpeg",
+        "to": "ffmpeg",
+        "filter": ["**/*.exe"]
+      }
+    ],
+    "asar": true,
+    "win": {
+      "target": [
+        {
+          "target": "portable",
+          "arch": ["x64"]
+        }
+      ],
+      "artifactName": "Fast-Cut-${version}-${arch}.exe"
+    },
+    "portable": {
+      "unpackDirName": "FastCut"
+    }
+  },
   "devDependencies": {
-    "electron": "^28.0.0"
+    "electron": "^28.3.3",
+    "electron-builder": "^26.15.3"
   }
 }
