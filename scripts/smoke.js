@@ -110,17 +110,19 @@ const HELPERS = `
       return { before, after: __smoke.tl.currentProgramTime(), sel: __smoke.state.sel };
     },
     /**
-     * 按住某个片段左端的手柄拖动，全程回报"手柄中心离指针多远"。
+     * 按住某个片段的某个端点手柄拖动，全程回报"手柄中心离指针多远"。
      * 边界拖动只能这样验：端点先弹开一下、再按固定偏差跟随鼠标，读最终数值看不出问题。
+     * 另一端的切点必须一动不动 —— 只量被拖的那端会漏掉"拖右端其实在拖左端"这类错。
      */
-    dragHandle: async (index, toPx) => {
+    dragHandle: async (index, toPx, side) => {
       window.__t.closeMasks();
+      side = side || 'l';
       const box = document.getElementById('timeline');
       const rect = box.getBoundingClientRect();
       const yy = window.__t.LANE_Y;
-      const sel = '#tlLane .seg[data-index="' + index + '"] .handle.l';
-      const center = () => {
-        const el = document.querySelector(sel);
+      const selOf = (s) => '#tlLane .seg[data-index="' + index + '"] .handle.' + s;
+      const center = (s) => {
+        const el = document.querySelector(selOf(s));
         if (!el) return null;
         const r = el.getBoundingClientRect();
         return r.left + r.width / 2 - rect.left;
@@ -129,19 +131,31 @@ const HELPERS = `
         .dispatchEvent(new PointerEvent(type, {
           pointerId: 27, clientX: rect.left + px, clientY: rect.top + yy, bubbles: true, isPrimary: true,
         }));
-      const x0 = center();
-      if (x0 == null) return { error: '找不到手柄元素' };
+      const other = side === 'l' ? 'r' : 'l';
+      __smoke.tl.fit();          // 目标可能在放大后的视口外，先整条收进来再量
+      await new Promise((r) => setTimeout(r, 60));
+      const el = document.querySelector(selOf(side));
+      if (!el) return { error: '找不到手柄元素' };
+      if (getComputedStyle(el).display === 'none') return { error: '这一端没有边界（头段左/尾段右），手柄是隐藏的' };
+      const x0 = center(side);
+      if (x0 == null) return { error: '手柄量不到位置' };
+      if (x0 < 0 || x0 > rect.width) return { error: '手柄不在视口内（x=' + Math.round(x0) + ' / 宽 ' + Math.round(rect.width) + '）' };
+      const other0 = center(other);
+      const clips0 = __smoke.state.clips.map((c) => [c.start, c.end]);
       fire('pointerdown', x0);
       const trail = [];
       for (const px of [x0 + toPx * 0.4, x0 + toPx]) {
         fire('pointermove', px);
         await new Promise((r) => setTimeout(r, 70));
-        const got = center();
+        const got = center(side);
         trail.push({ want: Math.round(px), got: got == null ? -999 : Math.round(got) });
       }
       fire('pointerup', x0 + toPx);
       await new Promise((r) => setTimeout(r, 200));
-      return { x0: Math.round(x0), trail, clips: __smoke.state.clips.map((c) => [c.start, c.end]) };
+      return {
+        x0: Math.round(x0), trail, clips: __smoke.state.clips.map((c) => [c.start, c.end]), clips0,
+        otherDrift: Math.round(Math.abs((center(other) == null ? -999 : center(other)) - other0)),
+      };
     },
     wheel: async (opts) => {
       const box = document.getElementById('timeline');
@@ -473,6 +487,30 @@ async function main() {
   await js(win, '__smoke.resetClips(); "ok"');
   await wait(250);
 
+  // 8c) 切三段后逐段拖**右**端：只有右边那个切点能动。
+  //     旧实现的命中判断不区分左右柄，第二段及以后拖右端其实在拖自己的左端。
+  await js(win, '__smoke.seekProgram(3); __smoke.splitAtPlayhead(); __smoke.seekProgram(6); __smoke.splitAtPlayhead(); "ok"');
+  await wait(350);
+  for (const idx of [0, 1]) {
+    const r = JSON.parse(await js(win, `__t.dragHandle(${idx}, 40, 'r').then((x) => JSON.stringify(x))`));
+    if (r.error) { check(`第 ${idx + 1} 段拖右端：动的是右端的切点，左端纹丝不动`, false, r.error); continue; }
+    const d = r.trail.map((p) => Math.abs(p.got - p.want));
+    const moved = r.clips.map((c, i) => [c[0] - r.clips0[i][0], c[1] - r.clips0[i][1]]);
+    const cut = moved[idx][1];
+    // 右端那个切点是"本段末 = 下段起"同一个值，必须一起动；
+    // 真正要盯住不动的是本段的左端和上一段的右端 —— 拖错边就动的是它们。
+    const together = Math.abs(moved[idx + 1][0] - cut) < 0.02;
+    const leftIntact = Math.abs(moved[idx][0]) < 0.02 && (idx === 0 || Math.abs(moved[idx - 1][1]) < 0.02);
+    check(`第 ${idx + 1} 段拖右端：动的是右端的切点，左端纹丝不动`,
+      Math.max(...d) <= 4 && r.otherDrift <= 4 && Math.abs(cut) > 0.15 && together && leftIntact,
+      `偏差 ${d.map((x) => x.toFixed(0)).join('/')}px · 对侧漂移 ${r.otherDrift}px · `
+      + `切点增量 ${moved.map((m) => m.map((v) => v.toFixed(2)).join('~')).join(' | ')} · 源区间 ${JSON.stringify(r.clips)}`);
+    await js(win, '__smoke.undo(); "ok"');
+    await wait(250);
+  }
+  await js(win, '__smoke.resetClips(); "ok"');
+  await wait(250);
+
   // 8b) J/K/L 变速播放
   await js(win, '__smoke.seekProgram(0); __smoke.stepRate(1); "ok"');
   await wait(450);
@@ -566,7 +604,8 @@ async function main() {
   // 8f) 缓存全命中时主进程会在渲染层认源之前就把胶片推出来，必须还能画上去
   await js(win, `__smoke.importFile(${JSON.stringify(SRC)}); 'ok'`);
   await waitFor('__smoke.state.src && __smoke.state.scanning === false', win);
-  await wait(700);
+  // 定长 sleep 会漂（画胶片排在 rAF 之后），改成轮询到画完为止
+  await waitFor('__smoke.tl.filmDraws >= ((__smoke.state.thumbs || {}).count || 0)', win, 15000);
   const warm = JSON.parse(await js(win, 'JSON.stringify({ thumbs: (__smoke.state.thumbs || {}).count || 0, draws: __smoke.tl.filmDraws })'));
   check('第二次导入（全走缓存）胶片条还在', warm.thumbs > 0 && warm.draws >= warm.thumbs,
     `胶片 ${warm.thumbs} 张 / 一帧里画了 ${warm.draws} 格`);

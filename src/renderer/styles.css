@@ -230,6 +230,9 @@ html, body {
 .seg .handle { position: absolute; top: 0; bottom: 0; width: 11px; cursor: col-resize; z-index: 2; }
 .seg .handle.l { left: 0; border-radius: 5px 0 0 5px; }
 .seg .handle.r { right: 0; border-radius: 0 5px 5px 0; }
+/* 头段的左边、尾段的右边外侧没有边界可拖（成片时间轴就是这两条端点本身），
+   画出来只会让人去拖一个不该动的地方 */
+.seg:first-child .handle.l, .seg:last-child .handle.r { display: none; }
 .seg .handle::after {
   content: ""; position: absolute; top: 50%; left: 50%; width: 5px; height: 20px;
   margin: -10px 0 0 -2px; border-radius: 3px;

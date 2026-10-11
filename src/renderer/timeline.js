@@ -492,17 +492,25 @@ function createTimeline(options) {
     const y = e.clientY - root.getBoundingClientRect().top;
     const segEl = e.target.closest ? e.target.closest('.seg') : null;
     const index = segEl ? Number(segEl.dataset.index) : -1;
-    const onHandle = !!(segEl && e.target.classList && e.target.classList.contains('handle'));
+    // 每段左右各有一个 .handle，两边都是同一个边界：左柄 = 本段与前段的边界（index-1），
+    // 右柄 = 本段与后段的边界（index）。以前只判断"按到了手柄"就一律当左柄，
+    // 于是第二段及以后**拖右端其实在拖自己的左端**（只有第一段的右端碰巧对）。
+    const side = segEl && e.target.classList && e.target.classList.contains('handle')
+      ? (e.target.classList.contains('r') ? 'r' : 'l')
+      : null;
 
     if (y < LANE_TOP) {
       // 顶部刻度条整条都是"手柄道"：按下去就拖播放头，不必去瞄准 12px 宽的手柄
       drag = { mode: 'scrub', x0: x, moved: 0 };
       playheadEl.classList.add('dragging');
       moveTo(x, { allowSnap: false, select: true });
-    } else if (onHandle && index > 0) {
+    } else if (side === 'l' && index > 0) {
       drag = Object.assign({ mode: 'boundary', index: index - 1, moved: 0 }, boundaryAnchor(index - 1, x));
-    } else if (onHandle && index < clips.length - 1) {
+    } else if (side === 'r' && index < clips.length - 1) {
       drag = Object.assign({ mode: 'boundary', index, moved: 0 }, boundaryAnchor(index, x));
+    } else if (side) {
+      // 第一段左柄 / 最后一段右柄：那头没有边界，什么都不做。
+      // 不能让它落到"拖动改顺序"，否则抓片段边缘那一下会把整段拎起来。
     } else if (index >= 0) {
       // 胶片本身：按下就是抓住这段素材，拖动改顺序；单击只选中，绝不动播放头
       drag = { mode: 'reorder', from: index, x0: x, moved: 0 };
