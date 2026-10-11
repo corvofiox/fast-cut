@@ -109,6 +109,40 @@ const HELPERS = `
       await new Promise((r) => setTimeout(r, 200));
       return { before, after: __smoke.tl.currentProgramTime(), sel: __smoke.state.sel };
     },
+    /**
+     * 按住某个片段左端的手柄拖动，全程回报"手柄中心离指针多远"。
+     * 边界拖动只能这样验：端点先弹开一下、再按固定偏差跟随鼠标，读最终数值看不出问题。
+     */
+    dragHandle: async (index, toPx) => {
+      window.__t.closeMasks();
+      const box = document.getElementById('timeline');
+      const rect = box.getBoundingClientRect();
+      const yy = window.__t.LANE_Y;
+      const sel = '#tlLane .seg[data-index="' + index + '"] .handle.l';
+      const center = () => {
+        const el = document.querySelector(sel);
+        if (!el) return null;
+        const r = el.getBoundingClientRect();
+        return r.left + r.width / 2 - rect.left;
+      };
+      const fire = (type, px) => (document.elementFromPoint(rect.left + px, rect.top + yy) || box)
+        .dispatchEvent(new PointerEvent(type, {
+          pointerId: 27, clientX: rect.left + px, clientY: rect.top + yy, bubbles: true, isPrimary: true,
+        }));
+      const x0 = center();
+      if (x0 == null) return { error: '找不到手柄元素' };
+      fire('pointerdown', x0);
+      const trail = [];
+      for (const px of [x0 + toPx * 0.4, x0 + toPx]) {
+        fire('pointermove', px);
+        await new Promise((r) => setTimeout(r, 70));
+        const got = center();
+        trail.push({ want: Math.round(px), got: got == null ? -999 : Math.round(got) });
+      }
+      fire('pointerup', x0 + toPx);
+      await new Promise((r) => setTimeout(r, 200));
+      return { x0: Math.round(x0), trail, clips: __smoke.state.clips.map((c) => [c.start, c.end]) };
+    },
     wheel: async (opts) => {
       const box = document.getElementById('timeline');
       const r = box.getBoundingClientRect();
@@ -420,6 +454,24 @@ async function main() {
   check('重做再次执行 Q 的删除', (await js(win, '__smoke.programTotal()')) === 8);
   await js(win, '__smoke.resetClips(); "ok"');
   await wait(300);
+
+  // 8a) 拖"右段左端点"伸缩：手柄必须一直压在指针底下。
+  //     旧实现拿 progToSrc(指针) 当新切点，指针一旦落进右段就取到右段的**源**坐标，
+  //     端点先弹开"此前删掉的素材长度"（这里 3→5，即 2 秒 ≈ 100px），再按这个固定偏差跟鼠标。
+  await js(win, '__smoke.seekProgram(3); __smoke.splitAtPlayhead(); __smoke.seekProgram(5); __smoke.rippleDeleteBefore(); "ok"');
+  await wait(350);
+  const handleState = JSON.parse(await js(win, 'JSON.stringify(__smoke.state.clips)'));
+  const handle = JSON.parse(await js(win, '__t.dragHandle(1, 45).then((r) => JSON.stringify(r))'));
+  const back = JSON.parse(await js(win, '__t.dragHandle(1, -30).then((r) => JSON.stringify(r))'));
+  const dev = handle.trail.concat(back.trail).map((p) => Math.abs(p.got - p.want));
+  check('拖右段左端点伸缩：手柄不弹开，两个方向都跟住指针',
+    !handle.error && handleState.length === 2 && Math.max(...dev) <= 4,
+    handle.error
+      || `右拖 指针 ${handle.trail.map((p) => p.want).join('/')}px / 手柄 ${handle.trail.map((p) => p.got).join('/')}px · `
+      + `左拖 指针 ${back.trail.map((p) => p.want).join('/')}px / 手柄 ${back.trail.map((p) => p.got).join('/')}px · `
+      + `最大偏差 ${Math.max(...dev).toFixed(0)}px · 源区间 ${JSON.stringify(back.clips)}`);
+  await js(win, '__smoke.resetClips(); "ok"');
+  await wait(250);
 
   // 8b) J/K/L 变速播放
   await js(win, '__smoke.seekProgram(0); __smoke.stepRate(1); "ok"');

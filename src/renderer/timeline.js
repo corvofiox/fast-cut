@@ -137,6 +137,26 @@ function createTimeline(options) {
     return null;
   }
 
+  /**
+   * 拖边界（片段端点）的锚点。
+   *
+   * 不能用 progToSrc(指针) 当新的切点：指针一旦落进右段，那条函数给的是**右段的源坐标**，
+   * 而右段的源起点比这条边界的成片位置晚了"此前删掉的素材总长"——第一次 move 就把端点
+   * 弹开那么远，之后按这个固定偏差跟着鼠标走（实测切一刀再拖右段左端点，端点瞬间跳 2s+）。
+   * 所以按住的那一刻记下边界自己的源值 src0 与成片位置 prog0，拖动只喂**位移量**，
+   * grab 再把"按在端点哪一侧"的初始偏差也抵掉，端点就不会先跳一下。
+   */
+  function boundaryAnchor(index, x) {
+    const left = clips[index];
+    if (!left) return { src0: 0, prog0: 0, grab: 0 };
+    const prog0 = left.pe;
+    return { src0: left.end, prog0, grab: xToT(x) - prog0 };
+  }
+
+  function boundaryValue(drag, x) {
+    return ms(drag.src0 + (xToT(x) - drag.prog0) - drag.grab);
+  }
+
   function clipIndexAtProg(pt) {
     for (let i = 0; i < clips.length; i++) {
       if (pt >= clips[i].ps - EPS && pt <= clips[i].pe + EPS) return i;
@@ -480,9 +500,9 @@ function createTimeline(options) {
       playheadEl.classList.add('dragging');
       moveTo(x, { allowSnap: false, select: true });
     } else if (onHandle && index > 0) {
-      drag = { mode: 'boundary', index: index - 1, moved: 0 };
+      drag = Object.assign({ mode: 'boundary', index: index - 1, moved: 0 }, boundaryAnchor(index - 1, x));
     } else if (onHandle && index < clips.length - 1) {
-      drag = { mode: 'boundary', index, moved: 0 };
+      drag = Object.assign({ mode: 'boundary', index, moved: 0 }, boundaryAnchor(index, x));
     } else if (index >= 0) {
       // 胶片本身：按下就是抓住这段素材，拖动改顺序；单击只选中，绝不动播放头
       drag = { mode: 'reorder', from: index, x0: x, moved: 0 };
@@ -513,7 +533,7 @@ function createTimeline(options) {
     if (drag.mode === 'scrub') {
       moveTo(x, { allowSnap: true, select: false });
     } else if (drag.mode === 'boundary' && cb.onBoundary) {
-      cb.onBoundary(drag.index, progToSrc(tToX(x)));
+      cb.onBoundary(drag.index, boundaryValue(drag, x));
     } else if (drag.mode === 'reorder') {
       const t = xToT(x);
       let to = clips.findIndex((c) => t >= c.ps && t < c.pe);
