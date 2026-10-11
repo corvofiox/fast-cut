@@ -7,6 +7,18 @@
 
 const { spawn } = require('child_process');
 const { snap } = require('./segments');
+const { familyOfFormat } = require('./containers');
+
+/**
+ * format.duration 有没有把 start_time 算进去，各家写法不一样（实测）：
+ *  - mkv：22.368 = 偏移 12.322 + 内容 10.023 —— 算进去了，得减
+ *  - mpegts：10.023 而 start_time 15.077 —— 没算进去，不能减
+ * 只认这两族，其余（avi/webm/ts…）宁可当"没算进去"，减错会让时间轴比内容短。
+ */
+function includesOffset(formatName) {
+  const family = familyOfFormat(formatName);
+  return family === 'mov' || family === 'matroska';
+}
 
 /** 构造 ffmpeg 参数：把 run({args, ...}) 展开成数组，便于测试注入假执行器。 */
 function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000 } = {}) {
@@ -104,7 +116,19 @@ function normalizeProbe(raw, file = '(unknown)') {
   const audios = (raw.streams || []).filter((s) => s.codec_type === 'audio');
   const subs = (raw.streams || []).filter((s) => s.codec_type === 'subtitle');
 
-  const duration = snap(Number(fmt.duration ?? video?.duration ?? 0));
+  /**
+   * 时间原点：ts / mpegts 录制和带 `-output_ts_offset` 的 mkv，首帧 pts 不是 0（实测相机
+   * .ts 从 13.745s 起）。mkv 还会把这段偏移算进 format.duration（10s 的片子报 22.368s）。
+   * 界面上所有时刻、关键帧表、-ss 都必须走"相对时间原点"的坐标，否则用户选 0.5–2.3s
+   * 实际拿到的是文件开头那段，整条时间轴平移。换算只在这里做一次：
+   * 对外（媒体信息、关键帧、时长）一律归零，只有下发 ffmpeg -ss 时再加回 startOffset。
+   */
+  const startOffset = snap(Number(fmt.start_time) || 0);
+  const rawDur = snap(Number(fmt.duration ?? video?.duration ?? 0));
+  const duration = startOffset > 0.01 && includesOffset(fmt.format_name) && rawDur > startOffset
+    ? snap(rawDur - startOffset)
+    : rawDur;
+
   const fps = video && video.avg_frame_rate && video.avg_frame_rate !== '0/0'
     ? safeRatio(video.avg_frame_rate)
     : null;
@@ -131,6 +155,7 @@ function normalizeProbe(raw, file = '(unknown)') {
     file,
     format: fmt.format_name || null,
     duration,
+    startOffset,
     sizeBytes: Number(fmt.size || 0),
     bitRate: Number(fmt.bit_rate || 0),
     video: video ? {
@@ -192,8 +217,14 @@ function safeRatio(r) {
  *  - csv 输出可能有空行，`Number('') === 0` 会凭空造出一个"0 秒关键帧"
  *  - 时间戳可能重复，必须去重，否则二分吸附会失准
  *  - 结果必须排序后才交给上层
+ *
+ * origin = 媒体的 startOffset：报文 pts 是**绝对**时间戳，而 ffmpeg 的输入侧 `-ss`、
+ * 界面时间轴都以"文件开头"为 0（实测同一素材加 13.7s 偏移后 `-ss 2.0` 拿到的还是
+ * 第 2 秒那一帧）。这张表必须减掉原点，否则相机 .ts / 带偏移的 mkv 会报出
+ * "关键帧全在 13.7s 之后"——吸附永远找不到入点，每个区间都被迫从 0 开始，
+ * 用户删掉的片段整个带回产物。
  */
-async function probeKeyframes(ffprobePath, file) {
+async function probeKeyframes(ffprobePath, file, origin = 0) {
   const { stdout } = await run(ffprobePath, [
     '-v', 'error',
     '-select_streams', 'v:0',
@@ -211,8 +242,8 @@ async function probeKeyframes(ffprobePath, file) {
     const flags = String(cols[1] || '').trim();
     if (!flags.includes('K')) continue;                // K = AV_PKT_FLAG_KEY
     if (!/^\d+(\.\d+)?$/.test(raw)) continue;          // 只认纯数字时间戳
-    const t = snap(Number(raw));
-    if (!Number.isFinite(t) || t < 0 || seen.has(t)) continue;   // 坑 2：去重
+    const t = snap(Math.max(0, Number(raw) - origin));
+    if (!Number.isFinite(t) || seen.has(t)) continue;   // 坑 2：去重
     seen.add(t);
     out.push(t);
   }

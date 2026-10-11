@@ -23,6 +23,9 @@ const { familyOfExt } = require('./containers');
  */
 const HEVC_DROP_RASL = 'filter_units=remove_types=8|9';
 
+/** 重编码段粗定位的提前量：够大到保住长视频寻址速度，多出来的再由输出侧 -ss 精确剪掉。 */
+const SEEK_LEAD = 2.0;
+
 function streamBsfFor(item, media) {
   if (item.kind !== 'copy') return [];
   if (media?.video?.codec !== 'hevc') return [];
@@ -33,7 +36,10 @@ function streamBsfFor(item, media) {
  * 构造单段切割命令。
  *
  * ffmpeg 语义（N-113109 实测，见 docs/02 技术方案 §3）：
- *  - `-ss` 放在 -i 之前（输入定位）：入点必须自己吸附到关键帧，否则 ffmpeg 只会更晚开始
+ *  - 流拷贝段：`-ss` 只放在 -i 之前（输入定位），入点必须自己吸附到关键帧，
+ *    否则 ffmpeg 只会更晚开始
+ *  - 重编码段：输入侧粗定位 + 输出侧 `-ss` 剪余量（原因见下方 lead 的注释）——
+ *    单靠输入侧 -ss 会让拷贝的音频从入点前 0.5s 就开始，拼接后帧被越拉越开
  *  - 长度控制优先用 `-frames:v N`（帧数）：`-t 1.5` 在 30fps 下只产出 45 帧，
  *    而 mp4 记录的时长是"末帧 PTS + 一帧"以外的值（实测 seg0 时长 1.467s），
  *    concat 时后段会被接到这个偏短的位置，引发 PTS 错位/回跳。
@@ -49,8 +55,20 @@ function argsForSegment(item, media, outPath, opts = {}) {
   const args = ['-hide_banner', '-loglevel', 'error', '-y'];
   const family = familyOfExt(path.extname(outPath));
   const mapArgs = opts.dropSubtitles ? ['-map', '0', '-map', '-0:s'] : ['-map', '0'];
-  args.push('-ss', fmtTime(item.start));
+
+  /**
+   * 重编码段的入点必须**分两段下**：只把 `-ss` 放在 -i 前面时，音频是流拷贝的，
+   * ffmpeg 的精确寻址只裁解码流、不裁拷贝流，段里的音频从入点前约 0.5s 就开始
+   * （实测 audio[-0.523→1.497] 配 video[0.000→1.500]）。拼接时后一段按"最大的那条
+   * 流"取偏移，帧被越拉越开：三条区间的 mkv 产物把 5.9s 摊成 18.5s，帧间隔 0.1s。
+   * 先输入侧粗定位（提前 SEEK_LEAD 秒，保住大文件寻址速度），再在 -i 之后用输出侧
+   * `-ss` 把这段余量精确剪掉，音视频就同时从 0 起（实测 audio[0.010→1.486] / video[0→1.500]）。
+   */
+  const lead = item.kind === 'reencode' ? Math.min(Math.max(0, item.start), SEEK_LEAD) : 0;
+  const coarse = item.start - lead;
+  if (coarse > 0.0005) args.push('-ss', fmtTime(coarse));
   args.push('-i', media.file);
+  if (lead > 0.0005) args.push('-ss', fmtTime(lead));
 
   // 长度：能折算成帧数就用 -frames:v，避免"帧数与时长不一致"导致 concat 错位
   const fps = Number(opts.fps) > 0 ? Number(opts.fps) : null;
@@ -64,9 +82,10 @@ function argsForSegment(item, media, outPath, opts = {}) {
     args.push('-c', 'copy');
     // 流拷贝必须显式规避负时间戳导致的花屏/首帧丢失
     args.push('-avoid_negative_ts', 'make_zero');
-    // 与重编码段保持同一时间轴刻度，否则 concat 混拼会把帧率拉歪
-    // 单段时间基无需干预：各段输出都是规整的 30/1，歪帧发生在 concat 阶段，
-    // 由 argsForConcat 的 -video_track_timescale 统一修正（实测 ts=15360 无效、ts=fps 有效）。
+    // 各段必须用同一个视频刻度：拷贝段的刻度是**从源继承**的（.ts 就是 1/90000），
+    // 重编码段却是 mov muxer 默认的 1/15360，concat 按前一段的刻度推下一段的偏移，
+    // 单位一混就把 5.8s 的内容摊成 38.7s（实测偏移 .ts 源精确模式）。
+    if (family === 'mov') args.push('-video_track_timescale', outputTimeScale(media));
     args.push(...mapArgs);                        // 保留全部音轨 / 字幕轨
     args.push('-map_metadata', '0');             // 保留元数据与章节
     args.push('-dn');                            // 丢弃数据轨（章节附件字体常导致失败）
@@ -78,8 +97,13 @@ function argsForSegment(item, media, outPath, opts = {}) {
     const codec = pickVideoCodec(media, opts);
     args.push(...mapArgs);
     args.push('-map_metadata', '0');
+    // 这里刻意不加 -avoid_negative_ts：重编码段的时间戳本来就被编码器归零，
+    // 加上它反而按"最小的音频 dts"整体平移，视频首帧被推到 +0.2~0.3s（实测），
+    // 段首就多出一截只有声音没有画面的空档。
     args.push('-c:v', codec);
     args.push('-c:a', 'copy');
+    // 重编码段也用同一个刻度，理由见上面拷贝段那段注释
+    if (family === 'mov') args.push('-video_track_timescale', outputTimeScale(media));
     if (!opts.dropSubtitles) args.push('-c:s', 'copy');
     args.push('-crf', String(opts.crf ?? 18));
     args.push(...speedArgs(codec));
@@ -116,19 +140,59 @@ function pickVideoCodec(media, opts = {}) {
 }
 
 /**
- * ffprobe 报的 profile 名能不能直接喂给编码器：
- *  - libx264 原样接受（实测 'High' 可用）
- *  - libx265 只认小写且不带空格：源 profile="Main" 原样传进去会
- *    "Error while opening encoder"（实测 HEVC 精确模式必崩）
- *  - VP9 / AV1 的 profile 写法完全不同（"Profile 0" 之类），交给编码器自己选，
- *    自检阶段会比对 profile 是否一致，不一致会明确报错而不是静默。
+ * 编码器产出的 codec_name（ffprobe 口径）。
+ * 精确模式要是拿 h264 编码器去接 mpeg2 的流拷贝段，拼出来的文件帧率、时长全乱
+ * （实测 mpeg2 .ts 精确模式产物 5.9s 选区变成 35.8s）——所以先问一句
+ * "重编码出来还是源那个编码吗"，不是就别混拼。
  */
+const CODEC_OF_ENCODER = {
+  libx264: 'h264',
+  libx265: 'hevc',
+  'libvpx-vp9': 'vp9',
+  libsvtav1: 'av1',
+  'libaom-av1': 'av1',
+  mpeg4: 'mpeg4',
+  mjpeg: 'mjpeg',
+};
+
+function keepsSourceCodec(media, opts = {}) {
+  const enc = pickVideoCodec(media, opts);
+  const src = media?.video?.codec;
+  if (!src) return true;
+  return (CODEC_OF_ENCODER[enc] || enc) === src;
+}
+
+/**
+ * ffprobe 报的 profile 名不能直接喂给编码器：两边写法不同（都拿随包 ffmpeg 实测）。
+ *  - "Constrained Baseline"（手机/屏幕录制很常见）、"Simple Profile"（xvid）、
+ *    "Standard"（ProRes）原样传进去 → "invalid profile" → 打不开编码器，整条精确模式
+ *    命令以退出码非 0 结束；"High 10"/"Progressive High" 同理。
+ *  - libx265 只认小写无空格：源 profile="Main" 原样传会崩（实测 HEVC 精确模式必崩）。
+ * 认不出来的就不传，让编码器按像素格式自己选——总比传一个错的强。
+ * VP9 / AV1 的 profile 写法又是另一套（"Profile 0" 之类），一律不传，
+ * 自检阶段会比对 profile 是否一致，不一致会明确报错而不是静默。
+ */
+const PROFILE_NAME_BY_ENCODER = {
+  libx264: new Set(['baseline', 'main', 'extended', 'high', 'high10', 'high422', 'high444']),
+  libx265: new Set(['main', 'main10', 'main12', 'monochrome', 'monochrome10', 'monochrome12']),
+};
+
+/** ffprobe 的长名字 → 编码器认的短名字（只在同一编码内部映射）。 */
+const PROFILE_ALIASES = {
+  constrainedbaseline: 'baseline',
+  progressivehigh: 'high',
+  high444predictive: 'high444',
+  mainstillpicture: 'main',
+};
+
 function profileArg(video, codec) {
-  const p = video && video.profile;
-  if (!p) return null;
-  if (codec === 'libx265') return String(p).toLowerCase().replace(/\s+/g, '');
-  if (codec === 'libx264') return String(p);
-  return null;
+  const allowed = PROFILE_NAME_BY_ENCODER[codec];
+  if (!allowed) return null;
+  const raw = String(video && video.profile ? video.profile : '')
+    .toLowerCase().replace(/[^a-z0-9]/g, '');
+  if (!raw) return null;
+  const name = PROFILE_ALIASES[raw] || raw;
+  return allowed.has(name) ? name : null;
 }
 
 /**
@@ -189,9 +253,21 @@ function argsForConcat(parts, outPath, media, strategy = 'concat_demuxer') {
     ...tsArg, outPath];
 }
 
-/** 生成 concat demuxer 的清单文件内容。单引号需转义为 '\''（先结束字符串再转义单引号）。 */
+/**
+ * 生成 concat demuxer 的清单文件内容。
+ *
+ * 两个必须处理的写法（实测）：
+ *  - 单引号要转义成 '\'' （先结束字符串再补一个转义单引号）
+ *  - 反斜杠会被当转义符：临时目录是 `C:\Users\John Smith\…` 这种带空格的路径时，
+ *    `\ ` 直接把解析打断，报 "Line 2: unknown keyword 'Coding\Fast'"。
+ *    ffmpeg 在 Windows 上认正斜杠，所以统一换成 /，盘符 `C:` 保留
+ */
 function concatListBody(parts) {
-  return parts.map((p) => `file '${p.replace(/'/g, "'\\''")}'`).join('\n') + '\n';
+  return parts.map((p) => `file '${slash(p).replace(/'/g, "'\\''")}'`).join('\n') + '\n';
+}
+
+function slash(p) {
+  return String(p).replace(/\\/g, '/');
 }
 
 /** concat 清单文件路径：与输出同目录，避免跨盘符/长路径问题。 */
@@ -214,4 +290,7 @@ function pad(n, w) {
   return String(n).padStart(w, '0');
 }
 
-module.exports = { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, pickVideoCodec, profileArg };
+module.exports = {
+  argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime,
+  pickVideoCodec, profileArg, keepsSourceCodec, CODEC_OF_ENCODER,
+};

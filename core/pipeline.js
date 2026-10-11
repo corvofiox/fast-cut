@@ -13,7 +13,7 @@ const os = require('os');
 const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./segments');
 const { buildPlan } = require('./cuttings');
 const { probeMedia, probeKeyframes, run } = require('./probe');
-const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime } = require('./buildArgs');
+const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
 const { verifyExport } = require('./verify');
 const { ffmpegPath, ffprobePath } = require('./ffmpegPath');
 
@@ -54,7 +54,7 @@ async function probeSource(file, opts = {}) {
  * 不能挡着"导入即播"。
  */
 async function scanKeyframes(loaded) {
-  const keyframes = await probeKeyframes(loaded.bins.ffprobe, loaded.file);
+  const keyframes = await probeKeyframes(loaded.bins.ffprobe, loaded.file, loaded.media.startOffset || 0);
   if (keyframes.length === 0) {
     throw new Error('未能扫描到关键帧（文件可能损坏或视频轨不可解码）');
   }
@@ -102,10 +102,13 @@ function planFor(loaded, segments, opts = {}) {
   const { plan, warnings } = buildPlan(keeps, {
     keyframes: loaded.media.keyframes,
     precise: !!opts.precise,
+    // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
+    // 实测 VFR 源改用 -t 限长时长根本收不住（要 2.27s 给出 4.83s，把删掉的内容又带回来）
     fps: loaded.media.video?.fps,
     lastKeyframe: loaded.media.lastKeyframe,
     duration: loaded.media.duration,
     ordered: !!opts.ordered,
+    sameCodec: keepsSourceCodec(loaded.media),
   });
   const keepSecs = opts.ordered
     ? snap(keeps.reduce((acc, k) => acc + (k.end - k.start), 0))
@@ -141,6 +144,14 @@ async function exportSegments(loaded, segments, opts) {
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有区间对齐关键帧后都为空：${warnings.join('；') || '无计划段'}`);
 
+  // 精确模式整段换了编码（源编码没有对应的同编码重编码器）时，自检要拿"所选编码"
+  // 比对，而不是拿源比对——否则这条明说的重编码会被判成故障。
+  const allReencode = plan.every((p) => p.kind === 'reencode');
+  const intendedCodec = allReencode && !keepsSourceCodec(media)
+    ? (CODEC_OF_ENCODER[pickVideoCodec(media)] || null)
+    : null;
+  const cutFps = media.video?.fps;
+
   const space = await precheckSpace(outPath, media, totalKeep);
   if (!space.ok) throw new Error(space.message);
   onProgress({ phase: 'prepare', keepSecs: totalKeep, segments: keeps });
@@ -157,7 +168,7 @@ async function exportSegments(loaded, segments, opts) {
     for (let i = 0; i < plan.length; i++) {
       const item = plan[i];
       const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${ext}`);
-      const args = argsForSegment(item, { ...media, file }, partFile, { crf, fps: media.video?.fps, dropSubtitles });
+      const args = argsForSegment(item, { ...media, file }, partFile, { crf, fps: cutFps, dropSubtitles });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);
       partFiles.push(partFile);
@@ -187,7 +198,7 @@ async function exportSegments(loaded, segments, opts) {
     const results = [];
     for (let i = 0; i < outputs.length; i++) {
       const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i],
-        { duration: expectSecs[i], container, dropSubtitles });
+        { duration: expectSecs[i], container, dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length, sourceFormat: media.format });
       results.push({ file: outputs[i], ...r });
     }
     onProgress({ phase: 'done', outputs, warnings, results });
@@ -198,7 +209,7 @@ async function exportSegments(loaded, segments, opts) {
       for (const p of [...new Set([outPath, ...outNames])]) await safeRemove(p);
       throw err;
     }
-    throw new Error(`导出失败：${err.message}`);
+    throw new Error(`导出失败：${muxHint(err.message)}`);
   } finally {
     await rmrf(tmpDir);
   }
@@ -218,6 +229,20 @@ function groupByKeep(plan) {
 
 function isCancelled(err) {
   return String(err.message || '').includes('已取消');
+}
+
+/**
+ * 换封装时最常撞的一堵墙：目标 muxer 没有这个编码的 tag
+ * （实测 ProRes → MP4 报 "Could not find tag for codec prores"，
+ * 抛出来只有一长串 ffmpeg 退出码，用户看不出跟自己选的容器有关）。
+ */
+function muxHint(message) {
+  const m = String(message || '');
+  const tag = /Could not find tag for codec ([a-zA-Z0-9_]+)/.exec(m);
+  if (tag) {
+    return `${m.trim()}——目标容器装不下 ${tag[1]}，换 MKV 试试（字幕装不下时界面已经提示，视频/音频装不下只有封装器知道）`;
+  }
+  return m;
 }
 
 /** 带进度回调地跑 ffmpeg：ffmpeg 只在 stderr 打进度，持续读取并换算百分比。 */

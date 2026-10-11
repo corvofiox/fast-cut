@@ -82,6 +82,15 @@ test('精确模式：区间落在一个 GOP 内时整段重编码', () => {
   assert.match(plan[0].note, /整段有损重编码/);
 });
 
+test('精确模式：源编码换掉时整段重编码，绝不与流拷贝段混拼', () => {
+  // 实测 mpeg2video 源用"重编码接缝 + 拷贝其余"混拼，5.9s 选区拼出 35.8s、
+  // avg_frame_rate 60/1 的怪文件；换编码时只能整条区间一种编码
+  const { plan } = buildPlan([{ start: 3.4, end: 7 }], { ...OPTS_PRECISE, sameCodec: false });
+  assertPlan(plan, [['reencode', 3.4, 3.6]]);
+  assert.match(plan[0].note, /不混拼/);
+  assert.ok(!plan.some((p) => p.kind === 'copy'));
+});
+
 test('精确模式相邻区间被去重：不重复导出同一段', () => {
   const { plan } = buildPlan([
     { start: 3.4, end: 4.4 },

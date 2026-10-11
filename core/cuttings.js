@@ -29,7 +29,7 @@ const { snap, EPS } = require('./segments');
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], precise = false, duration, fps, ordered = false } = opts;
+  const { keyframes = [], precise = false, duration, fps, ordered = false, sameCodec = true } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   // 帧长一律按"第 N 帧 = N/fps 秒"推导：1/30 = 0.0333… 用定点小数会引入误差，
   // 产生 .310 / .014 这类看着像整帧其实不是的时刻，concat 时仍会落半格。
@@ -71,7 +71,9 @@ function buildPlan(keeps, opts) {
     }
 
     const before = plan.length;
-    pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames);
+    // 窄段下限：两帧。fps 报不出来时按 1/15s（≈ 常见帧率的两帧）兜底
+    pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames, sameCodec,
+      fpsNum ? 2 / fpsNum : 1 / 15);
     // 精确模式会往一条保留区间里塞两段（重编码 + 流拷贝），统一标记归属，
     // 上层按 keepIndex 分组才能做到"每条保留区间一个文件"。
     for (let n = before; n < plan.length; n++) plan[n].keepIndex = ki;
@@ -83,11 +85,41 @@ function buildPlan(keeps, opts) {
 }
 
 /**
- * 精确模式：入点侧重编码一小段，其余流拷贝。
+ * 精确模式：入点小段重编码，其余流拷贝。
  * @param {(sec:number)=>number} roundToFrames 帧取整函数（由 buildPlan 注入，含 fps）
+ * @param {boolean} sameCodec 重编码出来还是源那个编码吗？false 时绝不混拼
+ * @param {number} minHead 入点到下一个关键帧不足这个秒数时不切窄段（由 fps 折算，默认 2 帧）
  */
-function pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames) {
+function pushPrecise(plan, keep, start, end, keyframes, headNote, warnings, roundToFrames, sameCodec = true, minHead = 0) {
   const kfAfter = nextKeyAfter(keep.start, keyframes);
+
+  // 换编码的重编码段和流拷贝段拼在一起，产物帧率/时长全乱
+  // （实测 mpeg2 .ts 精确模式：5.9s 选区拼出 35.8s、avg_frame_rate 60/1）。
+  // 这时整条区间都重编码：编码变了但至少是一个干净、帧准的单编码文件。
+  if (!sameCodec) {
+    plan.push({
+      kind: 'reencode', start: keep.start, duration: roundToFrames(keep.end - keep.start),
+      snapFrom: keep.start, keepEnd: keep.end, note: '精确模式：源编码没有对应的同编码重编码器，整段重编码（不混拼）',
+    });
+    return;
+  }
+
+  /**
+   * 入点离下一个关键帧不到 minHead 时，不要切"1 帧重编码 + 其余拷贝"：
+   * 实测 .ts 相机素材的关键帧落在 0.023/2.023/8.023 这种非整帧刻度上，选 8.000s 入点
+   * 就切出一个 0.033s 的窄段——13 个音频包配 1 帧画面，进 concat 后偏移炸掉，
+   * 5.9s 选区拼出 39s 的产物。这时直接从那个关键帧流拷贝，误差本来就不满 2 帧。
+   */
+  if (kfAfter !== null && kfAfter - keep.start < minHead) {
+    const lost = roundToFrames(kfAfter - keep.start);
+    plan.push({
+      kind: 'copy', start: kfAfter, duration: roundToFrames(end - kfAfter),
+      snapFrom: keep.start, keepEnd: keep.end,
+      note: `精确模式：入点距关键帧不足 ${Math.round(minHead * 1000)}ms，直接从关键帧 ${kfAfter.toFixed(3)}s 流拷贝（少 ${lost.toFixed(3)}s 内容，切不出这么窄的重编码段）`,
+    });
+    warnings.push(`精确模式：入点 ${keep.start.toFixed(3)}s 距下一个关键帧只有 ${lost.toFixed(3)}s，不足 ${Math.round(minHead * 1000)}ms，已改从关键帧起流拷贝，这 ${lost.toFixed(3)}s 内容没有导出`);
+    return;
+  }
 
   // 没有更晚的关键帧，或重编码段会吞掉整个区间：整段重编码以换取帧级入点
   if (kfAfter === null || kfAfter >= end - EPS) {

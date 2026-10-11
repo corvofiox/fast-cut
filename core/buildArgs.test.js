@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { argsForSegment, argsForConcat, concatListBody, fmtTime, pickVideoCodec, profileArg } = require('./buildArgs');
+const { argsForSegment, argsForConcat, concatListBody, fmtTime, pickVideoCodec, profileArg, keepsSourceCodec } = require('./buildArgs');
 
 const MEDIA = {
   file: 'C:\\videos\\src.mp4',
@@ -80,15 +80,20 @@ test('不排除字幕时保持原样：-map 0 且带 -c:s copy', () => {
 });
 
 test('重编码段沿用源的编码参数，音轨仍拷贝', () => {
-  const args = argsForSegment({ kind: 'reencode', start: 3, end: 4 }, MEDIA, 'out.mp4');
+  const args = argsForSegment({ kind: 'reencode', start: 3, end: 4, duration: 1 }, MEDIA, 'out.mp4', { fps: 30 });
   const i = (x) => args.indexOf(x);
   assert.strictEqual(args[i('-c:v') + 1], 'libx264');
   assert.strictEqual(args[i('-c:a') + 1], 'copy');
   assert.strictEqual(args[i('-crf') + 1], '18');
-  assert.strictEqual(args[i('-profile:v') + 1], 'High');
+  // profile 名要按编码器的写法给：ffprobe 报的 "High" 直接喂 x264 可以，
+  // 但 "Constrained Baseline" 之类会 "invalid profile" 打不开编码器（实测）
+  assert.strictEqual(args[i('-profile:v') + 1], 'high');
   assert.strictEqual(args[i('-pix_fmt') + 1], 'yuv420p');
   assert.strictEqual(args[i('-color_primaries') + 1], 'bt709');
   assert.strictEqual(args[i('-r') + 1], '30');
+  // 重编码段刻意不下 -avoid_negative_ts：编码器已经把时间戳归零，再加它会被
+  // 按"最小的音频 dts"整体平移，视频首帧跑到 +0.2~0.3s，段首变成有声无画（实测）
+  assert.ok(!args.includes('-avoid_negative_ts'));
 });
 
 test('H.265 源精确模式选 libx265，且 colorRange unknown 不注入空参数', () => {
@@ -118,8 +123,34 @@ test('多段输出走 concat demuxer 且清单内容合法（含空格与单引�
   const args = argsForConcat(['a.mp4', 'b.mp4'], 'out.mp4', MEDIA);
   assert.ok(args.includes('concat'));
   assert.strictEqual(args[args.indexOf('-safe') + 1], '0');
+  // 反斜杠在 concat 清单里是转义符：临时目录带空格（C:\Users\John Smith\…）时
+  // 原样写会把解析打断，实测报 "Line 2: unknown keyword"（ffmpeg 在 Windows 认正斜杠）
   const body = concatListBody(["C:\\a b\\it's.mp4"]);
-  assert.strictEqual(body, "file 'C:\\a b\\it'\\''s.mp4'\n");
+  assert.strictEqual(body, "file 'C:/a b/it'\\''s.mp4'\n");
+});
+
+test('profile 名按编码器口径映射，认不出来就不传', () => {
+  // 手机/屏幕录制常见的约束基线：原样传 "Constrained Baseline" 会让 x264 报 invalid profile
+  assert.strictEqual(profileArg({ profile: 'Constrained Baseline' }, 'libx264'), 'baseline');
+  assert.strictEqual(profileArg({ profile: 'Progressive High' }, 'libx264'), 'high');
+  assert.strictEqual(profileArg({ profile: 'High 4:2:2' }, 'libx264'), 'high422');
+  assert.strictEqual(profileArg({ profile: 'High 10' }, 'libx264'), 'high10');
+  // 别的编码的 profile 名字喂不过来（xvid / ProRes），宁可不传让编码器按像素格式自选
+  assert.strictEqual(profileArg({ profile: 'Simple Profile' }, 'libx264'), null);
+  assert.strictEqual(profileArg({ profile: 'Advanced Simple Profile' }, 'libx264'), null);
+  assert.strictEqual(profileArg({ profile: 'Standard' }, 'libx264'), null);
+  assert.strictEqual(profileArg({ profile: 'Main Still Picture' }, 'libx265'), 'main');
+  assert.strictEqual(profileArg({ profile: 'Range Extensions' }, 'libx265'), null);
+});
+
+test('源编码没有同编码重编码器时，精确模式不许混拼', () => {
+  assert.strictEqual(keepsSourceCodec({ video: { codec: 'h264' } }), true);
+  assert.strictEqual(keepsSourceCodec({ video: { codec: 'hevc' } }), true);
+  assert.strictEqual(keepsSourceCodec({ video: { codec: 'vp9' } }), true);
+  // 实测 mpeg2video 源混拼出 5.9s 选区变 35.8s、avg_frame_rate 60/1 的怪文件
+  assert.strictEqual(keepsSourceCodec({ video: { codec: 'mpeg2video' } }), false);
+  assert.strictEqual(keepsSourceCodec({ video: { codec: 'prores' } }), false);
+  assert.strictEqual(keepsSourceCodec({ video: null }), true);
 });
 
 test('时间戳格式：无科学计数法、零填充、毫秒三位', () => {
