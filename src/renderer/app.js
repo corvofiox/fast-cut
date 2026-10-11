@@ -853,9 +853,8 @@ function updateEstimate() {
   const over = precise ? 0 : overlapSeconds();
   if (over > 0.001) lines.push(`⚠ 缝隙会被带回 ${over.toFixed(3)}s`);
   if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 疑似 VFR，建议每段一个文件');
-  if (state.src.media.video && state.src.media.video.codec === 'hevc' && state.clips.length > 1 && !split) {
-    lines.push('⚠ HEVC 开 GOP 多段拼接会被自检拦下，改每段一个文件');
-  }
+  // HEVC 多段拼接以前会提示"会被自检拦下"：那是开放 GOP 的 RASL 前导帧造成的，
+  // 现在切割时直接在封装层剔掉（仍然 -c copy），这句话已经不成立，别再吓唬用户。
   // 换封装的代价必须在这里说清楚，而不是等 ffmpeg 报 "Could not find tag for codec"
   const cont = state.plan && state.plan.container;
   if (cont) {

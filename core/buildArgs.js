@@ -10,6 +10,26 @@ const { snap } = require('./segments');
 const { familyOfExt } = require('./containers');
 
 /**
+ * HEVC 开放 GOP 的多段拼接救法：剔掉 RASL（NAL 类型 8=RASL_N、9=RASL_R）。
+ *
+ * x265 默认 open-gop=1，IDR 之后会跟着若干"引用了 IDR 之前画面"的前导帧。整段播放时
+ * 解码器在随机接入点本来就要丢弃它们，所以单段没问题；可一旦把两段首尾相接，接缝不再是
+ * 解码器认可的接入点，那些参考就找不到了 —— 报 "Could not find ref with POC n"，画面在
+ * 接缝处坏几帧。既然规范上这些帧在接入点就该被丢，**在封装层把它们剔掉是等价且合法的**：
+ * 不重编码、不丢任何会显示的画面，拼接后全量解码零报错（实测 mov 与 mkv 两种目标都成立）。
+ *
+ * 别顺手把 RADL（6/7）也剔了：实测照样报错（说明坏的不是 RADL），而 RADL 是真会显示的帧。
+ * 也别对 H.264 下发：那是另一套 NAL 编号，且 h264 路径本来就没有这个问题。
+ */
+const HEVC_DROP_RASL = 'filter_units=remove_types=8|9';
+
+function streamBsfFor(item, media) {
+  if (item.kind !== 'copy') return [];
+  if (media?.video?.codec !== 'hevc') return [];
+  return ['-bsf:v', HEVC_DROP_RASL];
+}
+
+/**
  * 构造单段切割命令。
  *
  * ffmpeg 语义（N-113109 实测，见 docs/02 技术方案 §3）：
@@ -50,6 +70,7 @@ function argsForSegment(item, media, outPath, opts = {}) {
     args.push(...mapArgs);                        // 保留全部音轨 / 字幕轨
     args.push('-map_metadata', '0');             // 保留元数据与章节
     args.push('-dn');                            // 丢弃数据轨（章节附件字体常导致失败）
+    args.push(...streamBsfFor(item, media));      // HEVC 开放 GOP：剔 RASL，见上方注释
     if (media.rotation && media.rotation !== 0 && family === 'mov') {
       args.push('-display_rotation', 'copy');    // 保留旋转信息，避免竖屏视频方向错乱
     }

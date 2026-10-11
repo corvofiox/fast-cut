@@ -26,6 +26,20 @@ test('拷贝段命令：有 fps 时用 -frames:v 控制长度（避免帧数与�
   assert.ok(args.includes('-dn'));
 });
 
+test('HEVC 流拷贝段剔掉 RASL 前导帧：开放 GOP 多段拼接报 "Could not find ref with POC n" 的根因', () => {
+  const hevc = { ...MEDIA, video: { codec: 'hevc', profile: 'Main', pixFmt: 'yuv420p', fps: 30 } };
+  const args = argsForSegment({ kind: 'copy', start: 0, duration: 2 }, hevc, 'out.mp4', { fps: 30 });
+  const i = args.indexOf('-bsf:v');
+  assert.ok(i >= 0);
+  assert.strictEqual(args[i + 1], 'filter_units=remove_types=8|9');
+});
+
+test('H.264 段与重编码段都不下发该过滤器（NAL 编号不同 / 那一段本来就是新编码的）', () => {
+  assert.ok(!argsForSegment({ kind: 'copy', start: 0, duration: 2 }, MEDIA, 'out.mp4', { fps: 30 }).includes('-bsf:v'));
+  const hevc = { ...MEDIA, video: { codec: 'hevc', fps: 30 } };
+  assert.ok(!argsForSegment({ kind: 'reencode', start: 0, duration: 2 }, hevc, 'out.mp4').includes('-bsf:v'));
+});
+
 test('无 fps 时退回 -t 时长控制', () => {
   const args = argsForSegment({ kind: 'copy', start: 2, duration: 4 }, MEDIA, 'out.mp4');
   const i = (x) => args.indexOf(x);
