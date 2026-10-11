@@ -26,7 +26,7 @@ npm start              # 开发运行
 npm run core:test      # 剪辑内核单元测试
 npm run smoke          # 端到端自检：开真窗口跑完整剪辑 + 导出 + 时间轴交互
 npm run core:codecs    # 编解码矩阵：5 种容器/编码 × 3 种导出模式
-npm run dist           # 打包 → dist/Fast-Cut-<版本>-x64.exe（免安装，双击即用）
+npm run dist           # 打包 → dist/Fast-Cut-Setup-<版本>-x64.exe（NSIS 安装向导）
 npm run dist:dir       # 只出 dist/win-unpacked/，调打包配置时快得多
 ```
 

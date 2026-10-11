@@ -37,14 +37,16 @@
     "win": {
       "target": [
         {
-          "target": "portable",
+          "target": "nsis",
           "arch": ["x64"]
         }
       ],
-      "artifactName": "Fast-Cut-${version}-${arch}.exe"
+      "artifactName": "Fast-Cut-Setup-${version}-${arch}.exe"
     },
-    "portable": {
-      "unpackDirName": "FastCut"
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "shortcutName": "Fast Cut"
     }
   },
   "devDependencies": {
