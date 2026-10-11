@@ -152,7 +152,7 @@ function normalizeProbe(raw, file = '(unknown)') {
   if (sd && typeof sd.rotation === 'number') rotation = sd.rotation;
   else if (video?.tags?.rotate) rotation = Number(video.tags.rotate) || 0;
 
-  // HDR / 10bit 判定（影响精确模式的编码参数）
+  // HDR / 10bit 判定（影响重编码段的像素格式与色彩参数）
   const hdr = !!video && (
     (video.color_primaries && video.color_primaries !== 'unknown' && video.color_primaries !== 'bt709') ||
     !!video.tags?.['color_range'] ||
