@@ -1,7 +1,7 @@
 'use strict';
 
 /**
- * 裁剪流程编排：导入 → 探流 → 吸附 → 切割 → 拼接 → 自检。
+ * 裁剪流程编排：导入 → 探流 → 切割 → 拼接 → 自检。
  * 这是 UI 唯一需要调用的入口；它自己不碰 DOM、不碰 Electron。
  */
 
@@ -13,6 +13,7 @@ const os = require('os');
 const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./segments');
 const { buildPlan } = require('./cuttings');
 const { probeMedia, probeKeyframes, run } = require('./probe');
+const { familyOfFormat, familyOfExt } = require('./containers');
 const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
 const { verifyExport } = require('./verify');
 const { ffmpegPath, ffprobePath } = require('./ffmpegPath');
@@ -95,20 +96,22 @@ async function precheckSpace(outPath, media, keepSecs) {
 
 /**
  * 只做区间规整 + 切割计划推导，不跑 ffmpeg。
- * UI 要在导出前显示真实吸附结果、主进程要查重名，都走这里，保证和真正导出同一套算法。
+ * UI 要在导出前显示真实的入点/代价、主进程要查重名，都走这里，保证和真正导出同一套算法。
  */
 function planFor(loaded, segments, opts = {}) {
   const keeps = opts.ordered ? orderPreserving(segments) : normalizeSegments(segments);
   const { plan, warnings } = buildPlan(keeps, {
     keyframes: loaded.media.keyframes,
-    precise: !!opts.precise,
     // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
     // 实测 VFR 源改用 -t 限长时长根本收不住（要 2.27s 给出 4.83s，把删掉的内容又带回来）
     fps: loaded.media.video?.fps,
-    lastKeyframe: loaded.media.lastKeyframe,
+    gridOrigin: loaded.media.gridOrigin,
+    reorderDepth: loaded.media.video?.reorderDepth,
     duration: loaded.media.duration,
     ordered: !!opts.ordered,
     sameCodec: keepsSourceCodec(loaded.media),
+    // VFR 源帧长不均匀，按帧数切出来的时长与音频对不上：只能整段重编码成定帧率
+    forceReencode: !!loaded.media.video?.vfr,
   });
   const keepSecs = opts.ordered
     ? snap(keeps.reduce((acc, k) => acc + (k.end - k.start), 0))
@@ -135,24 +138,25 @@ function orderPreserving(segments) {
 async function exportSegments(loaded, segments, opts) {
   const { file, media, bins } = loaded;
   const {
-    outPath, precise = false, split = false, crf = 18, ordered = false,
+    outPath, split = false, crf = 18, ordered = false,
     dropSubtitles = false, container = null,
     onProgress = () => {}, token = createToken(),
   } = opts;
 
-  const { keeps, plan, warnings, keepSecs: totalKeep } = planFor(loaded, segments, { precise, ordered });
+  const { keeps, plan, warnings, keepSecs: totalKeep } = planFor(loaded, segments, { ordered });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
-  if (plan.length === 0) throw new Error(`所有区间对齐关键帧后都为空：${warnings.join('；') || '无计划段'}`);
+  if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
 
-  // 精确模式整段换了编码（源编码没有对应的同编码重编码器）时，自检要拿"所选编码"
+  // 整片换了编码（源编码没有对应的同编码重编码器）时，自检要拿"所选编码"
   // 比对，而不是拿源比对——否则这条明说的重编码会被判成故障。
   const allReencode = plan.every((p) => p.kind === 'reencode');
   const intendedCodec = allReencode && !keepsSourceCodec(media)
     ? (CODEC_OF_ENCODER[pickVideoCodec(media)] || null)
     : null;
   const cutFps = media.video?.fps;
-
-  const space = await precheckSpace(outPath, media, totalKeep);
+  // 归一化：多段拼接时先把源整片纯拷进 MP4 工作副本（原因见 willNormalize 注释）
+  const normalize = willNormalize(media, plan.length);
+  const space = await precheckSpace(outPath, media, totalKeep + (normalize ? (media.duration || 0) : 0));
   if (!space.ok) throw new Error(space.message);
   onProgress({ phase: 'prepare', keepSecs: totalKeep, segments: keeps });
 
@@ -165,37 +169,85 @@ async function exportSegments(loaded, segments, opts) {
   const outNames = split ? groups.map((_, i) => numbered(outPath, i, ext)) : [outPath];
 
   try {
+    let src = { file, media };
+    if (normalize) {
+      onProgress({ phase: 'normalize', note: '先把源封装归一成 MP4（纯拷贝，不重编码）' });
+      try {
+        src = await makeWorkingCopy(bins, file, media, tmpDir, token);
+        warnings.push('源不是 MP4 封装：多段拼接前已把它纯拷成 MP4 工作副本，否则按段归零时间戳会丢报文时间戳（实测 MKV 源直接切出的段 pts 为空，拼不了）');
+      } catch (err) {
+        if (isCancelled(err)) throw err;
+        warnings.push(`封装归一失败（${String(err.message || err).split('\n')[0].slice(0, 90)}），改用源文件直接切割`);
+      }
+    }
+    // 中间段优先写 MP4（原因见 partsAsMp4）；只有必须带字幕轨时才沿用目标容器。
+    const partExt = partsAsMp4(media, ext, dropSubtitles) ? '.mp4' : ext;
+    // 「读 mov 族 且 写 mov 族」才敢让拷贝段的时间戳不归零：
+    // 不归零才不会每个接缝多一帧（见 buildArgs），但读 MKV/TS 或写 MKV 时会丢报文时间戳。
+    const zeroFree = familyOfFormat(src.media.format) === 'mov' && familyOfExt(partExt) === 'mov';
+    const copyTs = zeroFree ? 'disabled' : 'make_zero';
+    if (!zeroFree && plan.some((p) => p.kind === 'copy')) {
+      warnings.push('这次导出无法让拷贝段的时间戳严格按帧对齐（源或目标容器不允许），'
+        + '接缝处可能多带 1~2 帧画面——产物内容仍是按你选的区间切的');
+    }
+
     for (let i = 0; i < plan.length; i++) {
       const item = plan[i];
-      const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${ext}`);
-      const args = argsForSegment(item, { ...media, file }, partFile, { crf, fps: cutFps, dropSubtitles });
+      const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${partExt}`);
+      const args = argsForSegment(item, { ...src.media, file: src.file }, partFile, { crf, fps: cutFps, dropSubtitles, copyTs });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);
       partFiles.push(partFile);
     }
-
+    const cutMedia = src.media;
     let outputs = [];
     const expectSecs = [];
+    const expectFrames = [];
     const userSecs = [];
+    /** 计划要写多少帧：拷贝段按 plan 给的包数（已扣双向预测余量），其余按时长折算。 */
+    const framesOf = (p) => (Number.isFinite(p.frames) && p.frames > 0
+      ? Math.round(p.frames)
+      : (cutFps ? Math.round(p.duration * cutFps) : null));
+    const framesSum = (idxList) => {
+      const ns = idxList.map((n) => framesOf(plan[n]));
+      return ns.some((x) => x == null) ? null : ns.reduce((a, b) => a + b, 0);
+    };
+    /** 计划里被 B 帧余量裁掉的帧占多少：帧率自检拿它当允差，免得把"故意留的余量"判成改了帧率。 */
+    const rateSlackOf = (idxList) => {
+      const frames = framesSum(idxList);
+      if (!frames) return 0;
+      const trimmed = idxList.reduce((a, n) => a + (plan[n].trimmed || 0), 0);
+      return trimmed / frames;
+    };
+    const expectSlack = [];
     if (split) {
       // 需求文档 §4.3：「每段一个文件」= 每条保留区间一个文件。
-      // 精确模式下一条区间会被切成"重编码小段 + 流拷贝段"，这里再把它们拼回同一个文件。
+      // 入点不在关键帧上时一条区间会被切成"重编码小段 + 流拷贝段"，这里再把它们拼回同一个文件。
       for (let i = 0; i < groups.length; i++) {
         const files = groups[i].map((n) => partFiles[n]);
         const target = outNames[i];
-        if (files.length === 1) await fsp.copyFile(files[0], target);
-        else await concatInto(files, target, media, bins);
+        // 段可能是 MP4 而目标是 MKV（见 partsAsMp4）：封装不同就必须真的过一遍 muxer，
+        // 不能 copyFile 把 mp4 改名成 .mkv 交出去（实测会写出"扩展名是 mkv 的 mp4"）。
+        if (files.length === 1 && path.extname(files[0]).toLowerCase() === path.extname(target).toLowerCase()) {
+          await fsp.copyFile(files[0], target);
+        } else {
+          await concatInto(files, target, cutMedia, bins);
+        }
         outputs.push(target);
         expectSecs.push(snap(groups[i].reduce((acc, n) => acc + plan[n].duration, 0)));
+        expectFrames.push(framesSum(groups[i]));
+        expectSlack.push(rateSlackOf(groups[i]));
         const ki = plan[groups[i][0]].keepIndex;
         userSecs.push(ki != null && keeps[ki] ? snap(keeps[ki].end - keeps[ki].start) : undefined);
       }
     } else {
-      await concatInto(partFiles, outPath, media, bins);
+      await concatInto(partFiles, outPath, cutMedia, bins);
       outputs = [outPath];
-      // 上界要按计划实算，不能拿"用户选区"当基准：吸附本来就会多带内容，
-      // 按选区判会把正常的回溯也报成故障；按源长百分比判又宽到吞掉剪辑都查不出来。
+      // 基准按计划实算：段时长是整帧时刻，与用户选区最多差一帧。
+      // 拿源长百分比当允差会宽到"吞掉剪辑"都查不出来（实测 98 分钟片删 1.9s 判通过）。
       expectSecs.push(snap(plan.reduce((acc, p) => acc + p.duration, 0)));
+      expectFrames.push(framesSum(plan.map((_, n) => n)));
+      expectSlack.push(rateSlackOf(plan.map((_, n) => n)));
       userSecs.push(totalKeep);
     }
 
@@ -204,7 +256,12 @@ async function exportSegments(loaded, segments, opts) {
     const results = [];
     for (let i = 0; i < outputs.length; i++) {
       const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i],
-        { duration: expectSecs[i], userSecs: userSecs[i], container, dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length, sourceFormat: media.format });
+        {
+          duration: expectSecs[i], userSecs: userSecs[i], frames: expectFrames[i],
+          rateSlack: expectSlack[i], container,
+          dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length,
+          sourceFormat: media.format,
+        });
       results.push({ file: outputs[i], ...r });
     }
     onProgress({ phase: 'done', outputs, warnings, results });
@@ -256,11 +313,63 @@ async function runWithProgress(ffmpeg, args, item, onProgress, token) {
   return run(ffmpeg, args, {
     signal: token.signal,
     onProgress: (p) => {
-      const segLen = Math.max(0.001, item.end - item.start);
+      const segLen = Math.max(0.001, item.duration);
       const ratio = Math.min(1, Math.max(0, p.seconds / segLen));
       onProgress({ phase: 'cut-progress', ratio, time: p.seconds, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}` });
     },
   });
+}
+
+/**
+ * 多段拼接前要不要先把源归一成 MP4 工作副本。
+ *
+ * 起因（实测）：拷贝段的时间戳"不归零"才能对齐接缝（归零会把段内视频推后约一帧，
+ * 每个接缝多一帧，四段拼出来多 0.067s）。但 `-avoid_negative_ts disabled` 配
+ * **Matroska 源**会让段里所有报文丢掉时间戳（ffprobe 读出来 pts=N/A），
+ * 拼接直接报 "Can't write packet with unknown timestamp"。
+ * 把源纯拷成 MP4 之后再切，段的时间戳正常、接缝也不漂，MKV/TS 源的拼接就干净了
+ * （实测 hevc.mkv 归一 → 切 5 段 → 拼 mkv/mpv 两个目标都解码无错）。
+ *
+ * 不做的情况：
+ *  - 只有一段（没有拼接就没有漂移）；
+ *  - 源本来就是 mov 族（多拷一份纯浪费磁盘和时间）；
+ *  - 源带字幕（MP4 装不下 subrip/ass 的流拷贝，归一等于悄悄丢字幕）。
+ */
+function willNormalize(media, partCount) {
+  if (partCount < 2) return false;
+  if (familyOfFormat(media.format) === 'mov') return false;
+  return !(media.subtitleCodecs || []).length;
+}
+
+/**
+ * 中间的切割段写成什么容器。
+ *
+ * 用 MP4 写段（哪怕最终产物是 MKV）有两个实测依据：
+ *  - `-avoid_negative_ts disabled` 只有写 mov 族才安全；写 Matroska 会让段里
+ *    所有报文丢掉时间戳（实测 pts=N/A，拼接报 unknown timestamp）；
+ *  - MKV 段的块时长记账会把接缝后的时间轴拉长（实测 hevc.mov 切成 mkv 段再拼，
+ *    52 帧的视频占了 1.952s，而按 mp4 段拼同样的计划是 1.800s 整）。
+ * 段是临时产物，只有最终产物留给用户，所以中间步骤统一走最准的那条路。
+ *
+ * 不能这么做的情况：段里必须带上字幕轨（MP4 装不下 subrip/ass 的流拷贝，
+ * 见 containers.js），这时只能沿用目标容器并承担 mkv 段的记账偏差。
+ */
+function partsAsMp4(media, ext, dropSubtitles) {
+  if (familyOfExt(ext) === 'mov') return false;                 // 本来就是 mov 族，无需改
+  if ((media.subtitleCodecs || []).length > 0 && !dropSubtitles) return false;
+  return true;
+}
+
+/** 纯拷贝把工作副本写成 MP4；关键帧表沿用源的（流拷贝不动报文）。 */
+async function makeWorkingCopy(bins, file, media, tmpDir, token) {
+  const working = path.join(tmpDir, 'normalized.mp4');
+  const args = ['-hide_banner', '-loglevel', 'error', '-y', '-i', file,
+    '-c', 'copy', '-map', '0:v', '-map', '0:a', '-dn', working];
+  await run(bins.ffmpeg, args, { signal: token.signal });
+  const wm = await probeMedia(bins.ffprobe, working);
+  wm.keyframes = media.keyframes;
+  wm.lastKeyframe = media.lastKeyframe;
+  return { file: working, media: wm };
 }
 
 async function concatInto(parts, outPath, media, bins) {

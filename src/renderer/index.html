@@ -46,7 +46,7 @@
         <video id="player" preload="auto" playsinline></video>
         <div id="empty">
           <div class="empty-title">把视频文件拖进来</div>
-          <div class="empty-sub">只做裁剪 · 流拷贝导出 · mp4 / mov / mkv / webm …</div>
+          <div class="empty-sub">只做裁剪 · 帧级精确 · mp4 / mov / mkv / webm …</div>
           <button id="btnImportEmpty" class="btn primary big">选择文件</button>
           <div class="empty-note" id="emptyNote"></div>
         </div>
@@ -123,12 +123,8 @@
 <div id="exportMask" class="modal-mask hidden">
   <section class="modal export">
     <h3>导出</h3>
-    <div class="modal-tip">默认整段流拷贝，不重编码、不改画质，切点会前移到最近的关键帧。</div>
-    <label class="m-row">
-      <span class="m-label">精确模式</span>
-      <input type="checkbox" id="optPrecise" />
-      <span class="m-sub">入点精确到帧，代价是入点小段做<b>有损重编码</b>（CRF 18、同 profile）</span>
-    </label>
+    <div class="modal-tip">剪辑位置精确到帧，不回溯关键帧：入点正好在关键帧上就整段流拷贝，
+      落在 GOP 中间则只把入点那一小段做<b>有损重编码</b>（CRF 18、同 profile），其余仍是流拷贝。</div>
     <label class="m-row">
       <span class="m-label">每段一个文件</span>
       <input type="checkbox" id="optSplit" />
@@ -174,7 +170,7 @@
     <div class="m-foot">
       <span class="grow"></span>
       <button id="btnCancelExport" class="btn danger hidden">取消导出</button>
-      <button id="btnExport" class="btn primary" disabled title="按源容器与编码流拷贝导出">导出</button>
+      <button id="btnExport" class="btn primary" disabled title="剪辑位置精确到帧：入点落在关键帧上的段整段流拷贝">导出</button>
       <button id="btnExportDone" class="btn" data-close="exportMask">关闭</button>
     </div>
   </section>

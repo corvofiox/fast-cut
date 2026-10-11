@@ -20,7 +20,7 @@ test('拷贝段命令：有 fps 时用 -frames:v 控制长度（避免帧数与�
   assert.strictEqual(args[i('-i') + 1], 'C:\\videos\\src.mp4');
   assert.strictEqual(args[i('-frames:v') + 1], '120'); // 4s × 30fps
   assert.strictEqual(args[i('-c') + 1], 'copy');
-  assert.ok(args.includes('-avoid_negative_ts'));
+  assert.strictEqual(args[i('-avoid_negative_ts') + 1], 'disabled');
   assert.strictEqual(args[i('-map') + 1], '0');
   assert.ok(args.includes('-map_metadata'));
   assert.ok(args.includes('-dn'));
@@ -96,7 +96,7 @@ test('重编码段沿用源的编码参数，音轨仍拷贝', () => {
   assert.ok(!args.includes('-avoid_negative_ts'));
 });
 
-test('H.265 源精确模式选 libx265，且 colorRange unknown 不注入空参数', () => {
+test('H.265 源重编码段选 libx265，且 colorRange unknown 不注入空参数', () => {
   const hevc = { ...MEDIA, video: { codec: 'hevc', profile: 'Main', pixFmt: 'yuv420p', fps: 25, colorPrimaries: 'unknown', colorTransfer: 'unknown', colorSpace: 'unknown' } };
   const args = argsForSegment({ kind: 'reencode', start: 1, end: 2 }, hevc, 'out.mp4');
   const i = (x) => args.indexOf(x);
@@ -143,7 +143,7 @@ test('profile 名按编码器口径映射，认不出来就不传', () => {
   assert.strictEqual(profileArg({ profile: 'Range Extensions' }, 'libx265'), null);
 });
 
-test('源编码没有同编码重编码器时，精确模式不许混拼', () => {
+test('源编码没有同编码重编码器时不许混拼', () => {
   assert.strictEqual(keepsSourceCodec({ video: { codec: 'h264' } }), true);
   assert.strictEqual(keepsSourceCodec({ video: { codec: 'hevc' } }), true);
   assert.strictEqual(keepsSourceCodec({ video: { codec: 'vp9' } }), true);

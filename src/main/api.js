@@ -362,14 +362,13 @@ function needLoaded(file) {
 }
 
 /**
- * 用导出的同一套纯函数算出"吸附后真实会从哪一秒开始"，让 UI 显示的偏差提示
- * 和实际产物一致——吸附误差是 P0 信息，不能靠渲染层另算一套。
+ * 用导出的同一套纯函数算出切割计划：每条保留区间实际从哪一秒起、导出多少帧、
+ * 入点那一小段要不要重编码。界面显示的那些代价必须来自这里，不能另算一套。
  */
 function previewPlan(payload) {
   const loaded = needLoaded(payload.file);
   const segments = sanitizeSegments(payload.segments);
   const { plan, warnings, keeps, keepSecs } = planFor(loaded, segments, {
-    precise: !!payload.precise,
     ordered: isReordered(segments),
   });
   const target = targetFor(payload.container, loaded, path.resolve(String(payload.file)));
@@ -456,7 +455,7 @@ async function startExport(win, payload) {
     throw new Error('关键帧还没扫完，稍等一下再导出');
   }
   const split = !!payload.split;
-  const targets = targetsFor(loaded, segments, outPath, ext, split, !!payload.precise);
+  const targets = targetsFor(loaded, segments, outPath, ext, split);
   assertNotOverwrite(abs, targets);
 
   const token = createToken();
@@ -468,7 +467,6 @@ async function startExport(win, payload) {
   try {
     const result = await exportSegments(loaded, segments, {
       outPath,
-      precise: !!payload.precise,
       split,
       crf: 18,
       ordered: isReordered(segments),
@@ -496,9 +494,9 @@ async function startExport(win, payload) {
 }
 
 /** 本次导出会写哪些文件：拼接模式 1 个，「每段一个文件」按保留区间各 1 个。 */
-function targetsFor(loaded, segments, outPath, ext, split, precise) {
+function targetsFor(loaded, segments, outPath, ext, split) {
   if (!split) return [outPath];
-  const { plan } = planFor(loaded, segments, { precise, ordered: isReordered(segments) });
+  const { plan } = planFor(loaded, segments, { ordered: isReordered(segments) });
   return groupByKeep(plan).map((_, i) => numbered(outPath, i, ext));
 }
 
@@ -632,7 +630,7 @@ function registerIpc(getWindow) {
     type: 'info',
     title: 'Fast Cut',
     message: 'Fast Cut v0.1',
-    detail: '只做裁剪的极简视频工具：流拷贝导出，不重编码、不上传、不写源文件。',
+    detail: '只做裁剪的极简视频工具：剪辑位置精确到帧，能不重编码的段一律流拷贝；不上传、不写源文件。',
     buttons: ['知道了'],
   }));
   ipcMain.handle('fc:app:quit', () => app.quit());

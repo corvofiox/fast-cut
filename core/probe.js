@@ -128,6 +128,14 @@ function normalizeProbe(raw, file = '(unknown)') {
   const duration = startOffset > 0.01 && includesOffset(fmt.format_name) && rawDur > startOffset
     ? snap(rawDur - startOffset)
     : rawDur;
+  /**
+   * 帧网格原点（相对时间原点）：视频流自己的 start_time 可能比容器晚
+   * （实测 HEVC 的 .mp4/.mkv 首帧 pts = 0.023，因为 DTS/PTS 有编码器延迟）。
+   * 关键帧时间戳就落在这个原点 + N/fps 的格子上；按 0 去折算帧数，
+   * 每个接缝都会差上半帧，拷贝段还会被算成与重编码段重叠 → 时长互相蚕食。
+   */
+  const streamStart = snap(Number(video?.start_time) || 0);
+  const gridOrigin = streamStart > startOffset ? snap(streamStart - startOffset) : 0;
 
   const fps = video && video.avg_frame_rate && video.avg_frame_rate !== '0/0'
     ? safeRatio(video.avg_frame_rate)
@@ -156,6 +164,7 @@ function normalizeProbe(raw, file = '(unknown)') {
     format: fmt.format_name || null,
     duration,
     startOffset,
+    gridOrigin,
     sizeBytes: Number(fmt.size || 0),
     bitRate: Number(fmt.bit_rate || 0),
     video: video ? {
@@ -179,7 +188,14 @@ function normalizeProbe(raw, file = '(unknown)') {
       colorPrimaries: video.color_primaries ?? null,
       colorTransfer: video.color_transfer ?? null,
       colorSpace: video.color_space ?? null,
-      hasBframes: /p/.test(String(video.has_b_frames ?? '')),
+      /**
+       * 重排深度 = 解码序与显示序差几帧（ffprobe 的 has_b_frames 是**数字**，不是 'P'）。
+       * 流拷贝按解码序数包（`-frames:v`），出点会往前多带这么多帧、同时漏掉同样多帧
+       * （实测 h264 双向预测源要 45 帧给出 {0..43, 47}：47 是用户已经删掉的素材）。
+       * 拷贝段的出点帧数要按它减，见 cuttings.buildPlan。
+       */
+      reorderDepth: Math.max(0, Number(video.has_b_frames) || 0),
+      hasBframes: (Number(video.has_b_frames) || 0) > 0,
     } : null,
     audioTracks: audios.map((a) => ({
       index: a.index,

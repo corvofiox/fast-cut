@@ -78,21 +78,6 @@ function fpsOf(media) {
 const round3 = (t) => Math.round(t * 1000) / 1000;
 const clamp = (t, lo, hi) => Math.min(Math.max(t, lo), hi);
 
-/** ≤ t 的最后一个关键帧；找不到退回 0。只用于显示，导出切点由主进程的 planFor() 决定。 */
-function snapStartOf(t, keyframes) {
-  const kfs = keyframes || [];
-  if (!kfs.length) return 0;
-  let lo = 0;
-  let hi = kfs.length - 1;
-  let best = null;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (kfs[mid] <= t + EPS) { best = kfs[mid]; lo = mid + 1; }
-    else hi = mid - 1;
-  }
-  return best == null ? 0 : best;
-}
-
 function toast(msg, kind) {
   const box = $('toast');
   box.textContent = msg;
@@ -159,35 +144,50 @@ function keptSeconds() {
   return round3(state.clips.reduce((s, c) => s + (c.end - c.start), 0));
 }
 
-/** 每个片段的真实导出入点（吸附后），给时间轴角标和"多带几秒"用。 */
 /**
- * 每条保留段"实际从哪儿开始切"。优先按主进程给的切割计划来（那才是真相：
- * 关键帧比剪辑粒度粗时会走自动局部精确，客户端自己重算会算成"回溯吃掉间隙"），
- * 计划还没回来时才退回本地按关键帧吸附估算。
+ * 每条保留段"实际从哪儿开始切"。剪辑位置是硬性要求，入点永不回溯，
+ * 所以这张表只可能来自真实切割计划；计划还没回来时就是空的（界面显示"源 X–Y"，不加任何角标）。
  */
 function snapMap() {
   const parts = state.plan && state.plan.plan;
-  if (Array.isArray(parts) && parts.length) {
-    const map = {};
-    for (const p of parts) {
-      if (p.keepIndex == null || map[p.keepIndex] != null) continue;
-      map[p.keepIndex] = p.start;
-    }
-    return map;
-  }
-  const precise = $('optPrecise').checked;
-  const kfs = state.src ? state.src.media.keyframes : [];
+  if (!Array.isArray(parts) || !parts.length) return {};
   const map = {};
-  if (precise || state.scanning || !kfs || !kfs.length) return map;
-  state.clips.forEach((c, i) => { map[i] = snapStartOf(c.start, kfs); });
+  for (const p of parts) {
+    if (p.keepIndex == null || map[p.keepIndex] != null) continue;
+    map[p.keepIndex] = p.start;
+  }
   return map;
 }
 
-/** 被"自动局部精确"处理的段数：这些段的入点那一小段是有损重编码，必须告知。 */
-function autoPreciseCount() {
+/**
+ * 每条保留段的代价：入点落在关键帧上是纯拷贝，否则入点那一小段有损重编码，
+ * 再不然整段重编码（一个 GOP 内 / 源编码没有同编码重编码器）。时间轴角标和预估行都用它。
+ */
+function costMap() {
   const parts = state.plan && state.plan.plan;
-  if (!Array.isArray(parts)) return 0;
-  return new Set(parts.filter((p) => p.autoPrecise && p.kind === 'reencode').map((p) => p.keepIndex)).size;
+  if (!Array.isArray(parts) || !parts.length) return {};
+  const flags = {};
+  for (const p of parts) {
+    if (p.keepIndex == null) continue;
+    const f = flags[p.keepIndex] || (flags[p.keepIndex] = { copy: false, reencode: false, head: false, codec: false });
+    if (p.kind === 'copy') f.copy = true;
+    else {
+      f.reencode = true;
+      if (p.role === 'head') f.head = true;
+      if (p.codecChange) f.codec = true;
+    }
+  }
+  const map = {};
+  for (const [ki, f] of Object.entries(flags)) {
+    // 换编码最严重，其次是"整段都在重编码"，再次是"只重编码入点那一小段"，最轻是纯拷贝
+    map[ki] = f.codec ? 'codec' : f.reencode && !f.copy ? 'whole' : f.head ? 'head' : 'copy';
+  }
+  return map;
+}
+
+function countCost(cost) {
+  const map = costMap();
+  return Object.values(map).filter((c) => c === cost).length;
 }
 
 // ---------------------------------------------------------------- 启动
@@ -780,7 +780,6 @@ async function runPlan() {
     state.plan = await window.fc.previewPlan({
       file: state.src.file,
       segments: state.clips.map((c) => ({ start: c.start, end: c.end })),
-      precise: $('optPrecise').checked,
       container: containerChoice(),
     });
   } catch (err) {
@@ -809,14 +808,17 @@ function renderClips() {
     len.textContent = `${(c.end - c.start).toFixed(3)}s`;
     li.append(idx, time, len);
 
-    const snapStart = snapMap()[i];
-    const extra = snapStart == null ? 0 : c.start - snapStart;
+    const cost = costMap()[i];
     const src = document.createElement('span');
-    src.className = 'snap';
-    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)}` + (extra > 0.001 ? ` +${extra.toFixed(3)}s` : '');
-    src.title = extra > 0.001
-      ? `流拷贝：实际从 ${tcShort(snapStart)} 开始，多带 ${extra.toFixed(3)}s`
-      : '入点正好落在关键帧上';
+    src.className = 'snap' + (cost && cost !== 'copy' ? ' lossy' : '');
+    const label = { copy: '纯拷贝', head: '入点重编码', whole: '整段重编码', codec: '整段换编码' }[cost] || '待计划';
+    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`;
+    src.title = {
+      copy: '入点正好落在关键帧上：整段流拷贝，不重编码',
+      head: '入点落在 GOP 中间：只有入点那一小段有损重编码，其余仍流拷贝',
+      whole: '整段落在一个 GOP 内（或后面没有可接续的关键帧）：整段有损重编码',
+      codec: '源编码没有同编码的重编码器：整段重编码，导出编码与源不同',
+    }[cost] || '切割计划还在计算';
     li.appendChild(src);
 
     li.addEventListener('click', () => { state.sel = i; tl.setSelected(i); seekProgram(c.ps); renderClips(); });
@@ -833,29 +835,6 @@ function renderClips() {
   }
 }
 
-function snapExtra() {
-  const map = snapMap();
-  let extra = 0;
-  state.clips.forEach((c, i) => { if (map[i] != null) extra += Math.max(0, c.start - map[i]); });
-  return extra;
-}
-
-/**
- * 相邻保留段被吸附"吃掉"的重叠秒数：内容会被导出两遍或把已删的间隙带回来。
- * 主进程的计划已不会再让这种事发生（跨界的段自动走局部精确），这里留着是给
- * "计划还没回来"的窗口期做保守提示，正常路径下应当恒为 0。
- */
-function overlapSeconds() {
-  const map = snapMap();
-  let secs = 0;
-  for (let i = 1; i < state.clips.length; i++) {
-    const prevEnd = state.clips[i - 1].end;
-    const snap = map[i];
-    if (snap != null && snap < prevEnd - 0.001) secs += prevEnd - snap;
-  }
-  return round3(secs);
-}
-
 /** 预估行是 innerHTML 拼的，凡是来自文件元数据/主进程的字样都先过这一道。 */
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
@@ -865,26 +844,32 @@ function updateEstimate() {
   const box = $('estimate');
   if (!state.src || !state.clips.length) { box.textContent = '—'; return; }
   const keepSecs = keptSeconds();
-  // extra 取自真实计划：精确模式下入点不回溯，天然是 0；吸附模式多带多少就说多少
-  const extra = snapExtra();
-  const precise = $('optPrecise').checked;
+  const parts = state.plan && state.plan.plan;
+  // 成片时长按计划实算（整帧取整后的真值），计划没回来时退回用户选区
+  const planSecs = Array.isArray(parts) && parts.length
+    ? round3(parts.reduce((a, p) => a + p.duration, 0)) : null;
+  const estSecs = planSecs == null ? keepSecs : planSecs;
   const split = $('optSplit').checked;
   const cut = round3(Math.max(0, (state.src.media.duration || 0) - keepSecs));
-  const estSecs = keepSecs + extra;
   const rate = state.src.media.bitRate || 8e6;
   const bytes = rate / 8 * estSecs * 1.05;
   const lines = [
     `<b>${split ? state.clips.length : 1} 个文件</b> · 成片 <b>${tc(estSecs)}</b> · <b>${fmtBytes(bytes)}</b>`,
   ];
-  const over = precise ? 0 : overlapSeconds();
-  if (over > 0.001) lines.push(`⚠ 缝隙会被带回 ${over.toFixed(3)}s`);
-  // 入点回溯多带的部分（流拷贝只能从关键帧起）：说清楚比让用户发现强
-  if (!precise && extra > 0.05) lines.push(`⚠ 吸附关键帧会多带 ${round3(extra).toFixed(3)}s 片段开头`);
-  const autoN = autoPreciseCount();
-  if (autoN) lines.push(`⚠ 关键帧间隔比剪辑粒度粗：${autoN} 段已自动局部精确（入点那一小段重编码，其余仍是流拷贝）`);
+  const headN = countCost('head');
+  const wholeN = countCost('whole');
+  const codecN = countCost('codec');
+  if (headN) lines.push(`✂ ${headN} 段入点不在关键帧上：只重编码入点那一小段，其余仍是流拷贝`);
+  if (wholeN) lines.push(`✂ ${wholeN} 段整段重编码（落在一个 GOP 内，或后面没有可接续的关键帧）`);
+  const srcCodec = state.src.media.video && state.src.media.video.codec;
+  if (codecN) lines.push(`⚠ ${codecN} 段整段换编码重编码：源编码 ${esc(srcCodec || '?')} 没有同编码的重编码器`);
+  const parts2 = (state.plan && state.plan.plan) || [];
+  const trimmed = parts2.reduce((a, p) => Math.max(a, p.trimmed || 0), 0);
+  if (trimmed) lines.push(`· 源含双向预测帧：拷贝段的末端留了 ${trimmed} 帧余量，不会把你删掉的素材带回来`);
+  if (planSecs != null && Math.abs(planSecs - keepSecs) > 0.05) {
+    lines.push(`· 计划比选区${planSecs > keepSecs ? '多' : '少'} ${Math.abs(planSecs - keepSecs).toFixed(3)}s（整帧取整）`);
+  }
   if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 疑似 VFR，建议每段一个文件');
-  // HEVC 多段拼接以前会提示"会被自检拦下"：那是开放 GOP 的 RASL 前导帧造成的，
-  // 现在切割时直接在封装层剔掉（仍然 -c copy），这句话已经不成立，别再吓唬用户。
   // 换封装的代价必须在这里说清楚，而不是等 ffmpeg 报 "Could not find tag for codec"
   const cont = state.plan && state.plan.container;
   if (cont) {
@@ -915,7 +900,7 @@ function updateExportEnabled() {
             : !$('outDir').value ? '先选择导出目录'
               : state.busy ? '导出进行中' : '';
   $('btnExport').disabled = !!why;
-  $('btnExport').title = why || '按源容器与编码流拷贝导出';
+  $('btnExport').title = why || '剪辑位置精确到帧：入点落在关键帧上的段整段流拷贝，落在 GOP 中间的重编码入点那一小段';
 }
 
 // ---------------------------------------------------------------- 导出
@@ -930,7 +915,6 @@ async function runExport() {
     segments,
     outDir: $('outDir').value,
     baseName: $('outName').value,
-    precise: $('optPrecise').checked,
     split: $('optSplit').checked,
     container: containerChoice(),
   };
@@ -976,7 +960,7 @@ function setBusy(busy) {
   $('btnExport').classList.toggle('hidden', busy);
   $('btnCancelExport').classList.toggle('hidden', !busy);
   $('btnImportEmpty').disabled = busy;
-  for (const id of ['optPrecise', 'optSplit', 'outName', 'outContainer', 'btnChooseDir']) $(id).disabled = busy;
+  for (const id of ['optSplit', 'outName', 'outContainer', 'btnChooseDir']) $(id).disabled = busy;
   updateToolButtons();
   updateExportEnabled();
 }
@@ -993,6 +977,9 @@ function onProgress(evt) {
   switch (evt.phase) {
     case 'prepare':
       setProgress(`准备导出 ${evt.segments.length} 段`, 2, `合计 ${Number(evt.keepSecs).toFixed(3)} s`);
+      break;
+    case 'normalize':
+      setProgress('封装归一（纯拷贝，不重编码）', 3, evt.note || '');
       break;
     case 'cut':
       state.cut = { index: evt.index, total: evt.total || 1, ratio: 0 };
@@ -1332,14 +1319,10 @@ function bindUi() {
   });
   $('outName').addEventListener('input', updateExportEnabled);
 
-  for (const id of ['optPrecise', 'optSplit']) {
-    $(id).addEventListener('change', () => {
-      // 只有精确模式的副说明是警告（有损重编码），勾上才染黄；"每段一个文件"那条不该跟着变脸
-      $(id).closest('.m-row').classList.toggle('on', id === 'optPrecise' && $(id).checked);
-      syncTimeline(false);
-      refreshPlan();
-    });
-  }
+  $('optSplit').addEventListener('change', () => {
+    syncTimeline(false);
+    refreshPlan();
+  });
 
   $('outContainer').addEventListener('change', refreshPlan);   // 换容器会改后缀，也可能装不下字幕
 

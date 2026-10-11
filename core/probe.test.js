@@ -31,6 +31,23 @@ test('普通素材 startOffset 为 0，时长原样', () => {
   assert.strictEqual(m.duration, 10);
 });
 
+test('帧网格原点 = 视频流自己的 start_time（实测 HEVC 的 mp4/mkv 首帧 pts 0.023）', () => {
+  const m = normalizeProbe({
+    format: { format_name: 'mov,mp4,m4a', start_time: '0.000000', duration: '10.031' },
+    streams: [{ ...VIDEO, start_time: '0.023000' }],
+  }, 'x.mp4');
+  assert.strictEqual(m.startOffset, 0);
+  assert.strictEqual(m.gridOrigin, 0.023);
+});
+
+test('容器与流的原点合一时网格原点归 0，不重复扣', () => {
+  const m = normalizeProbe({
+    format: { format_name: 'mpegts', start_time: '15.076778', duration: '10.023222' },
+    streams: [{ ...VIDEO, start_time: '15.076778' }],
+  }, 'x.ts');
+  assert.strictEqual(m.gridOrigin, 0);
+});
+
 test('可变帧率判定：标称与实测差 1% 以上算 VFR', () => {
   const vfr = normalizeProbe({
     format: { format_name: 'mov,mp4', duration: '10' },

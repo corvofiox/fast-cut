@@ -288,7 +288,7 @@ async function main() {
 
   // 1c) 顶栏：⌨ ⤓ ⤒ 三个图标按钮；导入 / 导出都是居中模态（与快捷键同款交互）
   const pop = JSON.parse(await js(win, `JSON.stringify((() => {
-    const ids = ["optPrecise", "optSplit", "outDir", "outName", "estimate", "btnExport", "checks", "error"];
+    const ids = ["optSplit", "outDir", "outName", "estimate", "btnExport", "checks", "error"];
     const order = [...document.querySelectorAll("#topbar > button, #topbar .pop-wrap > button")]
       .map((b) => b.id).filter((id) => id === "btnKeys" || id === "btnImportOpen" || id === "btnExportOpen");
     const mask = document.getElementById("exportMask");
@@ -676,7 +676,7 @@ async function main() {
     return 'ok';
   })()`);
   await wait(300);
-  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'snap'); 'ok'`);
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'exact'); 'ok'`);
   await wait(250);
   // 界面先给个说法：导出前那行"成片 …"说的秒数，必须和真导出来的时长对得上。
   // （98 分钟的 .mkv 就翻在这里：界面按选区报 8 秒，产物却是整部片，自检还判通过。）
@@ -687,14 +687,25 @@ async function main() {
     return JSON.stringify({ shown: Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]), plan });
   })()`);
   const promise = promised === -1 ? null : JSON.parse(promised);
+  // 剪辑位置是硬性要求：计划里每一段的起点必须就是用户选的入点，一秒都不许回溯到关键帧
+  const noSnap = JSON.parse(await js(win, `(() => {
+    const keeps = __smoke.state.plan.keeps, parts = __smoke.state.plan.plan || [];
+    const bad = keeps.map((k, i) => [i, k, parts.filter((p) => p.keepIndex === i)[0]]).filter(([, k, p]) => p && p.start > k.start + 0.001);
+    return JSON.stringify({ bad, n: parts.length });
+  })()`));
+  check('计划不回溯关键帧：每段起点就是用户选的入点', noSnap.bad.length === 0,
+    JSON.stringify(noSnap.bad) + `（共 ${noSnap.n} 个切割段）`);
   let res = await runExport(win);
   check('拼接导出通过自检', res.ok && res.outputs.length === 1, res.detail);
   if (res.ok && promise) {
     const real = Number(execFileSync('ffprobe', ['-v', 'error', '-show_entries', 'format=duration', '-of', 'csv=p=0',
-      path.join(OUT_DIR, 'snap.mp4')], { encoding: 'utf8' }).trim());
+      path.join(OUT_DIR, 'exact.mp4')], { encoding: 'utf8' }).trim());
     check('界面预估的成片时长 = 实际产物，且不吞掉已删素材',
-      Math.abs(promise.shown - real) <= 0.6 && Math.abs(promise.plan - real) <= 0.6,
-      `预估 ${promise.shown}s · 计划 ${promise.plan.toFixed(3)}s · 实际 ${real.toFixed(3)}s（选区 6s，多带的是吸附回溯，界面已报）`);
+      Math.abs(promise.shown - real) <= 0.25 && Math.abs(promise.plan - real) <= 0.25,
+      `预估 ${promise.shown}s · 计划 ${promise.plan.toFixed(3)}s · 实际 ${real.toFixed(3)}s（允差 0.25s）`);
+    const names = JSON.parse(await js(win, `JSON.stringify([...document.querySelectorAll('#checks li')].map((li) => li.textContent))`));
+    check('自检里有「帧数符合切割计划」这条硬判据',
+      names.some((t) => t.includes('帧数符合切割计划')), names.join('、').slice(0, 200));
   }
 
   const groups = await js(win, 'new Set(__smoke.state.plan.plan.map((p) => p.keepIndex)).size');
@@ -702,12 +713,7 @@ async function main() {
   await wait(250);
   res = await runExport(win);
   check('每段一个文件通过自检', res.ok && res.outputs.length === groups, `${res.detail}（计划 ${groups} 组）`);
-
-  await js(win, `__smoke.setOption('optSplit', false); __smoke.setOption('optPrecise', true); __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'precise'); 'ok'`);
-  await wait(300);
-  res = await runExport(win);
-  check('精确模式通过自检', res.ok && res.outputs.length === 1, res.detail);
-  await js(win, `__smoke.setOption('optPrecise', false); 'ok'`);
+  await js(win, `__smoke.setOption('optSplit', false); 'ok'`);
   await wait(250);
 
   // 9a) 用真实指针拖胶片：改顺序，且绝不移动播放头
@@ -762,8 +768,6 @@ async function main() {
   await js(win, `(() => {
     document.getElementById('tlPlayhead').classList.remove('dragging');
     __smoke.tl.fit();
-    // 勾上精确模式再拍：拨杆的选中态和"有损重编码"的黄字只在打开时才看得到
-    __smoke.setOption('optPrecise', true);
     document.getElementById('exportMask').classList.remove('hidden');
     return 'ok';
   })()`);
@@ -771,7 +775,6 @@ async function main() {
   await shoot(win, 'smoke-ui-export.png');
   await js(win, `(() => {
     document.getElementById('exportMask').classList.add('hidden');
-    __smoke.setOption('optPrecise', false);
     return 'ok';
   })()`);
   // 三个模态各拍一张：并排看才知道设计语言到底统一了没有
@@ -790,8 +793,8 @@ async function main() {
     })()`);
   }
 
-  // 11) 目标重名必须拒绝，绝不覆盖
-  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'snap'); 'ok'`);
+  // 11) 目标重名必须拒绝，绝不覆盖（用本轮真正导出过的名字 'exact'）
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'exact'); 'ok'`);
   await wait(250);
   const refused = await js(win, '__smoke.runExport().then(() => document.getElementById("error").textContent)');
   check('重名时拒绝覆盖', /已存在/.test(String(refused)), String(refused).slice(0, 60));

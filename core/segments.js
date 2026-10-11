@@ -82,36 +82,6 @@ function totalDuration(segs) {
   return snap(normalizeSegments(segs).reduce((acc, s) => acc + (s.end - s.start), 0));
 }
 
-/**
- * 关键帧吸附：把 t 前移到 ≤ t 的最后一个关键帧。
- * keyframes 必须已排序。若无关键帧或全部晚于 t，返回最大可能的前值（或 null 表示无解）。
- */
-function snapToKeyframe(t, keyframes) {
-  if (!Array.isArray(keyframes) || keyframes.length === 0) return null;
-  let lo = 0;
-  let hi = keyframes.length - 1;
-  let best = null;
-  while (lo <= hi) {
-    const mid = (lo + hi) >> 1;
-    if (keyframes[mid] <= t + EPS) {
-      best = keyframes[mid];
-      lo = mid + 1;
-    } else {
-      hi = mid - 1;
-    }
-  }
-  return best;
-}
-
-/** 出点吸附：把 t 后移到 ≥ t 的第一个关键帧（流拷贝结束点必须落在关键帧之后的帧边界上）。 */
-function snapEndToKeyframe(t, keyframes) {
-  if (!Array.isArray(keyframes) || keyframes.length === 0) return null;
-  for (const k of keyframes) {
-    if (k >= t - EPS) return k;
-  }
-  return null;
-}
-
 module.exports = {
   EPS,
   MIN_LEN,
@@ -121,6 +91,4 @@ module.exports = {
   unionSegments,
   invertSegments,
   totalDuration,
-  snapToKeyframe,
-  snapEndToKeyframe,
 };

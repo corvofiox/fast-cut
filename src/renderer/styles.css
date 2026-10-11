@@ -300,6 +300,8 @@ html, body {
 .keeps li .tc { white-space: nowrap; }
 .keeps li .len { color: var(--fg-dim); }
 .keeps li .snap { grid-column: 1 / -1; color: var(--fg-dim); font-size: 11px; }
+/* 入点不在关键帧上就要重编码一小段：这是有损的，得跟"纯拷贝"区分开 */
+.keeps li .snap.lossy { color: var(--warn); }
 .keeps li .x { color: var(--fg-dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
 .keeps li .x:hover { color: var(--err); border-color: #6b3330; }
 .keeps .empty-row { display: block; color: var(--fg-dim); padding: 8px 6px; font-size: 12px; }

@@ -54,32 +54,44 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
   if (!sVideo || !oVideo) {
     add('视频轨存在', false, `源视频轨 ${!!sVideo}，导出 ${!!oVideo}`);
   } else if (expect.codec && expect.codec !== sVideo.codec_name) {
-    // 精确模式整段重编码换了编码，是明说的设计而不是故障：拿目标编码比对
-    add('编码为精确模式所选', oVideo.codec_name === expect.codec,
-      `源 ${sVideo.codec_name} → 导出 ${oVideo.codec_name}（精确模式整段重编码，非流拷贝）`);
+    // 源编码没有同编码的重编码器时整段重编码，编码必然改变：这是明说的设计而不是故障，
+    // 拿"所选编码"比对，而不是拿源比对
+    add('编码为重编码所选', oVideo.codec_name === expect.codec,
+      `源 ${sVideo.codec_name} → 导出 ${oVideo.codec_name}（整段重编码，非流拷贝）`);
     add('分辨率一致', sameWH(sVideo, oVideo), `源 ${sVideo.width}x${sVideo.height} → 导出 ${oVideo.width}x${oVideo.height}`);
   } else {
     add('视频编码一致', sVideo.codec_name === oVideo.codec_name, `源 ${sVideo.codec_name} → 导出 ${oVideo.codec_name}`);
     add('分辨率一致', sameWH(sVideo, oVideo), `源 ${sVideo.width}x${sVideo.height} → 导出 ${oVideo.width}x${oVideo.height}`);
     add('像素格式一致', sVideo.pix_fmt === oVideo.pix_fmt, `源 ${sVideo.pix_fmt} → 导出 ${oVideo.pix_fmt}`);
-    // 帧率：用 r_frame_rate（容器声明的标称帧率）判定，不要用 avg_frame_rate。
-    // avg 是 ffprobe 用 duration/nb_frames 倒推的，首帧 PTS 非 0 时会失真
-    // （实测：精确模式产物 116 帧 @30fps、帧间隔严格 1/30，但 avg 显示 3480/119 ≈ 29.24）。
-    // VFR 源没有"标称帧率"可言：源报 30/1、按时间戳重封装后报 25/1 是正常结果，
-    // 判它失败等于把封装器的口径差异说成用户导出坏了（实测 VFR 素材三种模式全误报）。
+    /**
+     * 帧率：真正要守住的是"这么多帧占满这么长时间"，也就是 frames / duration。
+     * 拿源与产物的 r_frame_rate 对口径会被两件事绊倒（都实测过）：
+     *  - ffprobe 的 r/avg 都是**推断**，ts 的 1/30 落在 90kHz 上会报成 60/1，
+     *    mkv 的块时长按毫秒取整会把 30/1 报成 645/22 ≈ 29.32；
+     *  - 含双向预测的源在出点上按解码序留了余量，有几帧画面会多显示一帧时间——
+     *    帧数、总时长都精确，唯独"最常见的帧间隔"变长了，那不是导出坏了。
+     * 所以判据换成：产物的任一帧率口径 ≈ 计划帧数 / 计划时长（2% 内），
+     * 或者与源的口径一致（0.5% 内，纯拷贝不裁帧时本来就是它）。
+     */
     if (expect.vfr) {
-      add('可变帧率源', true, `源标称 ${sVideo.r_frame_rate} / 实测 ${sVideo.avg_frame_rate}，按时间戳导出，不强求帧率一致`);
+      add('可变帧率源', true, `源标称 ${sVideo.r_frame_rate} / 实测 ${sVideo.avg_frame_rate}，整段按定帧率重编码导出，不强求与源一致`);
     } else {
-      // r_frame_rate 与 avg_frame_rate 都是 ffprobe 的**推断**，各有各的失手：
-      //  - avg 用 duration/帧数倒推，首帧 PTS 非 0 时失真（实测精确模式产物 116 帧 @30fps 报 29.24）
-      //  - r 取最常见的帧间隔，mpegts 的 1/30 落在 90kHz 刻度上抖动时会报成 60/1（实测源 30/1）
-      // 所以两对口径里**任一对**对得上就算通过：真把帧率改歪时两对全都对不上。
-      const ok = frameRateEq(sVideo.r_frame_rate, oVideo.r_frame_rate)
-        || frameRateEq(sVideo.avg_frame_rate, oVideo.avg_frame_rate)
-        || frameRateEq(sVideo.avg_frame_rate, oVideo.r_frame_rate)
-        || frameRateEq(sVideo.r_frame_rate, oVideo.avg_frame_rate);
-      add('帧率一致', ok,
-        `源 ${sVideo.r_frame_rate}/${sVideo.avg_frame_rate} → 导出 ${oVideo.r_frame_rate}/${oVideo.avg_frame_rate}（标称/实测，任一口径一致即通过）`);
+      /**
+       * 允差不是拍脑袋的百分比，而是**计划自己允许的偏差**：
+       * 含双向预测的源在出点按解码序留了余量（trimmed 帧），那几帧的时间仍占着格子，
+       * "最常见的帧间隔"就被拉长（实测 43 帧的计划报成 645/22 ≈ 29.32 而非 30）。
+       * 真把帧率改歪（25 当成 30 编）远超这个数，照样会被判失败。
+       */
+      const slack = Math.max(0.005, (expect.rateSlack || 0) + 0.01);
+      const planRate = expect.frames && expect.duration > 0 ? expect.frames / expect.duration : null;
+      const srcRates = [toFps(sVideo.r_frame_rate), toFps(sVideo.avg_frame_rate)];
+      const outRates = [toFps(oVideo.r_frame_rate), toFps(oVideo.avg_frame_rate)];
+      const close = (a, b) => a !== null && b !== null && Math.abs(a - b) <= Math.max(0.001, b * slack);
+      const ok = outRates.some((o) => srcRates.some((s) => close(o, s)))
+        || (planRate !== null && outRates.some((o) => close(o, planRate)));
+      add('帧率与计划一致', ok,
+        `源 ${sVideo.r_frame_rate}/${sVideo.avg_frame_rate} → 导出 ${oVideo.r_frame_rate}/${oVideo.avg_frame_rate}`
+        + `（计划 ${expect.frames || '?'} 帧 / ${Number(expect.duration).toFixed(3)}s ≈ ${planRate ? planRate.toFixed(2) : '?'} fps，允差 ${(slack * 100).toFixed(1)}%）`);
     }
     if (sVideo.profile) {
       add('profile 一致', String(sVideo.profile) === String(oVideo.profile), `源 ${sVideo.profile} → 导出 ${oVideo.profile}`);
@@ -107,9 +119,22 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
     }
   }
 
-  // 时长：`expect.duration` 是**切割计划实算的时长之和**（不是用户选区——吸附本来就会多带内容，
-  // 按选区判会把正常回溯误报成故障）。上界也不再按"源长 5%"给：98 分钟的素材等于允许多带
-  // 5 分钟，把"整段被并回去、剪辑等于没做"那种事故直接放行（实测）。
+  /**
+   * 帧数：计划要导出多少帧，视频轨就得有多少个报文。
+   * 这是"剪辑位置精确"最硬的一条判据——时长会被容器记账口径糊弄（mkv 的块时长、
+   * ts 的 90kHz 取整），帧数不会。允差 1 帧只给封装器自己的边界取整留余地。
+   */
+  if (expect.frames != null) {
+    const n = await countVideoPackets(ffprobePath, outFile);
+    add('帧数符合切割计划', n !== null && Math.abs(n - expect.frames) <= 1,
+      n == null ? `计划 ${expect.frames} 帧，视频包数没读到`
+        : `计划 ${expect.frames} 帧 → 实际 ${n} 帧（差 ${n - expect.frames}）${n > expect.frames ? '：多出来的是你已经删掉的素材' : ''}`);
+  }
+
+  // 时长：`expect.duration` 是**切割计划实算的时长之和**（整帧取整后的真值）。
+  // 上界不再按"源长 5%"给：98 分钟的素材等于允许多带 5 分钟，把"整段被并回去、
+  // 剪辑等于没做"那种事故直接放行（实测）。多带的每一秒都是用户已经删掉的素材，
+  // 所以上界要紧，下界留给"音频尾巴/封装口径"那种看得见的无害差。
   // 量的必须是**视频轨**：拷贝过去的音频常常比画面长半秒，拿容器时长（各流取最大）判
   // 会把这种音频尾巴算成"多导了内容"（实测 .ts 源 +0.6s 误报），而那类病自有"音画时间线一致"把关。
   const outDur = videoDuration(outMeta) ?? Number(outMeta.format.duration || 0);
@@ -210,26 +235,26 @@ async function probeRaw(ffprobePath, file) {
   return JSON.parse(stdout);
 }
 
+/** 视频轨报文数（按解码序数包，比 `-count_frames` 全量解码便宜得多，判帧数够用）。 */
+async function countVideoPackets(ffprobePath, file) {
+  try {
+    const { stdout } = await run(ffprobePath, ['-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'packet=pts', '-of', 'csv=p=0', file]);
+    const n = stdout.split(/\r?\n/).filter((l) => l.trim() !== '').length;
+    return n || null;
+  } catch {
+    return null;
+  }
+}
+
 function first(streams, type) { return (streams || []).find((s) => s.codec_type === type) || null; }
 function all(streams, type) { return (streams || []).filter((s) => s.codec_type === type); }
 function sameWH(a, b) { return a.width === b.width && a.height === b.height; }
-
-/** 帧率比对用 0.5% 相对误差：concat 重封装会把 30/1 改写成等价的大分子分母时分比。 */
-function frameRateEq(a, b) {
-  const na = toFps(a);
-  const nb = toFps(b);
-  if (na === null || nb === null) return false;
-  return Math.abs(na - nb) <= Math.max(0.001, nb * 0.005);
-}
 
 function toFps(r) {
   const [x, y] = String(r).split('/').map(Number);
   if (!x || !y) return null;
   return x / y;
-}
-
-function ratioEq(a, b) {
-  return frameRateEq(a, b);
 }
 
 module.exports = { verifyExport, decodeErrors };

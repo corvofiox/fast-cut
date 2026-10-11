@@ -5,7 +5,7 @@ const assert = require('node:assert');
 
 const {
   snap, normalizeSegment, normalizeSegments, unionSegments, invertSegments,
-  totalDuration, snapToKeyframe, snapEndToKeyframe,
+  totalDuration,
 } = require('./segments');
 
 test('snap 抹平浮点误差', () => {
@@ -68,22 +68,4 @@ test('invertSegments 反相为删除区间', () => {
 test('totalDuration 累加的是并集时长', () => {
   assert.strictEqual(totalDuration([{ start: 0, end: 2 }, { start: 1, end: 4 }]), 4);
   assert.strictEqual(totalDuration([]), 0);
-});
-
-test('snapToKeyframe 前移到最近关键帧', () => {
-  const kfs = [0, 2, 4, 6, 8, 10];
-  assert.strictEqual(snapToKeyframe(0, kfs), 0);
-  assert.strictEqual(snapToKeyframe(3.4, kfs), 2);
-  assert.strictEqual(snapToKeyframe(4, kfs), 4);
-  assert.strictEqual(snapToKeyframe(4.0001, kfs), 4);
-  assert.strictEqual(snapToKeyframe(-1, kfs), null);
-  assert.strictEqual(snapToKeyframe(3, []), null);
-});
-
-test('snapEndToKeyframe 后移到最近关键帧', () => {
-  const kfs = [0, 2, 4, 6, 8, 10];
-  assert.strictEqual(snapEndToKeyframe(3.4, kfs), 4);
-  assert.strictEqual(snapEndToKeyframe(4, kfs), 4);
-  assert.strictEqual(snapEndToKeyframe(4.0001, kfs), 6);
-  assert.strictEqual(snapEndToKeyframe(11, kfs), null);
 });

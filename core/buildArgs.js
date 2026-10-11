@@ -43,7 +43,8 @@ function streamBsfFor(item, media) {
  *  - 长度控制优先用 `-frames:v N`（帧数）：`-t 1.5` 在 30fps 下只产出 45 帧，
  *    而 mp4 记录的时长是"末帧 PTS + 一帧"以外的值（实测 seg0 时长 1.467s），
  *    concat 时后段会被接到这个偏短的位置，引发 PTS 错位/回跳。
- *  - `-avoid_negative_ts make_zero` 必须加，否则时间戳不归零，播放器可能显示错乱
+ *  - `-avoid_negative_ts disabled`（仅拷贝段）：段内视频必须严格从 0 起，
+ *    `make_zero` 会按最小的音频包把视频推后一帧，拼接后每个接缝多一帧（见下方注释）
  *  - 不要把 `-ss` 放在 -i 之后再用 `-to`：输入定位时 `-to` 会被当成输出总时长
  *
  * remux 换容器时由目标文件的扩展名决定 muxer，两处按家族分支：
@@ -70,21 +71,34 @@ function argsForSegment(item, media, outPath, opts = {}) {
   args.push('-i', media.file);
   if (lead > 0.0005) args.push('-ss', fmtTime(lead));
 
-  // 长度：能折算成帧数就用 -frames:v，避免"帧数与时长不一致"导致 concat 错位
+  // 长度：能折算成帧数就用 -frames:v，避免"帧数与时长不一致"导致 concat 错位。
+  // 计划给了明确包数时（拷贝段要按解码序留双向预测余量）一律以计划为准。
   const fps = Number(opts.fps) > 0 ? Number(opts.fps) : null;
-  if (fps && Number.isFinite(item.duration)) {
-    args.push('-frames:v', String(Math.max(1, Math.round(item.duration * fps))));
-  } else {
-    args.push('-t', fmtTime(item.duration));
-  }
+  const frames = Number.isFinite(item.frames) && item.frames > 0
+    ? Math.round(item.frames)
+    : (fps && Number.isFinite(item.duration) ? Math.round(item.duration * fps) : null);
+  if (frames) args.push('-frames:v', String(Math.max(1, frames)));
+  else args.push('-t', fmtTime(item.duration));
 
   if (item.kind === 'copy') {
     args.push('-c', 'copy');
-    // 流拷贝必须显式规避负时间戳导致的花屏/首帧丢失
-    args.push('-avoid_negative_ts', 'make_zero');
+    /**
+     * 拷贝段默认**不归零**时间戳。计划里的拷贝段起点必定是关键帧，归零反而是害：
+     * `make_zero` 按"所有流里最小的那个"整体平移，而音频帧边界不会正好压在关键帧上，
+     * 于是音频归零、视频被推后约一帧（实测 30fps 段 start_time=0.0333）。
+     * concat 按各段自身时长推偏移，段里视频晚一帧 → 每个接缝多一帧：
+     * 4 段拼出来 4.4667s（该 4.4000s），多出来的正是用户已经删掉的素材。
+     * 用 disabled 让段内视频严格从 0 起，负的那点音频尾巴由容器自己
+     * （mov 走 edit list / mkv 允许 3ms 偏移）吸收，拼接后时长、帧数、起点全对。
+     *
+     * 唯一例外由上层指定（copyTs='make_zero'）：**读 Matroska 源**时 disabled 会让段里
+     * 所有报文丢掉时间戳（实测 pts=N/A，拼接报 unknown timestamp）。
+     * 上层会先把源纯拷成 MP4 再切，切不动时才退回 make_zero 并承担每接缝一帧的偏差。
+     */
+    args.push('-avoid_negative_ts', opts.copyTs === 'make_zero' ? 'make_zero' : 'disabled');
     // 各段必须用同一个视频刻度：拷贝段的刻度是**从源继承**的（.ts 就是 1/90000），
     // 重编码段却是 mov muxer 默认的 1/15360，concat 按前一段的刻度推下一段的偏移，
-    // 单位一混就把 5.8s 的内容摊成 38.7s（实测偏移 .ts 源精确模式）。
+    // 单位一混就把 5.8s 的内容摊成 38.7s（实测偏移 .ts 源重编码接缝）。
     if (family === 'mov') args.push('-video_track_timescale', outputTimeScale(media));
     args.push(...mapArgs);                        // 保留全部音轨 / 字幕轨
     args.push('-map_metadata', '0');             // 保留元数据与章节
@@ -107,7 +121,7 @@ function argsForSegment(item, media, outPath, opts = {}) {
     if (!opts.dropSubtitles) args.push('-c:s', 'copy');
     args.push('-crf', String(opts.crf ?? 18));
     args.push(...speedArgs(codec));
-    // 精确模式的小段用同 profile 编码，减少与源不一致造成的兼容问题
+    // 入点小段用同 profile 编码，减少与源不一致造成的兼容问题
     const profile = profileArg(media.video, codec);
     if (profile) args.push('-profile:v', profile);
     if (media.video?.pixFmt) args.push('-pix_fmt', media.video.pixFmt);
@@ -129,7 +143,7 @@ function argsForSegment(item, media, outPath, opts = {}) {
   return args;
 }
 
-/** 精确模式选编码器：源是 H.265/AV1 时用对应软件编码器；未知编码按 h264 处理（mp4/mov 最稳）。 */
+/** 重编码段选编码器：源是 H.265/AV1 时用对应软件编码器；未知编码按 h264 处理（mp4/mov 最稳）。 */
 function pickVideoCodec(media, opts = {}) {
   if (opts.reencodeCodec) return opts.reencodeCodec;
   const c = media?.video?.codec;
@@ -141,8 +155,8 @@ function pickVideoCodec(media, opts = {}) {
 
 /**
  * 编码器产出的 codec_name（ffprobe 口径）。
- * 精确模式要是拿 h264 编码器去接 mpeg2 的流拷贝段，拼出来的文件帧率、时长全乱
- * （实测 mpeg2 .ts 精确模式产物 5.9s 选区变成 35.8s）——所以先问一句
+ * 拿 h264 编码器去接 mpeg2 的流拷贝段，拼出来的文件帧率、时长全乱
+ * （实测 mpeg2 .ts 混拼产物 5.9s 选区变成 35.8s）——所以先问一句
  * "重编码出来还是源那个编码吗"，不是就别混拼。
  */
 const CODEC_OF_ENCODER = {
@@ -165,9 +179,9 @@ function keepsSourceCodec(media, opts = {}) {
 /**
  * ffprobe 报的 profile 名不能直接喂给编码器：两边写法不同（都拿随包 ffmpeg 实测）。
  *  - "Constrained Baseline"（手机/屏幕录制很常见）、"Simple Profile"（xvid）、
- *    "Standard"（ProRes）原样传进去 → "invalid profile" → 打不开编码器，整条精确模式
+ *    "Standard"（ProRes）原样传进去 → "invalid profile" → 打不开编码器，整条重编码命令
  *    命令以退出码非 0 结束；"High 10"/"Progressive High" 同理。
- *  - libx265 只认小写无空格：源 profile="Main" 原样传会崩（实测 HEVC 精确模式必崩）。
+ *  - libx265 只认小写无空格：源 profile="Main" 原样传会崩（实测 HEVC 源直接传必崩）。
  * 认不出来的就不传，让编码器按像素格式自己选——总比传一个错的强。
  * VP9 / AV1 的 profile 写法又是另一套（"Profile 0" 之类），一律不传，
  * 自检阶段会比对 profile 是否一致，不一致会明确报错而不是静默。
