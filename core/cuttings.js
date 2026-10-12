@@ -242,7 +242,7 @@ function hasKeyframeAt(t, keyframes) {
  *
  * 入点不在帧网格上时，导出的第一帧是网格里**不早于**它的那一格（`span` 就是这么数帧的）。
  * 字幕按文本重计时必须拿这个时刻当基准：拿用户输入的 0.5 当基准，而画面其实从 0.523 起，
- * 每条 cue 都会整体晚 0.023s——差得不到一帧，但字幕与口型就是一致的偏晚。
+ * 每条 cue 都会整体晚 0.023s——还不够一帧，但字幕与口型就是一致地偏晚。
  */
 function frameStart(t, fps, origin = 0) {
   const f = Number(fps) > 0 ? Number(fps) : null;
