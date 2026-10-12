@@ -134,7 +134,7 @@ function buildPlan(keeps, opts) {
         plan.push({
           kind: 'copy', role: 'whole', start, duration: part.duration, frames: part.frames,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
-          note: '入点正好落在关键帧上：整段流拷贝',
+          note: '入点正好在关键帧上：整段流拷贝',
         });
       } else {
         plan.push({
