@@ -477,7 +477,7 @@ function updateHud() {
   const hud = $('hud');
   if (!state.src) { hud.textContent = ''; return; }
   const parts = [];
-  if (lastSnap) parts.push(lastSnap.kind === 'keyframe' ? '磁吸·关键帧' : '磁吸·分割点');
+  if (lastSnap) parts.push(lastSnap.kind === 'keyframe' ? '磁吸·GOP 边界' : '磁吸·分割点');
   const pt = tl.currentProgramTime();
   const srcT = tl.progToSrc(pt);
   if (Math.abs(srcT - pt) > 0.001) parts.push(`源 ${tcShort(srcT)}`);
