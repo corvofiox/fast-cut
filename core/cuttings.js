@@ -35,6 +35,15 @@ const { snap, EPS } = require('./segments');
 const KEY_TOL = 0.0005;
 
 /**
+ * 帧网格序号：时刻 t 是第几帧。规则只有一条——**帧必须严格早于上界**，所以向上取整
+ * （四舍五入有一半概率把上界那一帧也算进来，接缝上就把同一帧导出两遍）。
+ * 网格原点是 origin（源首帧未必落在 0，实测 HEVC 首帧 pts = 0.023）。
+ */
+function frameIndex(t, fps, origin = 0) {
+  return Math.ceil((t - origin) * fps - 1e-9);
+}
+
+/**
  * @param {Array<{start:number,end:number}>} keeps 已规整的保留区间
  * @param {{keyframes:number[], duration:number, fps?:number, ordered?:boolean, sameCodec?:boolean}} opts
  *        ordered=true 表示 keeps 的顺序就是导出顺序（用户拖动改过），此时不做相邻合并；
@@ -63,7 +72,7 @@ function buildPlan(keeps, opts) {
    */
   const span = (from, to) => {
     if (!fpsNum) return snap(to - from);
-    const idx = (t) => Math.ceil((t - origin) * fpsNum - 1e-9);
+    const idx = (t) => frameIndex(t, fpsNum, origin);
     // 不抹毫秒：37/30 被 snap 成 1.233 就不是整帧时刻了，concat 推偏移会落半格
     return Math.max(0, idx(to) - idx(from)) / fpsNum;
   };
@@ -228,6 +237,20 @@ function hasKeyframeAt(t, keyframes) {
   return false;
 }
 
+/**
+ * 入点 t 实际会落在哪一帧（源时间轴上的时刻）。
+ *
+ * 入点不在帧网格上时，导出的第一帧是网格里**不早于**它的那一格（`span` 就是这么数帧的）。
+ * 字幕按文本重计时必须拿这个时刻当基准：拿用户输入的 0.5 当基准，而画面其实从 0.523 起，
+ * 每条 cue 都会整体晚 0.023s——差得不到一帧，但字幕与口型就是一致的偏晚。
+ */
+function frameStart(t, fps, origin = 0) {
+  const f = Number(fps) > 0 ? Number(fps) : null;
+  if (!f) return t;
+  const o = Number(origin) > 0 ? Number(origin) : 0;
+  return o + Math.max(0, frameIndex(t, f, o)) / f;
+}
+
 /** ≥ t 的第一个关键帧（keyframes 已升序；没有则 null）。 */
 function firstKeyframeAtLeast(t, keyframes) {
   for (const k of keyframes) {
@@ -294,4 +317,4 @@ function dedupePlan(plan) {
   return out.filter((p) => p.duration > EPS);
 }
 
-module.exports = { buildPlan };
+module.exports = { buildPlan, frameStart };

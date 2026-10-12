@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert');
 
-const { buildPlan } = require('./cuttings');
+const { buildPlan, frameStart } = require('./cuttings');
 
 // 剪辑位置是硬性要求（v0.1 起，见 docs/02 技术方案 §3）：
 //  - 入点**绝不**吸附关键帧；不在关键帧上就重编码入点那一小段，其余仍流拷贝
@@ -238,4 +238,16 @@ test('乱序：用户改过顺序时绝不合并相邻段（否则后一段会�
     `乱序不该被合并：merged ${merged.plan.length} 段 / ordered ${ordered.plan.length} 段`);
   assert.deepStrictEqual(ordered.plan.map((p) => [p.kind, p.start, p.duration]),
     [['reencode', 5, 1], ['copy', 6, 4], ['copy', 0, 5]], '顺序按用户排的，段内容各自精确');
+});
+
+// 帧网格原点：入点不在格子上时，画面从"不早于它的那一格"起步。字幕重计时拿这个时刻做基准，
+// 否则每条 cue 都比口型一致地晚半帧（实测 30fps、origin 0.023 的 mkv 源差 0.023s）。
+test('frameStart：入点向上落到帧网格，原点与无帧率两种情况都不越界', () => {
+  const near = (a, b) => Math.abs(a - b) < 1e-9;
+  assert.ok(near(frameStart(0.5, 30, 0.023), 0.523), '0.5 → 第 15 帧 0.523');
+  assert.ok(near(frameStart(4.1, 30, 0.023), 4.123), '4.1 → 4.123');
+  assert.ok(near(frameStart(0.023, 30, 0.023), 0.023), '正好在格子上就不动');
+  assert.ok(near(frameStart(0, 30, 0.023), 0.023), '早于首帧的入点落到首帧');
+  assert.ok(near(frameStart(0.5, 30, 0), 0.5), '原点 0 时按整帧刻度对齐');
+  assert.strictEqual(frameStart(1.234, null, 0.023), 1.234, '没有帧率就原样返回，不编造网格');
 });

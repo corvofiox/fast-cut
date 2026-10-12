@@ -145,16 +145,23 @@ function setAssTime(node, start, end) {
  * @param {Array<{start:number,end:number}>} cues 源时刻
  * @param {Array<{start:number,end:number}>} keeps 保留区间（源时刻，已按成片顺序）
  * @param {number[]} progStarts 每条保留区间在成片里的起点
+ * @param {number[]} [aligns] 每条保留区间**实际第一帧**的源时刻（默认取区间入点）
  */
-function retime(cues, keeps, progStarts) {
+function retime(cues, keeps, progStarts, aligns) {
   const out = [];
   cues.forEach((c, index) => {
     const k = keeps.findIndex((seg) => c.start >= seg.start - 1e-6 && c.start < seg.end - 1e-6);
     if (k < 0) return;
     const seg = keeps[k];
     const base = (progStarts && progStarts[k]) || 0;
-    const start = base + (c.start - seg.start);
-    const end = base + (Math.min(c.end, seg.end) - seg.start);
+    /**
+     * 减法用 align 而不是 seg.start：入点不落在帧网格上时，画面从网格上不早于它的那一格起步
+     * （见 cuttings.frameStart）。用用户输入的入点做减法，每条 cue 都会整体晚掉这半帧
+     * （实测 30fps、origin 0.023 的 mkv 源差 0.023s——不足一帧，但字幕与口型一致地偏晚）。
+     */
+    const align = (aligns && Number.isFinite(aligns[k])) ? aligns[k] : seg.start;
+    const start = Math.max(base, base + (c.start - align));
+    const end = base + (Math.min(c.end, seg.end) - align);
     if (end - start <= 1e-6) return;
     out.push(Object.assign({}, c, {
       from: index,

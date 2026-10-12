@@ -150,3 +150,19 @@ test('只有文本字幕可重排', () => {
   assert.strictEqual(isTextSubtitle('hdmv_pgs_subtitle'), false);
   assert.strictEqual(isTextSubtitle('mov_text'), false);
 });
+
+// 基准取"这一段实际第一帧的时刻"：入点 0.5 不在 30fps 的网格上（原点 0.023）时画面从 0.523 起，
+// 用 0.5 做减法会让每条 cue 都比口型晚 0.023s（实测 mkv 源就是这个数）。
+test('重新计时：aligns 给实际第一帧时刻，cue 不再整体偏晚半帧', () => {
+  const keeps = [{ start: 0.5, end: 2.3 }];
+  const cues = [{ start: 0.823, end: 1.223, text: 'x' }];
+  assert.strictEqual(retime(cues, keeps, [0])[0].start, 0.323);           // 没给对齐时刻：按用户入点
+  assert.strictEqual(retime(cues, keeps, [0], [0.523])[0].start, 0.3);    // 给了：按第一帧
+});
+
+test('重新计时：压着入点的 cue 顶到该段开头，不写出负时刻', () => {
+  const out = retime([{ start: 0.505, end: 1.2, text: '压线' }], [{ start: 0.5, end: 2.3 }], [0], [0.523]);
+  assert.strictEqual(out.length, 1);
+  assert.strictEqual(out[0].start, 0);
+  assert.ok(Math.abs(out[0].end - (1.2 - 0.523)) < 1e-6);
+});

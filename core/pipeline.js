@@ -11,7 +11,7 @@ const path = require('path');
 const os = require('os');
 
 const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./segments');
-const { buildPlan } = require('./cuttings');
+const { buildPlan, frameStart } = require('./cuttings');
 const { probeMedia, probeKeyframes, run, sourceSubtitleCues } = require('./probe');
 const { familyOfFormat, familyOfExt } = require('./containers');
 const { parseSrt, parseAss, applyRetime, retime, isTextSubtitle } = require('./subtitles');
@@ -117,7 +117,12 @@ function planFor(loaded, segments, opts = {}) {
   const keepSecs = opts.ordered
     ? snap(keeps.reduce((acc, k) => acc + (k.end - k.start), 0))
     : totalDuration(keeps);
-  return { keeps, plan, warnings, keepSecs };
+  /**
+   * 每条保留区间**实际第一帧**的源时刻：入点不在帧网格上时画面从网格点起步。
+   * 字幕按文本重新计时要拿它做减法，否则每条 cue 都比口型晚半帧（见 cuttings.frameStart）。
+   */
+  const keepAligns = keeps.map((k) => frameStart(k.start, loaded.media.video?.fps, loaded.media.gridOrigin));
+  return { keeps, plan, warnings, keepSecs, keepAligns };
 }
 
 /**
@@ -144,7 +149,7 @@ async function exportSegments(loaded, segments, opts) {
     onProgress = () => {}, token = createToken(),
   } = opts;
 
-  const { keeps, plan, warnings, keepSecs: totalKeep } = planFor(loaded, segments, { ordered, dropSubtitles });
+  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, dropSubtitles });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
 
@@ -258,8 +263,8 @@ async function exportSegments(loaded, segments, opts) {
       const cues = [];
       for (const entry of subDocs) {
         const one = split
-          ? await writeRetimeSidecar(entry, ks.map((k) => keeps[k]), ks.map(() => 0), tmpDir, tag)
-          : await writeRetimeSidecar(entry, keeps, keeps.map((_, i) => progOfKeep[i] || 0), tmpDir, tag);
+          ? await writeRetimeSidecar(entry, ks.map((k) => keeps[k]), ks.map(() => 0), ks.map((k) => keepAligns[k]), tmpDir, tag)
+          : await writeRetimeSidecar(entry, keeps, keeps.map((_, i) => progOfKeep[i] || 0), keepAligns, tmpDir, tag);
         if (one) { files.push(one.file); cues.push(one.cues); }
       }
       return { files, cues };
@@ -306,7 +311,7 @@ async function exportSegments(loaded, segments, opts) {
     onProgress({ phase: 'verify' });
     for (let i = 0; i < outputs.length; i++) {
       if (!wantCues[i] && !dropSubtitles && (media.subtitleCodecs || []).length) {
-        wantCues[i] = await expectedCuesFromSource(bins, file, media, keeps, plan, groups, progOfKeep, split, i);
+        wantCues[i] = await expectedCuesFromSource(bins, file, media, keeps, plan, groups, progOfKeep, split, i, keepAligns);
       }
     }
     const results = [];
@@ -449,8 +454,8 @@ async function extractSubtitleDocs(bins, file, media, tmpDir) {
  * 把某条输出的字幕重排成 sidecar 文件。
  * @returns {{file:string, cues:number[]}|null} 一条都没有时返回 null（该轨就不写进产物）
  */
-async function writeRetimeSidecar(entry, keeps, progStarts, tmpDir, tag) {
-  const moved = retime(entry.doc.cues, keeps, progStarts);
+async function writeRetimeSidecar(entry, keeps, progStarts, aligns, tmpDir, tag) {
+  const moved = retime(entry.doc.cues, keeps, progStarts, aligns);
   if (!moved.length) return null;
   const out = path.join(tmpDir, `sub${entry.track}-${tag}${entry.isAss ? '.ass' : '.srt'}`);
   try {
@@ -464,7 +469,7 @@ async function writeRetimeSidecar(entry, keeps, progStarts, tmpDir, tag) {
  * 换算成成片时刻。自检拿它逐条比对成片字幕，就能把"漏一条 + 串一条"那种
  * 条数刚好相等的情况也抓出来。
  */
-async function expectedCuesFromSource(bins, file, media, keeps, plan, groups, progOfKeep, split, outIndex) {
+async function expectedCuesFromSource(bins, file, media, keeps, plan, groups, progOfKeep, split, outIndex, aligns) {
   try {
     const cueLists = await sourceSubtitleCues(bins.ffprobe, file,
       keeps.map((k) => [k.start, k.end]), media.startOffset, media.duration);
@@ -476,7 +481,8 @@ async function expectedCuesFromSource(bins, file, media, keeps, plan, groups, pr
       for (const t of list) {
         const k = ks.find((ki) => t >= keeps[ki].start - 0.001 && t < keeps[ki].end);
         if (k === undefined) continue;
-        out.push(split ? t - keeps[k].start : (progOfKeep[k] || 0) + (t - keeps[k].start));
+        const align = (aligns && Number.isFinite(aligns[k])) ? aligns[k] : keeps[k].start;
+        out.push(split ? t - align : (progOfKeep[k] || 0) + (t - align));
       }
       return out.sort((a, b) => a - b);
     });

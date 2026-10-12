@@ -21,6 +21,7 @@ const path = require('path');
 const { execFileSync, spawnSync } = require('child_process');
 
 const { loadSource, exportSegments, planFor, groupByKeep } = require('../core/pipeline');
+const { frameStart } = require('../core/cuttings');
 const { decodeErrors } = require('../core/verify');
 const { byExt, unmuxableSubtitles } = require('../core/containers');
 
@@ -255,20 +256,24 @@ function cueStarts(file) {
 
 /**
  * 期望成片里出现哪些 cue：cue 起点落在某条保留区间内部（离两端都 > 0.3s，
- * 免得撞上 B 帧余量的边界），就该出现在"该区间成片起点 + (cue - 区间起点)"。
+ * 免得撞上 B 帧余量的边界），就该出现在"该区间成片起点 + (cue − 这一段实际第一帧的时刻)"。
+ * 基准不是用户输入的入点：入点不在帧网格上时画面从网格点起步，用入点算会让整条字幕
+ * 一致地偏晚半帧（内核 retime 同一条规则，见 core/pipeline 的 keepAligns）。
  */
-function expectedCues(plan, groups, keeps, cues, split) {
+function expectedCues(plan, groups, keeps, cues, split, media) {
   const progStart = [];
   let acc = 0;
   for (const g of groups) { progStart.push(acc); acc += g.reduce((a, n) => a + plan[n].duration, 0); }
+  const off = Number(media.startOffset) || 0;
   const out = [];
-  for (const t of cues) {
-    // 与内核 retime 同一条规则：cue 起点落在保留区间内就保留（跨末尾的截断），否则整条丢掉
+  for (const abs of cues) {
+    const t = abs - off;                       // 素材给的是绝对 pts，内核一切都在"相对容器原点"
     const ki = keeps.findIndex((k) => t >= k.start - 1e-6 && t < k.end - 1e-6);
     if (ki < 0) continue;
-    if (split && ki !== groups.findIndex((g) => g.some((n) => plan[n].keepIndex === ki))) continue;
-    out.push({ file: split ? groups.findIndex((g) => g.some((n) => plan[n].keepIndex === ki)) : 0,
-      at: (split ? 0 : progStart[ki]) + (t - keeps[ki].start), src: t });
+    const gi = groups.findIndex((g) => g.some((n) => plan[n].keepIndex === ki));
+    if (split && ki !== gi) continue;
+    out.push({ file: split ? gi : 0, src: t,
+      at: (split ? 0 : progStart[ki]) + (t - frameStart(keeps[ki].start, media.video?.fps, media.gridOrigin)) });
   }
   return out;
 }
@@ -360,7 +365,7 @@ async function runMatrix() {
         const cueBad = [];
         let cueNote = '';
         if (fx.subCues && !dropSubtitles && r.ok) {
-          const exp = expectedCues(plan, groups, planned.keeps, fx.subCues, mode.opts.split);
+          const exp = expectedCues(plan, groups, planned.keeps, fx.subCues, mode.opts.split, loaded.media);
           const got = r.outputs.map(cueStarts);
           const tol = 0.05;
           for (const e of exp) {
