@@ -66,7 +66,13 @@ function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000 } =
       settled = true;
       clearTimeout(timer);
       if (code === 0) resolve({ code, stdout, stderr });
-      else reject(new Error(`${bin} 退出码 ${code}\n${tail(stderr)}`));
+      else {
+        const err = new Error(`${bin} 退出码 ${code}\n${tail(stderr)}`);
+        // 调用方（导出自检的解码判据）要按 stderr 分辨"真报错"与封装层碎语，
+        // 光看 message 会把"ffmpeg 退出码 69"那行也当成一条错误。
+        err.stderr = stderr;
+        reject(err);
+      }
     });
   });
 }

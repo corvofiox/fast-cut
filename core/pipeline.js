@@ -230,6 +230,14 @@ async function exportSegments(loaded, segments, opts) {
     const userSecs = [];
     const wantCues = [];
     const subTracks = [];
+    /** 每个输出内部的拼接接缝（成片时刻）：解码自检拿它决定哪些时刻非解到不可。 */
+    const seamsOf = (idxList) => {
+      const out = [];
+      let acc = 0;
+      for (const n of idxList.slice(0, -1)) { acc += plan[n].duration; out.push(acc); }
+      return out;
+    };
+    const seamsList = [];
     /** 计划要写多少帧：拷贝段按 plan 给的包数（已扣双向预测余量），其余按时长折算。 */
     const framesOf = (p) => (Number.isFinite(p.frames) && p.frames > 0
       ? Math.round(p.frames)
@@ -288,6 +296,7 @@ async function exportSegments(loaded, segments, opts) {
         expectSlack.push(rateSlackOf(groups[i]));
         wantCues.push(subs.cues);
         if (subs.cues) subTracks.push(subs.cues.length);
+        seamsList.push(seamsOf(groups[i]));
         const ki = plan[groups[i][0]].keepIndex;
         userSecs.push(ki != null && keeps[ki] ? snap(keeps[ki].end - keeps[ki].start) : undefined);
       }
@@ -302,6 +311,7 @@ async function exportSegments(loaded, segments, opts) {
       expectSlack.push(rateSlackOf(plan.map((_, n) => n)));
       wantCues.push(subs.cues);
       if (subs.cues) subTracks.push(subs.cues.length);
+      seamsList.push(seamsOf(plan.map((_, n) => n)));
       userSecs.push(totalKeep);
     }
 
@@ -322,6 +332,7 @@ async function exportSegments(loaded, segments, opts) {
           rateSlack: expectSlack[i], container, wantCues: wantCues[i],
           subTracks: subTracks[i],
           dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length,
+          seams: seamsList[i],
           sourceFormat: media.format,
         });
       results.push({ file: outputs[i], ...r });

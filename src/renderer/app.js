@@ -998,7 +998,7 @@ function onProgress(evt) {
       setProgress(`切割 ${state.cut.index + 1}/${state.cut.total}`, pctForItem(), evt.range || '');
       break;
     case 'verify':
-      setProgress('自检中（比对源参数 + 全量解码）', 92, '');
+      setProgress('自检中（比对源参数 + 解码校验）', 92, '');
       break;
     case 'done':
       setProgress('导出完成', 100, '');

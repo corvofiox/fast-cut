@@ -492,7 +492,7 @@ async function startExport(win, payload) {
       for (const p of result.outputs) {
         try { fs.rmSync(p, { force: true }); } catch { /* 被占用时留给用户手动清理 */ }
       }
-      const hint = failed.some((c) => c.name === '完整解码无错误') && segments.length > 1
+      const hint = failed.some((c) => c.name === '解码无错误') && segments.length > 1
         ? '\n\n这条产物在解码时报错。可以试试「每段一个文件」（一条区间恰好只有一段时才真的不走拼接），或减少切点、让入点落在关键帧上。'
         : '';
       throw new Error(`自检未通过，已删除产物：\n${detail || '未知原因'}${hint}`);

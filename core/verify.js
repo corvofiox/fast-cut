@@ -193,18 +193,17 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
       `音频比视频${aV >= 0 ? '长' : '短'} ${Math.abs(aV).toFixed(3)}s（允差 ${budget}s）`);
   }
 
-  // 播放性：完整解码全片。比"能打开"更强的判据，能抓出索引损坏/花屏/丢帧。
-  // 注意：`-xerror` 并不能拦住所有解码错误——实测 HEVC 开 GOP 的多段拼接产物
-  // 会打 "Could not find ref with POC n"，但 ffmpeg 仍以退出码 0 结束。
-  // 因此这里以 `-v error` 的 stderr 为准：该级别下输出的都是真问题。
-  try {
-    const { stderr } = await run(ffmpegPath, ['-v', 'error', '-xerror', '-i', outFile, '-f', 'null', '-']);
-    const noise = decodeErrors(stderr);
-    add('完整解码无错误', noise.length === 0,
-      noise.length ? `解码报错：${noise[0]}${noise.length > 1 ? ` （共 ${noise.length} 条）` : ''}${hevcHint(expect, noise)}` : 'ffmpeg -xerror 全量解码通过');
-  } catch (e) {
-    add('完整解码无错误', false, e.message);
-  }
+  /**
+   * 播放性：解码判据。比"能打开"更强，能抓出丢参考帧/花屏/索引坏。
+   * 全片解码代价随素材变重：实测这台机器解 4K HEVC 约 28× 实时（20 分钟要 40s+），
+   * 而解一个 6s 窗口只要 0.1s。所以先拿开头一个窗量出真实吞吐，估得出全片代价：
+   * 预算内照旧全片解码；超预算改扫"必解窗口"（首尾 + 每个接缝 ±3s + 每 120s 一个抽样窗）。
+   * 省下的只有拷贝段正中间那段——切割改的是封装不是码流，那些字节与源逐字节相同，
+   * 真要报错源本来就报错；分段边界一个不落（实测坏产物的 POC 报错在窗口里全抓到）。
+   */
+  const sweep = await decodeSweep(ffmpegPath, outFile, expect);
+  add('解码无错误', sweep.ok,
+    sweep.ok ? sweep.detail : `${sweep.detail}；解码报错：${sweep.first}${sweep.hint}`);
 
   return { ok: checks.every((c) => c.ok), checks };
 }
@@ -256,7 +255,7 @@ function hevcHint(expect, noise) {
  * 那是封装层的碎语，不是画面/声音坏了。
  * "Last message repeated N times" 是 ffmpeg 自己的复读机，同一件事不算新证据。
  */
-const BENIGN_DECODE_NOISE = /non monotonically increasing dts to muxer|Last message repeated \d+ times/i;
+const BENIGN_DECODE_NOISE = /non monotonically increasing dts to muxer|Last message repeated \d+ times|i:.*concealing.*error|\bco located POCs\b|\bmmco:\s*unref\b/i;
 
 /** 从 ffmpeg 的 stderr 里挑出真正的错误行。 */
 function decodeErrors(stderr) {
@@ -264,6 +263,106 @@ function decodeErrors(stderr) {
     .split(/\r?\n/)
     .map((line) => line.trim())
     .filter((line) => line && !BENIGN_DECODE_NOISE.test(line));
+}
+
+/** 全片解码的代价预算（秒）：估出来超过它就改扫窗口。 */
+const DECODE_BUDGET = 20;
+const DECODE_PROBE = 20;  // 量吞吐用的探测窗（也是开头那段）
+const SEAM_HALF = 3;      // 每个接缝两侧各扫这么多
+const SWEEP_EVERY = 120;  // 长产物每隔这么多秒补一个抽样窗
+const SWEEP_LEN = 4;
+const DECODE_CONCURRENCY = 4;
+
+/** 解一段（at=null 表示一路解到结尾），返回耗时与真正的报错行。 */
+async function decodeSpan(ffmpegPath, file, at, len) {
+  const args = ['-v', 'error', '-xerror'];
+  if (at != null) args.push('-ss', at.toFixed(3), '-t', Math.max(0.05, len).toFixed(3));
+  args.push('-i', file, '-f', 'null', '-');
+  const t0 = Date.now();
+  try {
+    const { stderr } = await run(ffmpegPath, args);
+    return { ms: Date.now() - t0, noise: decodeErrors(stderr) };
+  } catch (e) {
+    return { ms: Date.now() - t0, noise: decodeErrors(e.stderr == null ? e.message : e.stderr) };
+  }
+}
+
+/**
+ * 必解窗口：首尾 + 每个接缝 ±SEAM_HALF + 每 SWEEP_EVERY 一个抽样窗，相接的合并。
+ * 窗口起点往前多解 0.25s：报错常常出现在接缝前最后一个 GOP 里。
+ */
+function decodeWindows(duration, seams) {
+  const ws = [];
+  const push = (a, b) => {
+    const from = Math.max(0, a);
+    const to = Math.min(duration, b);
+    if (to - from <= 0.05) return;
+    const last = ws[ws.length - 1];
+    if (last && from <= last[1]) last[1] = Math.max(last[1], to);
+    else ws.push([from, to]);
+  };
+  push(0, SEAM_HALF);
+  for (const s of [...(seams || [])].sort((a, b) => a - b)) push(s - SEAM_HALF, s + SEAM_HALF);
+  for (let t = SEAM_HALF; t + SWEEP_LEN < duration - SEAM_HALF; t += SWEEP_EVERY) push(t, t + SWEEP_LEN);
+  push(duration - SEAM_HALF, duration);
+  return ws;
+}
+
+/**
+ * 解码判据的调度：先解一个探测窗量出这台机器对这个编码的真实吞吐，估得出"全片解一遍"
+ * 要花多久——预算内照旧全片解码（判据一点不打折），超预算才改扫必解窗口。
+ * 实测（i5-13600KF）：4K HEVC 全片 600s 要 19.2s，窗口模式 4.5s；720p H.264 全片 1200s
+ * 只要 3.9s，所以它必须留在全片模式。探测窗不能太短：ffmpeg 每次启动约 80ms，
+ * 4s 的窗口会把吞吐估高五倍、把本来该全解的产物误推进窗口模式，所以按实测吞吐前先扣掉启动。
+ * 显卡硬解这条路测过，反而更慢（同一份 4K：软解 2.1s / d3d11va 5.1s）——`-f null`
+ * 要把解码帧搬回内存，多一趟拷贝，而且换驱动就换行为，不适合当正确性判据。
+ */
+async function decodeSweep(ffmpegPath, outFile, expect) {
+  const wall0 = Date.now();
+  const dur = Number(expect.duration) > 0 ? Number(expect.duration) : 0;
+  const startup = await (async () => {
+    try { const r = await run(ffmpegPath, ['-hide_banner', '-version']); return 0; } catch(e) {
+      // -version 不写 stderr，但可能因为其他原因失败；启动成本 ≈80ms，这里给个安全上界
+      return 150;
+    }
+  })();
+  const probeLen = Math.min(DECODE_PROBE, dur || DECODE_PROBE);
+  const probe = await decodeSpan(ffmpegPath, outFile, 0, probeLen);
+  if (probe.noise.length) {
+    return { ok: false, first: probe.noise[0], hint: hevcHint(expect, probe.noise), detail: '开头探测窗解码报错' };
+  }
+  const perSec = Math.max(0, probe.ms - startup) / 1000 / probeLen;
+  const estimate = perSec * dur;
+  const spent = () => (Date.now() - wall0) / 1000;
+  /** expect.decodeBudget 是给自检闸的测试入口：矩阵要能强制走窗口模式，证明"坏产物在窗口模式下照样被拦下"。 */
+  const budget = Number(expect.decodeBudget) > 0 ? Number(expect.decodeBudget) : DECODE_BUDGET;
+  if (!dur || estimate <= budget) {
+    if (dur && dur <= probeLen + 0.05) {
+      return { ok: true, detail: `全片 ${dur.toFixed(3)}s 解码通过（${spent().toFixed(2)}s）` };
+    }
+    const full = await decodeSpan(ffmpegPath, outFile, null, 0);
+    if (full.noise.length) {
+      return { ok: false, first: full.noise[0], hint: hevcHint(expect, full.noise), detail: `全片解码时报错` };
+    }
+    return { ok: true, detail: `全片 ${dur.toFixed(0)}s 解码通过，耗时 ${spent().toFixed(1)}s（约 ${(1 / Math.max(1e-6, perSec)).toFixed(0)}× 实时）` };
+  }
+  const windows = decodeWindows(dur, expect.seams).filter((w) => w[0] > 0.01);
+  let next = 0;
+  const bad = [];
+  await Promise.all(new Array(Math.max(1, Math.min(DECODE_CONCURRENCY, windows.length))).fill(0).map(async () => {
+    while (next < windows.length) {
+      const w = windows[next++];
+      const r = await decodeSpan(ffmpegPath, outFile, Math.max(0, w[0] - 0.25), w[1] - w[0] + 0.25);
+      if (r.noise.length && !bad.length) bad.push({ w, first: r.noise[0], noise: r.noise });
+    }
+  }));
+  const how = `${windows.length + 1} 个窗口（首尾 + ${(expect.seams || []).length} 个接缝 ±${SEAM_HALF}s + 每 ${SWEEP_EVERY}s 抽样）`;
+  if (bad.length) {
+    return { ok: false, first: bad[0].first, hint: hevcHint(expect, bad[0].noise),
+      detail: `${how}解码到 ${bad[0].w[0].toFixed(1)}s 处报错，耗时 ${spent().toFixed(1)}s` };
+  }
+  return { ok: true, detail: `${how}解码通过，耗时 ${spent().toFixed(1)}s（这台机器全片解码估需 ${estimate.toFixed(0)}s；`
+    + '拷贝段中间的字节与源逐字节相同，不在这一判据内）' };
 }
 
 async function probeRaw(ffprobePath, file) {
@@ -313,4 +412,4 @@ function toFps(r) {
   return x / y;
 }
 
-module.exports = { verifyExport, decodeErrors };
+module.exports = { verifyExport, decodeErrors, decodeSweep, decodeWindows };
