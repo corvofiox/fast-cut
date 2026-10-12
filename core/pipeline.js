@@ -12,7 +12,7 @@ const os = require('os');
 
 const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./segments');
 const { buildPlan } = require('./cuttings');
-const { probeMedia, probeKeyframes, run } = require('./probe');
+const { probeMedia, probeKeyframes, run, sourceSubtitleCues } = require('./probe');
 const { familyOfFormat, familyOfExt } = require('./containers');
 const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
 const { verifyExport } = require('./verify');
@@ -143,7 +143,7 @@ async function exportSegments(loaded, segments, opts) {
     onProgress = () => {}, token = createToken(),
   } = opts;
 
-  const { keeps, plan, warnings, keepSecs: totalKeep } = planFor(loaded, segments, { ordered });
+  const { keeps, plan, warnings, keepSecs: totalKeep } = planFor(loaded, segments, { ordered, dropSubtitles });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
 
@@ -252,13 +252,41 @@ async function exportSegments(loaded, segments, opts) {
     }
 
     // 自检：每个输出文件与"它自己那组切割计划的时长"比对，不和总时长比。
+    // 字幕基准先算好：源在各条保留区间内到底有多少条 cue（分段流拷贝会把尾段的 cue 整条漏掉，
+    // 也会把被删区间的 cue 串回来，只有数条数才看得见）。
     onProgress({ phase: 'verify' });
+    let wantCues = [];
+    if (!dropSubtitles && (media.subtitleCodecs || []).length) {
+      // 每条保留区间在成片里的起点
+      const progOfKeep = {};
+      let cursor = 0;
+      for (const g of groups) {
+        const k = plan[g[0]].keepIndex;
+        if (k != null && progOfKeep[k] === undefined) progOfKeep[k] = cursor;
+        cursor += g.reduce((a, n) => a + plan[n].duration, 0);
+      }
+      try {
+        const cueLists = await sourceSubtitleCues(bins.ffprobe, file,
+          keeps.map((k) => [k.start, k.end]), media.startOffset, media.duration);
+        const keepsOf = (idxList) => [...new Set(idxList.map((n) => plan[n].keepIndex).filter((k) => k != null))];
+        const groupsOfKeeps = split ? groups.map(keepsOf) : [keeps.map((_, k) => k)];
+        wantCues = groupsOfKeeps.map((ks) => cueLists.map((list) => {
+          const out = [];
+          for (const t of list) {
+            const k = ks.find((ki) => t >= keeps[ki].start - 0.001 && t < keeps[ki].end);
+            if (k === undefined) continue;
+            out.push(split ? t - keeps[k].start : (progOfKeep[k] || 0) + (t - keeps[k].start));
+          }
+          return out.sort((a, b) => a - b);
+        }));
+      } catch { wantCues = []; }
+    }
     const results = [];
     for (let i = 0; i < outputs.length; i++) {
       const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i],
         {
           duration: expectSecs[i], userSecs: userSecs[i], frames: expectFrames[i],
-          rateSlack: expectSlack[i], container,
+          rateSlack: expectSlack[i], container, wantCues: wantCues[i],
           dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length,
           sourceFormat: media.format,
         });

@@ -267,4 +267,42 @@ async function probeKeyframes(ffprobePath, file, origin = 0) {
   return out;
 }
 
-module.exports = { run, parseProgress, probeMedia, probeKeyframes, normalizeProbe };
+/**
+ * 取源在给定保留区间内的字幕 cue 时刻（相对时间原点），按字幕流分组。
+ *
+ * 只读区间内的报文（`-read_intervals` 用绝对时间戳，所以要加回 startOffset），
+ * 不必把整片解一遍。用途是导出自检：分段流拷贝时 ffmpeg 对 Matroska 字幕轨的定位
+ * 不可靠（实测会把窗口里的 cue 整条漏掉，也会把被删区间的 cue 串回来），
+ * 而"漏一条 + 串一条"正好把条数抵消掉，所以要比**落点**而不是只数条数。
+ *
+ * @param {Array<[number,number]>} ranges 保留区间（相对时间原点）
+ * @returns {Promise<number[][]>} 每条字幕轨的 cue 起点列表
+ */
+async function sourceSubtitleCues(ffprobePath, file, ranges, startOffset = 0, until = 0) {
+  if (!ranges.length) return [];
+  const off = Number(startOffset) || 0;
+  const iv = ranges.map(([s, e]) => {
+    const hi = until > 0 ? Math.min(e, until) : e;
+    return `${(s + off).toFixed(3)}%${(hi + off).toFixed(3)}`;
+  }).join(',');
+  const { stdout } = await run(ffprobePath, [
+    '-v', 'error', '-print_format', 'json',
+    '-show_entries', 'stream=index,codec_type',
+    '-show_entries', 'packet=stream_index,pts_time',
+    '-read_intervals', iv, file,
+  ]);
+  const j = JSON.parse(stdout);
+  const tracks = (j.streams || []).filter((s) => s.codec_type === 'subtitle').map((s) => Number(s.index));
+  const hits = tracks.map(() => []);
+  for (const p of j.packets || []) {
+    const k = tracks.indexOf(Number(p.stream_index));
+    if (k < 0) continue;
+    const t = Number(p.pts_time);
+    if (!Number.isFinite(t)) continue;
+    const rel = t - off;
+    if (ranges.some(([s, e]) => rel >= s - 0.001 && rel < e)) hits[k].push(rel);
+  }
+  return hits.map((list) => list.sort((a, b) => a - b));
+}
+
+module.exports = { run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues };

@@ -131,6 +131,35 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
         : `计划 ${expect.frames} 帧 → 实际 ${n} 帧（差 ${n - expect.frames}）${n > expect.frames ? '：多出来的是你已经删掉的素材' : ''}`);
   }
 
+  /**
+   * 字幕落点：分段流拷贝时 ffmpeg 对字幕轨的定位不可靠——实测 Matroska 的 subrip
+   * 会整条漏掉落在拷贝尾段里的 cue，也会把被删区间里的 cue 串回成片。
+   * 只数条数会被"漏一条 + 串一条"刚好抵消骗过去（实测就发生了），所以按成片时刻逐条配对：
+   * 该在的每条 cue 都要在允差内有一个，而且不许多出。
+   */
+  if (Array.isArray(expect.wantCues) && expect.wantCues.some((l) => l && l.length)) {
+    const got = await subtitleCueTimes(ffprobePath, outFile);
+    const tol = 0.2;
+    const bad = [];
+    let total = 0;
+    for (let k = 0; k < expect.wantCues.length; k++) {
+      const want = expect.wantCues[k] || [];
+      total += want.length;
+      const pool = [...(got[k] || [])];
+      for (const t of want) {
+        const j = pool.findIndex((x) => Math.abs(x - t) <= tol);
+        if (j < 0) bad.push(`轨 ${k + 1} 缺 ${t.toFixed(3)}s 起的 cue`);
+        else pool.splice(j, 1);
+      }
+      if (pool.length) bad.push(`轨 ${k + 1} 多出 ${pool.map((x) => x.toFixed(2)).join('/')}s 的 cue`);
+    }
+    add('字幕与保留区间一致', bad.length === 0,
+      bad.length
+        ? `${bad.join('；')}（该有 ${total} 条，允差 ${tol}s）。ffmpeg 逐段定位字幕轨会漏包/串包，这个产物不能交出去——`
+          + '出路：把切点落在关键帧上（少切几刀、不拼接），或选会省略字幕的容器（如 MP4）再把字幕作为外挂文件另行处理'
+        : `${total} 条 cue 落点全部对上（允差 ${tol}s）`);
+  }
+
   // 时长：`expect.duration` 是**切割计划实算的时长之和**（整帧取整后的真值）。
   // 上界不再按"源长 5%"给：98 分钟的素材等于允许多带 5 分钟，把"整段被并回去、
   // 剪辑等于没做"那种事故直接放行（实测）。多带的每一秒都是用户已经删掉的素材，
@@ -233,6 +262,26 @@ function decodeErrors(stderr) {
 async function probeRaw(ffprobePath, file) {
   const { stdout } = await run(ffprobePath, ['-v', 'error', '-print_format', 'json', '-show_format', '-show_streams', file]);
   return JSON.parse(stdout);
+}
+
+/** 每条字幕轨的 cue 起点（秒）：一条 cue 一个报文，读报文时间即可，不用解字幕。 */
+async function subtitleCueTimes(ffprobePath, file) {
+  try {
+    const { stdout } = await run(ffprobePath, ['-v', 'error', '-print_format', 'json',
+      '-show_entries', 'stream=index,codec_type', '-show_entries', 'packet=stream_index,pts_time', file]);
+    const j = JSON.parse(stdout);
+    const tracks = (j.streams || []).filter((s) => s.codec_type === 'subtitle').map((s) => Number(s.index));
+    const hits = tracks.map(() => []);
+    for (const p of j.packets || []) {
+      const k = tracks.indexOf(Number(p.stream_index));
+      if (k < 0) continue;
+      const t = Number(p.pts_time);
+      if (Number.isFinite(t)) hits[k].push(t);
+    }
+    return hits.map((l) => l.sort((a, b) => a - b));
+  } catch {
+    return [];
+  }
 }
 
 /** 视频轨报文数（按解码序数包，比 `-count_frames` 全量解码便宜得多，判帧数够用）。 */

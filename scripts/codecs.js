@@ -31,6 +31,18 @@ const SEGS = [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8.0, 
 const V = ['-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=10'];
 const A = (freq = 440) => ['-f', 'lavfi', '-i', `sine=frequency=${freq}:duration=10`];
 
+/**
+ * 字幕核对用的 cue 起点：每条都落在某条保留区间**内部**（远离边界），
+ * 这样"丢了哪条、漂了多少"是可以精确算出来的。
+ * 保留区间 [[0.5,2.3],[4.1,6.7],[8.0,9.5]] 的成片起点依次是 0 / 1.8 / 4.4，
+ * 所以期望落点 = 0.3（0.8）/ 1.6（2.1）/ 2.7（5.0）/ 4.6（8.2）。
+ */
+const SUB_CUES = [0.8, 2.1, 5.0, 8.2];
+const SRT_TEXT = SUB_CUES.map((t, i) => {
+  const stamp = (s) => `00:00:${s.toFixed(3).padStart(6, '0')}`.replace(/\./, ',');
+  return `${i + 1}\n${stamp(t)} --> ${stamp(t + 0.4)}\ncue-${i + 1}\n`;
+}).join('\n');
+
 const FIXTURES = [
   {
     name: 'h264-mp4',
@@ -47,9 +59,11 @@ const FIXTURES = [
   {
     name: 'h264-mkv-多轨',
     file: 'h264.mkv',
-    note: '字幕轨必须留在 MKV 段里 → 不能归一封装、也不能用 MP4 段，'
-      + '时间戳只能按 make_zero 归零，每个接缝多约 1 帧（帧数仍要精确，跨度允差放宽到 0.2s）',
-    spanTol: 0.2,
+    note: '带字幕的源做分段流拷贝时，ffmpeg 逐段定位字幕轨会漏掉窗口内的 cue、也会把被删区间的串回来'
+      + '（实测四条 cue 只出三条，条数还会被"漏一条+串一条"抵消）。自检按落点逐条比对并**拒绝交付**，'
+      + '这里按 expectLoudFail 固化；字幕不带进产物（→ MP4 会自动省略）时一切正常',
+    expectLoudFail: true,
+    subCues: SUB_CUES,
     args: [...V, ...A(), ...A(880), '-i', 'tmp/sub.srt', '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:s',
       '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-c:s', 'srt'],
     remux: ['mp4'],
@@ -115,9 +129,8 @@ function sh(cmd, args) {
 
 function buildFixtures() {
   fs.mkdirSync(DIR, { recursive: true });
-  if (!fs.existsSync(path.join(ROOT, 'tmp', 'sub.srt'))) {
-    fs.writeFileSync(path.join(ROOT, 'tmp', 'sub.srt'), '1\n00:00:00,500 --> 00:00:02,000\nhello\n', 'utf8');
-  }
+  // 字幕内容会改（核对 cue 条数与落点要用），每次都覆写
+  fs.writeFileSync(path.join(ROOT, 'tmp', 'sub.srt'), SRT_TEXT, 'utf8');
   for (const fx of FIXTURES) {
     const target = path.join(DIR, fx.file);
     if (fs.existsSync(target) && !process.argv.includes('--rebuild')) continue;
@@ -204,6 +217,32 @@ function probePackets(file) {
   } catch { return null; }
 }
 
+/** 成片字幕 cue 的起点（秒）。Matroska 的字幕块一条 cue 一个包，读包时间即可。 */
+function cueStarts(file) {
+  const r = spawnSync('ffprobe', ['-v', 'error', '-select_streams', 's:0',
+    '-show_entries', 'packet=pts_time', '-of', 'csv=p=0', file], { encoding: 'utf8', maxBuffer: 32e6 });
+  if (r.status !== 0) return null;
+  return String(r.stdout || '').split(/\r?\n/).filter((l) => l.trim() !== '')
+    .map((l) => Number(l.trim())).filter(Number.isFinite).sort((a, b) => a - b);
+}
+
+/**
+ * 期望成片里出现哪些 cue：cue 起点落在某条保留区间内部（离两端都 > 0.3s，
+ * 免得撞上 B 帧余量的边界），就该出现在"该区间成片起点 + (cue - 区间起点)"。
+ */
+function expectedCues(plan, groups, keeps, cues, split) {
+  const progStart = [];
+  let acc = 0;
+  for (const g of groups) { progStart.push(acc); acc += g.reduce((a, n) => a + plan[n].duration, 0); }
+  const out = [];
+  for (const t of cues) {
+    const ki = keeps.findIndex((k) => t > k.start + 0.3 && t < k.end - 0.3);
+    if (ki < 0) continue;
+    out.push({ file: split ? ki : 0, at: progStart[ki] + (t - keeps[ki].start), src: t });
+  }
+  return out;
+}
+
 function targetFor(fx, loaded, target) {
   if (!target) return { ext: path.extname(fx.file), container: null, dropSubtitles: false };
   const container = byExt(target);
@@ -252,7 +291,8 @@ async function runMatrix() {
          *  2) 时间线跨度：容器记账口径（mkv 的块时长、ts 的 90kHz 取整、VFR）会让跨度
          *     与计划差几帧，允差 4 帧，并把差值打印出来供人工核对。
          */
-        const plan = planFor(loaded, SEGS, {}).plan;
+        const planned = planFor(loaded, SEGS, { dropSubtitles });
+        const plan = planned.plan;
         const fpsOf = loaded.media.video?.fps || 30;
         const framesOf = (p) => (Number.isFinite(p.frames) && p.frames > 0
           ? Math.round(p.frames) : Math.round(p.duration * fpsOf));
@@ -283,14 +323,37 @@ async function runMatrix() {
         const drift = spans.length === wantSecs.length
           ? spans.map((s, i) => (s == null ? '?' : (s - wantSecs[i] >= 0 ? '+' : '') + (s - wantSecs[i]).toFixed(3))).join('/')
           : '';
-        const ok = r.ok && noise.length === 0 && badAv.length === 0 && badFrames.length === 0 && badSpans.length === 0;
+        /**
+         * 3) 字幕：这条素材带 subrip，成片里的 cue 条数与落点都要对得上。
+         *    （内核曾因"入点重编码段 + 拷贝尾段"的分段丢掉落在尾段里的整条 cue。）
+         */
+        const cueBad = [];
+        let cueNote = '';
+        if (fx.subCues && !dropSubtitles && r.ok) {
+          const exp = expectedCues(plan, groups, planned.keeps, fx.subCues, mode.opts.split);
+          const got = r.outputs.map(cueStarts);
+          const tol = 0.1;
+          for (const e of exp) {
+            const list = got[e.file];
+            if (!list) { cueBad.push(`cue@${e.src} 所在文件读不到字幕`); continue; }
+            const near = list.reduce((best, t) => (Math.abs(t - e.at) < Math.abs(best - e.at) ? t : best), Infinity);
+            if (!(near < Infinity) || Math.abs(near - e.at) > tol) {
+              cueBad.push(`源 ${e.src}s 的 cue 期望 ${e.at.toFixed(3)}s，实际 ${list.map((x) => x.toFixed(2)).join('/') || '（一条都没有）'}`);
+            }
+          }
+          const totalGot = got.reduce((a, g) => a + (g ? g.length : 0), 0);
+          if (totalGot > exp.length) cueBad.push(`多出 ${totalGot - exp.length} 条字幕（已删区间里的 cue 回来了）`);
+          cueNote = ` · 字幕 ${exp.length} 条`;
+        }
+        const ok = r.ok && noise.length === 0 && badAv.length === 0 && badFrames.length === 0 && badSpans.length === 0 && cueBad.length === 0;
         console.log(`${pad(label, 34)}${ok ? '✓' : '✗'}  ${
           r.ok
             ? (noise.length ? `自检漏判：${cut(noise[0], 40)}`
               : badAv.length ? `自检漏判：音视频时间线差 ${badAv.map((x) => x.toFixed(3)).join('/')}s（允差 ${mode.avBudget}s）`
               : badFrames.length ? `帧数不符：${cut(badFrames.join('；'), 48)}`
               : badSpans.length ? `时间线偏差大：${cut(badSpans.join('；'), 48)}`
-              : `${r.outputs.length} 个文件 · ${counts.join('/')} 帧 · 跨度差 ${drift}s`)
+              : cueBad.length ? `字幕错位：${cut(cueBad.join('；'), 48)}`
+              : `${r.outputs.length} 个文件 · ${counts.join('/')} 帧 · 跨度差 ${drift}s${cueNote}`)
             : cut(failed.map((c) => `${c.name}：${c.detail}`).join('、'), 62)
         }`);
         // 静默交差 = 自检说通过但独立复核发现问题，一律算事故
@@ -298,6 +361,7 @@ async function runMatrix() {
         if (r.ok && badAv.length) problems.push(`${label}：音视频时间线差 ${badAv.map((x) => x.toFixed(3)).join('/')}s 但自检判为通过`);
         if (r.ok && badFrames.length) problems.push(`${label}：帧数不符 —— ${badFrames.join('；')}`);
         if (r.ok && badSpans.length) problems.push(`${label}：时间线跨度偏差过大 —— ${badSpans.join('；')}`);
+        if (r.ok && cueBad.length) problems.push(`${label}：字幕没保住 —— ${cueBad.join('；')}`);
         if (!r.ok) {
           if (failed.length === 0) problems.push(`${label}：ok=false 却说不出原因`);
           if (!fx.expectLoudFail) {
