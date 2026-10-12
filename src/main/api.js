@@ -493,7 +493,7 @@ async function startExport(win, payload) {
         try { fs.rmSync(p, { force: true }); } catch { /* 被占用时留给用户手动清理 */ }
       }
       const hint = failed.some((c) => c.name === '完整解码无错误') && segments.length > 1
-        ? '\n\n多段拼接在部分编码（如 HEVC 的开 GOP）下会丢参考帧。请改用「每段一个文件」，或减少切点、把切点落在关键帧上。'
+        ? '\n\n这条产物在解码时报错。可以试试「每段一个文件」（不走拼接），或减少切点、把切点落在关键帧上。'
         : '';
       throw new Error(`自检未通过，已删除产物：\n${detail || '未知原因'}${hint}`);
     }

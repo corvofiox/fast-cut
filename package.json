@@ -2,7 +2,7 @@
   "name": "fast-cut",
   "version": "0.1.0",
   "private": true,
-  "description": "Fast Cut - 快速启动、快速粗剪、快速导出的极简视频裁剪工具（流拷贝为核心）",
+  "description": "Fast Cut - 剪辑位置精确到帧的极简视频裁剪工具（能流拷贝的段一律流拷贝）",
   "license": "MIT",
   "main": "src/main/index.js",
   "scripts": {
@@ -30,7 +30,9 @@
       {
         "from": "vendor/ffmpeg",
         "to": "ffmpeg",
-        "filter": ["**/*.exe"]
+        "filter": [
+          "**/*.exe"
+        ]
       }
     ],
     "asar": true,
@@ -38,7 +40,9 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
         }
       ],
       "artifactName": "Fast-Cut-Setup-${version}-${arch}.exe"
