@@ -345,8 +345,8 @@ function onScanResult(payload) {
   if (!state.src || payload.file !== state.src.file) return;
   state.scanning = false;
   if (!payload.ok) {
-    showError(`关键帧扫描失败：${payload.message}`);
-    toast('关键帧扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
+    showError(`GOP 边界扫描失败：${payload.message}`);
+    toast('GOP 边界扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
     updateExportEnabled();
     return;
   }
@@ -356,7 +356,9 @@ function onScanResult(payload) {
   tl.setSource(state.src.media);
   updateInfo();
   syncTimeline();
-  toast(`关键帧扫描完成：${payload.keyframes.length} 个，用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
+  const headN = countCost('head');
+  const copyN = state.plan && state.plan.plan ? state.plan.plan.filter((p) => p.kind === 'copy').length : 0;
+  toast(`GOP 边界扫描完成：${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
 }
 
 function defaultOutDir(file) {
@@ -385,7 +387,7 @@ function updateInfo() {
   if (m.rotation) rows.push(['旋转', `${m.rotation}°`, '']);
   const kfCount = (m.keyframes || []).length;
   const gap = gopStats(m.keyframes);
-  rows.push(['关键帧', state.scanning ? '扫描中…' : `${kfCount} 个${gap ? ` · 间隔约 ${gap}` : ''}`, state.scanning ? 'warn' : '']);
+  rows.push(['GOP 边界', state.scanning ? '扫描中…' : `${kfCount} 个${gap ? ` · 间隔约 ${gap}` : ''}`, state.scanning ? 'warn' : '']);
 
   const dl = $('info');
   dl.innerHTML = '';
@@ -811,14 +813,14 @@ function renderClips() {
     const cost = costMap()[i];
     const src = document.createElement('span');
     src.className = 'snap' + (cost && cost !== 'copy' ? ' lossy' : '');
-    const label = { copy: '纯拷贝', head: '入点重编码', whole: '整段重编码', codec: '整段换编码' }[cost] || '待计划';
+    const label = { copy: '纯拷贝', head: '入点小段重编码', whole: '整段重编码', codec: '整段换编码' }[cost] || '待计划';
     src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`;
     src.title = {
-      copy: '入点正好落在关键帧上：整段流拷贝，不重编码',
-      head: '入点落在 GOP 中间：只有入点那一小段有损重编码，其余仍流拷贝',
-      whole: '整段落在一个 GOP 内（或后面没有可接续的关键帧）：整段有损重编码',
-      codec: '源编码没有同编码的重编码器：整段重编码，导出编码与源不同',
-    }[cost] || '切割计划还在计算';
+      copy: '整段流拷贝（不转码）',
+      head: '入点那一小段有损重编码，其余仍流拷贝',
+      whole: '这一整段在同一个 GOP 内：有损重编码',
+      codec: '整段重编码并更换编码格式',
+    }[cost] || '';
     li.appendChild(src);
 
     li.addEventListener('click', () => { state.sel = i; tl.setSelected(i); seekProgram(c.ps); renderClips(); });
@@ -859,8 +861,8 @@ function updateEstimate() {
   const headN = countCost('head');
   const wholeN = countCost('whole');
   const codecN = countCost('codec');
-  if (headN) lines.push(`✂ ${headN} 段入点不在关键帧上：只重编码入点那一小段，其余仍是流拷贝`);
-  if (wholeN) lines.push(`✂ ${wholeN} 段整段重编码（落在一个 GOP 内，或后面没有可接续的关键帧）`);
+  if (headN) lines.push(`✂ ${headN} 段入点那一小段重编码：其余仍流拷贝`);
+  if (wholeN) lines.push(`✂ ${wholeN} 段整段在同一个 GOP 内：有损重编码`);
   const srcCodec = state.src.media.video && state.src.media.video.codec;
   if (codecN) lines.push(`⚠ ${codecN} 段整段换编码重编码：源编码 ${esc(srcCodec || '?')} 没有同编码的重编码器`);
   const parts2 = (state.plan && state.plan.plan) || [];
@@ -869,7 +871,7 @@ function updateEstimate() {
   const mode = state.plan && state.plan.subtitleMode;
   const subTracks = (state.src.media.subtitleCodecs || []).length;
   if (mode === 'unsupported' && parts2.length > 1) {
-    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是可重排的文本字幕（只支持 SRT/ASS）：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。出路：让每个入点都落在关键帧上（实测整段流拷贝的那一刀字幕一条不缺），或改选会省略这条字幕轨的容器、把字幕当外挂文件另行处理`);
+    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是可重排的文本字幕（只支持 SRT/ASS）：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。出路：让每个入点都落在 GOP 边界上（实测整段流拷贝的那一刀字幕一条不缺），或改选会省略这条字幕轨的容器、把字幕当外挂文件另行处理`);
   } else if (mode === 'retime') {
     lines.push(`· ${subTracks} 条字幕轨按保留区间重新计时（文本重排，不改编码）`);
   }
@@ -901,13 +903,13 @@ function updateExportEnabled() {
   const secs = keptSeconds();
   const why = !state.src ? '先导入视频'
     : !(state.env && state.env.ok) ? '未找到可用的 ffmpeg'
-      : state.scanning ? '正在扫描关键帧，扫完才能确定哪些段能整段流拷贝'
+      : state.scanning ? '正在 GOP 边界扫描，扫完才能确定哪些段能整段流拷贝'
         : !state.clips.length ? '素材全被删了，至少留一段'
           : secs < MIN_KEEP ? '剩余素材总长小于一帧，无法导出'
             : !$('outDir').value ? '先选择导出目录'
               : state.busy ? '导出进行中' : '';
   $('btnExport').disabled = !!why;
-  $('btnExport').title = why || '剪辑位置精确到帧：入点落在关键帧上的段整段流拷贝，落在 GOP 中间的重编码入点那一小段';
+  $('btnExport').title = why || '剪辑位置精确到帧：入点不回溯，拷贝段整段流拷贝';
 }
 
 // ---------------------------------------------------------------- 导出

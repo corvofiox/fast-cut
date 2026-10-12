@@ -104,7 +104,7 @@ async function doLoad(file) {
   const cached = state.loaded.get(abs);
   if (cached) return publicSource(cached);
 
-  // 探流很快（只读容器头），先让界面能播；扫全片关键帧放后台，长视频不挡预览。
+  // 探流很快（只读容器头），先让界面能播；扫全片 GOP 边界放后台，长视频不挡预览。
   const loaded = await probeSource(abs, bins);
   state.loaded.set(abs, loaded);
 
@@ -120,7 +120,7 @@ async function doLoad(file) {
   return publicSource(loaded);
 }
 
-/** 关键帧扫描结果缓存：同一份文件（路径+修改时间+大小）第二次导入是瞬时的。 */
+/** GOP 边界扫描结果缓存：同一份文件（路径+修改时间+大小）第二次导入是瞬时的。 */
 function cacheDir() {
   return path.join(app.getPath('userData'), 'keyframe-cache');
 }
@@ -175,7 +175,7 @@ function scanInBackground(loaded) {
  * 时间轴上的胶片条：用 ffmpeg 按固定间隔抽帧成小 jpg，缓存到 userData。
  * 交给渲染层按"源时间 → 成片时间"映射画进片段里，所以拖动改顺序后缩略图也跟着对得上。
  *
- * 抽帧只依赖时长，因此不等关键帧扫描；同一份文件只跑一次。失败必须报出去——
+ * 抽帧只依赖时长，因此不等 GOP 边界扫描；同一份文件只跑一次。失败必须报出去——
  * 静默吞掉的后果是用户只看到一条空时间轴，没有任何地方解释为什么。
  */
 function buildThumbs(loaded) {

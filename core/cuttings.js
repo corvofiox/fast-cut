@@ -127,14 +127,14 @@ function buildPlan(keeps, opts) {
       continue;
     }
 
-    // 入点正好是关键帧：不需要重编码，整段流拷贝就是帧级精确的。
+    // 入点落在 GOP 中间：需要重编码入点那一小段才能从任意时刻起；其余仍流拷贝。
     if (hasKeyframeAt(start, keyframes)) {
       const part = copyPart(start, end);
       if (part.duration > EPS) {
         plan.push({
           kind: 'copy', role: 'whole', start, duration: part.duration, frames: part.frames,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
-          note: '入点正好在关键帧上：整段流拷贝',
+          note: '整段流拷贝（不转码）',
         });
       } else {
         plan.push({
@@ -147,11 +147,11 @@ function buildPlan(keeps, opts) {
     }
 
     if (keyframes.length === 0) {
-      warnings.push(`没有关键帧索引：区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 整段重编码以保证剪辑精确`);
+      warnings.push(`没有可用关键帧索引：区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 整段重编码以保证剪辑精确`);
       plan.push({
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
         snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
-        note: '没有关键帧索引：整段重编码（有损）',
+        note: '没有可用关键帧：整段重编码（有损）',
       });
       continue;
     }
@@ -193,15 +193,15 @@ function buildPlan(keeps, opts) {
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
         snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
         note: tailRaw > EPS
-          ? `可接续的关键帧之后只剩 ${Math.round(tailRaw * (fpsNum || 1))} 帧，减去双向预测的重排余量就没了：整段重编码（有损）`
-          : '入点不在关键帧上，可接续的关键帧已贴到出点：整段重编码（有损）',
+          ? `后面只剩 ${Math.round(tailRaw * (fpsNum || 1))} 帧，减去双向预测余量就不够了：整段重编码（有损）`
+          : 'GOP 边界已贴到出点：整段重编码（有损）',
       });
       continue;
     }
 
     plan.push({
       kind: 'reencode', role: 'head', start, duration: head,
-      snapFrom: keep.start, keepEnd: keep.end, note: '入点小段重编码（帧级精确）',
+      snapFrom: keep.start, keepEnd: keep.end, note: '入点小段重编码',
     });
     plan.push({
       kind: 'copy', role: 'tail', start: kfHead, duration: tailPart.duration, frames: tailPart.frames,

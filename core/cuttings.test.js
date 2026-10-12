@@ -111,7 +111,7 @@ test('源编码没有同编码重编码器时整段重编码，绝不与流拷�
 test('没有关键帧索引时整段重编码并警告，而不是从 0 拷贝', () => {
   const { plan, warnings } = buildPlan([{ start: 3.4, end: 7 }], { keyframes: [], duration: 10 });
   assertPlan(plan, [['reencode', 3.4, 3.6]]);
-  assert.ok(warnings.some((w) => /没有关键帧索引/.test(w)), warnings.join('、'));
+  assert.ok(warnings.some((w) => /没有可用关键帧/.test(w)), warnings.join('、'));
 });
 
 test('相邻区间首尾严格相接：不重复导出，也不留空洞', () => {
