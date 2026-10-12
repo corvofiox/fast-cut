@@ -158,7 +158,8 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
     add('字幕与保留区间一致', bad.length === 0,
       bad.length
         ? `${bad.join('；')}（该有 ${total} 条，允差 ${tol}s）。ffmpeg 逐段定位字幕轨会漏包/串包，这个产物不能交出去——`
-          + '出路：把切点落在关键帧上（少切几刀、不拼接），或选会省略字幕的容器（如 MP4）再把字幕作为外挂文件另行处理'
+          + '出路：让**每个入点都落在关键帧上**（少切几刀，且别出现"入点重编码 + 拷贝尾段"的分段；'
+          + '实测这样切出的拷贝段 cue 一条不缺），或改选会省略这条字幕轨的容器，把字幕当外挂文件另行处理'
         : `${total} 条 cue 落点全部对上（允差 ${tol}s）`);
   }
 
@@ -173,7 +174,8 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
   const lower = expect.duration - 1.0;
   const durOk = outDur >= lower && outDur <= expect.duration + slack;
   const seam = outDur > expect.duration + slack && expect.parts > 1
-    ? `；比计划多 ${(outDur - expect.duration).toFixed(3)}s —— 多段拼接的接缝被拉长（源时间戳不规范时在段内就烧好了，实测偏移 .ts），勾「每段一个文件」可绕开 concat`
+    ? `；比计划多 ${(outDur - expect.duration).toFixed(3)}s —— 多段拼接的接缝被拉长（源时间戳不规范时在段内就烧好了，实测偏移 .ts）。`
+      + '「每段一个文件」也不能完全绕开拼接：一条区间被切成"入点重编码 + 拷贝尾段"时，那一片仍要走 concat'
     : '';
   add('时长符合预期', durOk,
     `切割计划 ${expect.duration.toFixed(3)}s（用户选区 ${(expect.userSecs ?? expect.duration).toFixed(3)}s）`
@@ -182,7 +184,8 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
   // 音画时间线对齐：容器总时长看不出"音频比视频长半秒"这类接缝病。
   // 实测两种病都出在拼接：重编码段的拷贝音频不按入点收口（长 0.5s）、
   // 各段视频刻度不一致（帧被越拉越开，5.8s 摊成 38.7s）。两处都修了，
-  // 留 0.3s 允差是给"吸附多带的不足一帧"和音频帧取整的余量。
+  // 留 0.3s 允差是给看得见的无害差：拷贝段末端按 B 帧重排深度少导几帧、
+  // 入点向上取整到帧网格（不足一帧）、音频帧本身取整。
   const aV = avSpread(outMeta);
   if (aV !== null) {
     const budget = 0.3;
@@ -233,14 +236,16 @@ function videoDuration(meta) {
 
 /**
  * 已知踩过的坑，给一条能照着做的出路，别只丢一句"解码报错"。
- * 实测：同一段 HEVC 在 mp4 里多段拼接干净，在 mkv 里同样切法必报 "Duplicate POC"，
- * 而"每段一个文件"（不进 concat）是干净的。
+ * 实测：同一段 HEVC 在 mp4 里多段拼接干净，在 mkv 里同样切法必报 "Duplicate POC"。
+ * 这条路已经由"拼接前先把源纯拷成 MP4 工作副本"堵上（见 pipeline 的封装归一），
+ * 所以还会走到这里，说明那次归一没做成（失败时会另有一条"封装归一失败"的警告）。
  */
 function hevcHint(expect, noise) {
   const pocLike = /POC|Could not find ref/i.test(noise.join(' '));
   if (!pocLike) return '';
   if (expect.parts > 1 && familyOfFormat(expect.sourceFormat) === 'matroska') {
-    return '；源是 Matroska 容器里的 HEVC，多段拼接的接缝解码不过（实测）——勾"每段一个文件"导出即可，那条路不进 concat';
+    return '；源是 Matroska 容器里的 HEVC，多段拼接的接缝解码不过——正常导出会先把它纯拷成 MP4 工作副本再切，'
+      + '这次没归一成（见上面的警告）：减少切点、让每个入点落在关键帧上再试';
   }
   return '';
 }

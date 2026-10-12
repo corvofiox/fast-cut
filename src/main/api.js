@@ -377,7 +377,7 @@ function previewPlan(payload) {
   });
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
-    // 字幕怎么办，界面要提前说：文本字幕会被重新计时，位图字幕没法重排（自检会拦）
+    // 字幕怎么办，界面要提前说：SRT/ASS 这类文本字幕重新计时；其余（位图、mov_text 等）重排不了（自检会拦）
     subtitleMode: (() => {
       const subs = loaded.media.subtitleCodecs || [];
       if (!subs.length) return 'none';
@@ -493,7 +493,7 @@ async function startExport(win, payload) {
         try { fs.rmSync(p, { force: true }); } catch { /* 被占用时留给用户手动清理 */ }
       }
       const hint = failed.some((c) => c.name === '完整解码无错误') && segments.length > 1
-        ? '\n\n这条产物在解码时报错。可以试试「每段一个文件」（不走拼接），或减少切点、把切点落在关键帧上。'
+        ? '\n\n这条产物在解码时报错。可以试试「每段一个文件」（一条区间恰好只有一段时才真的不走拼接），或减少切点、让入点落在关键帧上。'
         : '';
       throw new Error(`自检未通过，已删除产物：\n${detail || '未知原因'}${hint}`);
     }

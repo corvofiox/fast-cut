@@ -346,7 +346,7 @@ function onScanResult(payload) {
   state.scanning = false;
   if (!payload.ok) {
     showError(`关键帧扫描失败：${payload.message}`);
-    toast('关键帧扫描失败，无法确定安全切点', 'warn');
+    toast('关键帧扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
     updateExportEnabled();
     return;
   }
@@ -869,14 +869,14 @@ function updateEstimate() {
   const mode = state.plan && state.plan.subtitleMode;
   const subTracks = (state.src.media.subtitleCodecs || []).length;
   if (mode === 'unsupported' && parts2.length > 1) {
-    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是文本字幕（SRT/ASS 之外），无法重新计时：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。把切点落在关键帧上（少切几刀）或改选省略字幕的容器`);
+    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是可重排的文本字幕（只支持 SRT/ASS）：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。出路：让每个入点都落在关键帧上（实测整段流拷贝的那一刀字幕一条不缺），或改选会省略这条字幕轨的容器、把字幕当外挂文件另行处理`);
   } else if (mode === 'retime') {
     lines.push(`· ${subTracks} 条字幕轨按保留区间重新计时（文本重排，不改编码）`);
   }
   if (planSecs != null && Math.abs(planSecs - keepSecs) > 0.05) {
     lines.push(`· 计划比选区${planSecs > keepSecs ? '多' : '少'} ${Math.abs(planSecs - keepSecs).toFixed(3)}s（整帧取整）`);
   }
-  if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 疑似 VFR，建议每段一个文件');
+  if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 疑似 VFR（标称与实测帧率差 1% 以上）：每段整段重编码为定帧率，时长与剪辑位置才准');
   // 换封装的代价必须在这里说清楚，而不是等 ffmpeg 报 "Could not find tag for codec"
   const cont = state.plan && state.plan.container;
   if (cont) {
@@ -901,7 +901,7 @@ function updateExportEnabled() {
   const secs = keptSeconds();
   const why = !state.src ? '先导入视频'
     : !(state.env && state.env.ok) ? '未找到可用的 ffmpeg'
-      : state.scanning ? '正在扫描关键帧，扫完才能确定安全切点'
+      : state.scanning ? '正在扫描关键帧，扫完才能确定哪些段能整段流拷贝'
         : !state.clips.length ? '素材全被删了，至少留一段'
           : secs < MIN_KEEP ? '剩余素材总长小于一帧，无法导出'
             : !$('outDir').value ? '先选择导出目录'

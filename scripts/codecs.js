@@ -146,8 +146,8 @@ const FIXTURES = [
 ];
 
 const MODES = [
-  { key: 'exact', label: '精确·拼接', opts: {}, avBudget: 0.3 },
-  { key: 'split', label: '精确·每段一文件', opts: { split: true }, avBudget: 0.3 },
+  { key: 'exact', label: '拼接', opts: {}, avBudget: 0.3 },
+  { key: 'split', label: '每段一文件', opts: { split: true }, avBudget: 0.3 },
 ];
 
 function sh(cmd, args) {
