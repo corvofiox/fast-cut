@@ -54,6 +54,7 @@ function buildPlan(keeps, opts) {
   const warnings = [];
   const plan = [];
   let warnedVfr = false;
+  let warnedSubs = false;
 
   /**
    * [from, to) 之间有多少帧 = 会被导出的帧数。

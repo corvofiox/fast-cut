@@ -368,10 +368,12 @@ function needLoaded(file) {
 function previewPlan(payload) {
   const loaded = needLoaded(payload.file);
   const segments = sanitizeSegments(payload.segments);
+  // 先定目标封装：字幕装不装得下会影响自检的比对口径
+  const target = targetFor(payload.container, loaded, path.resolve(String(payload.file)));
   const { plan, warnings, keeps, keepSecs } = planFor(loaded, segments, {
     ordered: isReordered(segments),
+    dropSubtitles: target.dropSubtitles,
   });
-  const target = targetFor(payload.container, loaded, path.resolve(String(payload.file)));
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
     container: {
@@ -455,7 +457,7 @@ async function startExport(win, payload) {
     throw new Error('关键帧还没扫完，稍等一下再导出');
   }
   const split = !!payload.split;
-  const targets = targetsFor(loaded, segments, outPath, ext, split);
+  const targets = targetsFor(loaded, segments, outPath, ext, split, target.dropSubtitles);
   assertNotOverwrite(abs, targets);
 
   const token = createToken();
@@ -494,9 +496,9 @@ async function startExport(win, payload) {
 }
 
 /** 本次导出会写哪些文件：拼接模式 1 个，「每段一个文件」按保留区间各 1 个。 */
-function targetsFor(loaded, segments, outPath, ext, split) {
+function targetsFor(loaded, segments, outPath, ext, split, dropSubtitles) {
   if (!split) return [outPath];
-  const { plan } = planFor(loaded, segments, { ordered: isReordered(segments) });
+  const { plan } = planFor(loaded, segments, { ordered: isReordered(segments), dropSubtitles });
   return groupByKeep(plan).map((_, i) => numbered(outPath, i, ext));
 }
 
