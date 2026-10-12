@@ -243,18 +243,26 @@ function outputTimeScale(media) {
  *  - concat demuxer 快速但要求各段编码参数一致（v0.1 默认路径）
  *  - 拼接时必须用 -video_track_timescale 统一时基，否则帧率被拉歪（见 outputTimeScale 注释）
  *  - strategy 'concat_filter' 是参数不一致时的兜底（慢，需重编码）
+ *  - opts.subs：重新计时过的字幕 sidecar。**在拼接这一步一起 mux**，不用多跑一遍：
+ *    段里刻意不带字幕（ffmpeg 逐段定位字幕轨会漏包/串包），字幕只在成片时刻上轨一次
  */
-function argsForConcat(parts, outPath, media, strategy = 'concat_demuxer') {
+function argsForConcat(parts, outPath, media, strategy = 'concat_demuxer', opts = {}) {
   const tsArg = ['-video_track_timescale', outputTimeScale(media)];
+  const subs = opts.subs || [];
+  const subInputs = subs.flatMap((f) => ['-i', f]);
+  // sidecar 的编码由扩展名决定（.srt → subrip，.ass → ass），remux 进容器不需要重编码
+  const subMaps = subs.map((_, i) => ['-map', `${i + 1}:s`]).flat();
 
   if (parts.length === 1) {
-    return ['-hide_banner', '-loglevel', 'error', '-y', '-i', parts[0],
-      '-c', 'copy', '-map', '0', '-map_metadata', '0', ...tsArg, outPath];
+    return ['-hide_banner', '-loglevel', 'error', '-y', '-i', parts[0], ...subInputs,
+      '-c', 'copy', '-map', '0', ...subMaps, '-map_metadata', '0', ...tsArg, outPath];
   }
 
   if (strategy === 'concat_demuxer') {
-    return ['-hide_banner', '-loglevel', 'error', '-y', '-f', 'concat', '-safe', '0', '-i', listPathOf(outPath),
-      '-c', 'copy', '-map', '0', '-map_metadata', '0', ...tsArg, outPath];
+    return ['-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'concat', '-safe', '0', '-i', listPathOf(outPath),
+      ...subInputs,
+      '-c', 'copy', '-map', '0', ...subMaps, '-map_metadata', '0', ...tsArg, outPath];
   }
 
   // concat filter：所有输入统一重编码（仅在参数不一致时使用）

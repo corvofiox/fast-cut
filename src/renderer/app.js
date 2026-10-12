@@ -866,10 +866,12 @@ function updateEstimate() {
   const parts2 = (state.plan && state.plan.plan) || [];
   const trimmed = parts2.reduce((a, p) => Math.max(a, p.trimmed || 0), 0);
   if (trimmed) lines.push(`· 源含双向预测帧：拷贝段的末端留了 ${trimmed} 帧余量，不会把你删掉的素材带回来`);
-  const cont0 = state.plan && state.plan.container;
-  const keepsSubs = !!(state.src.media.subtitleCodecs || []).length && !(cont0 && cont0.droppedSubtitles && cont0.droppedSubtitles.length);
-  if (keepsSubs && parts2.length > 1) {
-    lines.push('⚠ 源含字幕轨且要保留：分段流拷贝会漏掉/串动字幕，导出可能被自检拒绝。把切点落在关键帧上（少切几刀）或改选 MP4（会省略字幕）可绕开');
+  const mode = state.plan && state.plan.subtitleMode;
+  const subTracks = (state.src.media.subtitleCodecs || []).length;
+  if (mode === 'unsupported' && parts2.length > 1) {
+    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是文本字幕（SRT/ASS 之外），无法重新计时：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。把切点落在关键帧上（少切几刀）或改选省略字幕的容器`);
+  } else if (mode === 'retime') {
+    lines.push(`· ${subTracks} 条字幕轨按保留区间重新计时（文本重排，不改编码）`);
   }
   if (planSecs != null && Math.abs(planSecs - keepSecs) > 0.05) {
     lines.push(`· 计划比选区${planSecs > keepSecs ? '多' : '少'} ${Math.abs(planSecs - keepSecs).toFixed(3)}s（整帧取整）`);

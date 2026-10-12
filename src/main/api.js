@@ -19,6 +19,7 @@ const { snap } = require('../../core/segments');
 const { resolveBin } = require('../../core/ffmpegPath');
 const { run: spawnRun } = require('../../core/probe');
 const { EXPORT_CONTAINERS, byId, familyOfExt, unmuxableSubtitles } = require('../../core/containers');
+const { isTextSubtitle } = require('../../core/subtitles');
 
 const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm', 'flv', 'ts', 'mts'];
 
@@ -376,6 +377,13 @@ function previewPlan(payload) {
   });
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
+    // 字幕怎么办，界面要提前说：文本字幕会被重新计时，位图字幕没法重排（自检会拦）
+    subtitleMode: (() => {
+      const subs = loaded.media.subtitleCodecs || [];
+      if (!subs.length) return 'none';
+      if (target.dropSubtitles) return 'dropped';
+      return subs.every(isTextSubtitle) ? 'retime' : 'unsupported';
+    })(),
     container: {
       ext: target.ext,
       label: target.container ? target.container.label : '跟随源',

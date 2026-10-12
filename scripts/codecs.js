@@ -43,6 +43,24 @@ const SRT_TEXT = SUB_CUES.map((t, i) => {
   return `${i + 1}\n${stamp(t)} --> ${stamp(t + 0.4)}\ncue-${i + 1}\n`;
 }).join('\n');
 
+/** ASS 版：字段顺序故意用默认的 Layer,Start,End,…，并留一条 Comment 验证不被改动 */
+const ASS_TEXT = `[Script Info]
+ScriptType: v4.00+
+PlayResX: 320
+PlayResY: 180
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour
+Style: Default,Arial,16,&H00FFFFFF
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+Comment: 0,0:00:00.00,0:00:00.00,Default,,0,0,0,,这条不该出现在产物里
+` + SUB_CUES.map((t, i) => {
+  const stamp = (s) => `0:00:${s.toFixed(2).padStart(5, '0')}`;
+  return `Dialogue: 0,${stamp(t)},${stamp(t + 0.4)},Default,,0,0,0,,cue-${i + 1}`;
+}).join('\n') + '\n';
+
 const FIXTURES = [
   {
     name: 'h264-mp4',
@@ -61,8 +79,7 @@ const FIXTURES = [
     file: 'h264.mkv',
     note: '带字幕的源做分段流拷贝时，ffmpeg 逐段定位字幕轨会漏掉窗口内的 cue、也会把被删区间的串回来'
       + '（实测四条 cue 只出三条，条数还会被"漏一条+串一条"抵消）。自检按落点逐条比对并**拒绝交付**，'
-      + '这里按 expectLoudFail 固化；字幕不带进产物（→ MP4 会自动省略）时一切正常',
-    expectLoudFail: true,
+      + '现在改成把字幕抽成文本按保留区间重新计时再上轨，四条 cue 落点逐条核对',
     subCues: SUB_CUES,
     args: [...V, ...A(), ...A(880), '-i', 'tmp/sub.srt', '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:s',
       '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-c:s', 'srt'],
@@ -80,6 +97,15 @@ const FIXTURES = [
     file: 'hevc.mkv',
     note: '以前多段拼接接缝解码不过：现在先把源纯拷成 MP4 工作副本再切，接缝干净（不再是需要用户绕开的限制）',
     args: [...V, ...A(), '-c:v', 'libx265', '-x265-params', 'log-level=none', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac'],
+  },
+  {
+    name: 'h264-mkv-ass 字幕',
+    file: 'ass.mkv',
+    note: 'ASS 字幕：抽成文本按保留区间重排再上轨，Dialogue 的 Start/End 改完其余原样，'
+      + '落在被删区间的整行不写，Comment 行不参与',
+    subCues: SUB_CUES,
+    args: [...V, ...A(), '-i', 'tmp/sub.ass', '-map', '0:v', '-map', '1:a', '-map', '2:s',
+      '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-c:s', 'ass'],
   },
   {
     name: 'vp9-webm',
@@ -131,6 +157,7 @@ function buildFixtures() {
   fs.mkdirSync(DIR, { recursive: true });
   // 字幕内容会改（核对 cue 条数与落点要用），每次都覆写
   fs.writeFileSync(path.join(ROOT, 'tmp', 'sub.srt'), SRT_TEXT, 'utf8');
+  fs.writeFileSync(path.join(ROOT, 'tmp', 'sub.ass'), ASS_TEXT, 'utf8');
   for (const fx of FIXTURES) {
     const target = path.join(DIR, fx.file);
     if (fs.existsSync(target) && !process.argv.includes('--rebuild')) continue;
@@ -236,9 +263,12 @@ function expectedCues(plan, groups, keeps, cues, split) {
   for (const g of groups) { progStart.push(acc); acc += g.reduce((a, n) => a + plan[n].duration, 0); }
   const out = [];
   for (const t of cues) {
-    const ki = keeps.findIndex((k) => t > k.start + 0.3 && t < k.end - 0.3);
+    // 与内核 retime 同一条规则：cue 起点落在保留区间内就保留（跨末尾的截断），否则整条丢掉
+    const ki = keeps.findIndex((k) => t >= k.start - 1e-6 && t < k.end - 1e-6);
     if (ki < 0) continue;
-    out.push({ file: split ? ki : 0, at: progStart[ki] + (t - keeps[ki].start), src: t });
+    if (split && ki !== groups.findIndex((g) => g.some((n) => plan[n].keepIndex === ki))) continue;
+    out.push({ file: split ? groups.findIndex((g) => g.some((n) => plan[n].keepIndex === ki)) : 0,
+      at: (split ? 0 : progStart[ki]) + (t - keeps[ki].start), src: t });
   }
   return out;
 }
@@ -332,7 +362,7 @@ async function runMatrix() {
         if (fx.subCues && !dropSubtitles && r.ok) {
           const exp = expectedCues(plan, groups, planned.keeps, fx.subCues, mode.opts.split);
           const got = r.outputs.map(cueStarts);
-          const tol = 0.1;
+          const tol = 0.05;
           for (const e of exp) {
             const list = got[e.file];
             if (!list) { cueBad.push(`cue@${e.src} 所在文件读不到字幕`); continue; }

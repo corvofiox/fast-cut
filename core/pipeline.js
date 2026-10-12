@@ -14,6 +14,7 @@ const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./
 const { buildPlan } = require('./cuttings');
 const { probeMedia, probeKeyframes, run, sourceSubtitleCues } = require('./probe');
 const { familyOfFormat, familyOfExt } = require('./containers');
+const { parseSrt, parseAss, applyRetime, retime, isTextSubtitle } = require('./subtitles');
 const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
 const { verifyExport } = require('./verify');
 const { ffmpegPath, ffprobePath } = require('./ffmpegPath');
@@ -154,11 +155,6 @@ async function exportSegments(loaded, segments, opts) {
     ? (CODEC_OF_ENCODER[pickVideoCodec(media)] || null)
     : null;
   const cutFps = media.video?.fps;
-  // 归一化：多段拼接时先把源整片纯拷进 MP4 工作副本（原因见 willNormalize 注释）
-  const normalize = willNormalize(media, plan.length);
-  const space = await precheckSpace(outPath, media, totalKeep + (normalize ? (media.duration || 0) : 0));
-  if (!space.ok) throw new Error(space.message);
-  onProgress({ phase: 'prepare', keepSecs: totalKeep, segments: keeps });
 
   await fsp.mkdir(path.dirname(path.resolve(outPath)), { recursive: true });
   const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fast-cut-'));
@@ -167,6 +163,27 @@ async function exportSegments(loaded, segments, opts) {
   // 输出文件名在切割前就确定，取消时才能把半成品全部清掉。
   const groups = groupByKeep(plan);
   const outNames = split ? groups.map((_, i) => numbered(outPath, i, ext)) : [outPath];
+
+  /**
+   * 字幕先摘出来：ffmpeg 逐段定位字幕轨会漏包/串包（实测），所以能按文本重新计时时，
+   * 段里一律不带字幕，等拼接那一步再把重排好的 sidecar 一次上轨。
+   */
+  let subDocs = null;
+  if (!dropSubtitles && (media.subtitleCodecs || []).length) {
+    subDocs = await extractSubtitleDocs(bins, file, media, tmpDir);
+    if (!subDocs) {
+      warnings.push('源含字幕轨，但它不是可重排的文本字幕（只支持 SRT/ASS）：仍按分段流拷贝处理，'
+        + '自检会逐条比对字幕落点，对不上就拒绝交付');
+    }
+  }
+  const stripSubs = !!subDocs;
+  const carrySubsInParts = !dropSubtitles && !stripSubs && (media.subtitleCodecs || []).length > 0;
+
+  // 归一化：多段拼接时先把源整片纯拷进 MP4 工作副本（原因见 willNormalize 注释）
+  const normalize = willNormalize(media, plan.length, stripSubs);
+  const space = await precheckSpace(outPath, media, totalKeep + (normalize ? (media.duration || 0) : 0));
+  if (!space.ok) throw new Error(space.message);
+  onProgress({ phase: 'prepare', keepSecs: totalKeep, segments: keeps });
 
   try {
     let src = { file, media };
@@ -180,8 +197,8 @@ async function exportSegments(loaded, segments, opts) {
         warnings.push(`封装归一失败（${String(err.message || err).split('\n')[0].slice(0, 90)}），改用源文件直接切割`);
       }
     }
-    // 中间段优先写 MP4（原因见 partsAsMp4）；只有必须带字幕轨时才沿用目标容器。
-    const partExt = partsAsMp4(media, ext, dropSubtitles) ? '.mp4' : ext;
+    // 中间段优先写 MP4（原因见 partsAsMp4）；只有必须把字幕带在段里时才沿用目标容器。
+    const partExt = partsAsMp4(media, ext, carrySubsInParts) ? '.mp4' : ext;
     // 「读 mov 族 且 写 mov 族」才敢让拷贝段的时间戳不归零：
     // 不归零才不会每个接缝多一帧（见 buildArgs），但读 MKV/TS 或写 MKV 时会丢报文时间戳。
     const zeroFree = familyOfFormat(src.media.format) === 'mov' && familyOfExt(partExt) === 'mov';
@@ -194,7 +211,9 @@ async function exportSegments(loaded, segments, opts) {
     for (let i = 0; i < plan.length; i++) {
       const item = plan[i];
       const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${partExt}`);
-      const args = argsForSegment(item, { ...src.media, file: src.file }, partFile, { crf, fps: cutFps, dropSubtitles, copyTs });
+      const args = argsForSegment(item, { ...src.media, file: src.file }, partFile, {
+        crf, fps: cutFps, dropSubtitles: dropSubtitles || stripSubs, copyTs,
+      });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);
       partFiles.push(partFile);
@@ -204,6 +223,8 @@ async function exportSegments(loaded, segments, opts) {
     const expectSecs = [];
     const expectFrames = [];
     const userSecs = [];
+    const wantCues = [];
+    const subTracks = [];
     /** 计划要写多少帧：拷贝段按 plan 给的包数（已扣双向预测余量），其余按时长折算。 */
     const framesOf = (p) => (Number.isFinite(p.frames) && p.frames > 0
       ? Math.round(p.frames)
@@ -220,66 +241,73 @@ async function exportSegments(loaded, segments, opts) {
       return trimmed / frames;
     };
     const expectSlack = [];
+    // 每条保留区间在成片里的起点（拼接模式按全部区间累加）
+    const progOfKeep = {};
+    let cursor = 0;
+    for (const g of groups) {
+      const k = plan[g[0]].keepIndex;
+      if (k != null && progOfKeep[k] === undefined) progOfKeep[k] = cursor;
+      cursor += g.reduce((a, n) => a + plan[n].duration, 0);
+    }
+    const keepsOf = (idxList) => [...new Set(idxList.map((n) => plan[n].keepIndex).filter((k) => k != null))];
+    /** 重排字幕 sidecar：split 时每片只装自己那条区间的字幕，起点归零。 */
+    async function sidecarsFor(idxList, tag) {
+      if (!subDocs) return { files: [], cues: null };
+      const ks = keepsOf(idxList);
+      const files = [];
+      const cues = [];
+      for (const entry of subDocs) {
+        const one = split
+          ? await writeRetimeSidecar(entry, ks.map((k) => keeps[k]), ks.map(() => 0), tmpDir, tag)
+          : await writeRetimeSidecar(entry, keeps, keeps.map((_, i) => progOfKeep[i] || 0), tmpDir, tag);
+        if (one) { files.push(one.file); cues.push(one.cues); }
+      }
+      return { files, cues };
+    }
+
     if (split) {
       // 需求文档 §4.3：「每段一个文件」= 每条保留区间一个文件。
       // 入点不在关键帧上时一条区间会被切成"重编码小段 + 流拷贝段"，这里再把它们拼回同一个文件。
       for (let i = 0; i < groups.length; i++) {
         const files = groups[i].map((n) => partFiles[n]);
         const target = outNames[i];
-        // 段可能是 MP4 而目标是 MKV（见 partsAsMp4）：封装不同就必须真的过一遍 muxer，
-        // 不能 copyFile 把 mp4 改名成 .mkv 交出去（实测会写出"扩展名是 mkv 的 mp4"）。
-        if (files.length === 1 && path.extname(files[0]).toLowerCase() === path.extname(target).toLowerCase()) {
+        const subs = await sidecarsFor(groups[i], `k${i}`);
+        if (files.length === 1 && !subs.files.length && path.extname(files[0]).toLowerCase() === path.extname(target).toLowerCase()) {
           await fsp.copyFile(files[0], target);
         } else {
-          await concatInto(files, target, cutMedia, bins);
+          await concatInto(files, target, cutMedia, bins, { subs: subs.files });
         }
         outputs.push(target);
         expectSecs.push(snap(groups[i].reduce((acc, n) => acc + plan[n].duration, 0)));
         expectFrames.push(framesSum(groups[i]));
         expectSlack.push(rateSlackOf(groups[i]));
+        wantCues.push(subs.cues);
+        if (subs.cues) subTracks.push(subs.cues.length);
         const ki = plan[groups[i][0]].keepIndex;
         userSecs.push(ki != null && keeps[ki] ? snap(keeps[ki].end - keeps[ki].start) : undefined);
       }
     } else {
-      await concatInto(partFiles, outPath, cutMedia, bins);
+      const subs = await sidecarsFor(plan.map((_, n) => n), 'all');
+      await concatInto(partFiles, outPath, cutMedia, bins, { subs: subs.files });
       outputs = [outPath];
       // 基准按计划实算：段时长是整帧时刻，与用户选区最多差一帧。
       // 拿源长百分比当允差会宽到"吞掉剪辑"都查不出来（实测 98 分钟片删 1.9s 判通过）。
       expectSecs.push(snap(plan.reduce((acc, p) => acc + p.duration, 0)));
       expectFrames.push(framesSum(plan.map((_, n) => n)));
       expectSlack.push(rateSlackOf(plan.map((_, n) => n)));
+      wantCues.push(subs.cues);
+      if (subs.cues) subTracks.push(subs.cues.length);
       userSecs.push(totalKeep);
     }
 
     // 自检：每个输出文件与"它自己那组切割计划的时长"比对，不和总时长比。
-    // 字幕基准先算好：源在各条保留区间内到底有多少条 cue（分段流拷贝会把尾段的 cue 整条漏掉，
-    // 也会把被删区间的 cue 串回来，只有数条数才看得见）。
+    // 字幕基准：能重排时用重排后的时刻（我们自己算的，最准）；不能重排时去数源的 cue，
+    // 那条路就是"分段流拷贝会不会把字幕弄坏"的检验。
     onProgress({ phase: 'verify' });
-    let wantCues = [];
-    if (!dropSubtitles && (media.subtitleCodecs || []).length) {
-      // 每条保留区间在成片里的起点
-      const progOfKeep = {};
-      let cursor = 0;
-      for (const g of groups) {
-        const k = plan[g[0]].keepIndex;
-        if (k != null && progOfKeep[k] === undefined) progOfKeep[k] = cursor;
-        cursor += g.reduce((a, n) => a + plan[n].duration, 0);
+    for (let i = 0; i < outputs.length; i++) {
+      if (!wantCues[i] && !dropSubtitles && (media.subtitleCodecs || []).length) {
+        wantCues[i] = await expectedCuesFromSource(bins, file, media, keeps, plan, groups, progOfKeep, split, i);
       }
-      try {
-        const cueLists = await sourceSubtitleCues(bins.ffprobe, file,
-          keeps.map((k) => [k.start, k.end]), media.startOffset, media.duration);
-        const keepsOf = (idxList) => [...new Set(idxList.map((n) => plan[n].keepIndex).filter((k) => k != null))];
-        const groupsOfKeeps = split ? groups.map(keepsOf) : [keeps.map((_, k) => k)];
-        wantCues = groupsOfKeeps.map((ks) => cueLists.map((list) => {
-          const out = [];
-          for (const t of list) {
-            const k = ks.find((ki) => t >= keeps[ki].start - 0.001 && t < keeps[ki].end);
-            if (k === undefined) continue;
-            out.push(split ? t - keeps[k].start : (progOfKeep[k] || 0) + (t - keeps[k].start));
-          }
-          return out.sort((a, b) => a - b);
-        }));
-      } catch { wantCues = []; }
     }
     const results = [];
     for (let i = 0; i < outputs.length; i++) {
@@ -287,6 +315,7 @@ async function exportSegments(loaded, segments, opts) {
         {
           duration: expectSecs[i], userSecs: userSecs[i], frames: expectFrames[i],
           rateSlack: expectSlack[i], container, wantCues: wantCues[i],
+          subTracks: subTracks[i],
           dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length,
           sourceFormat: media.format,
         });
@@ -363,10 +392,11 @@ async function runWithProgress(ffmpeg, args, item, onProgress, token) {
  *  - 源本来就是 mov 族（多拷一份纯浪费磁盘和时间）；
  *  - 源带字幕（MP4 装不下 subrip/ass 的流拷贝，归一等于悄悄丢字幕）。
  */
-function willNormalize(media, partCount) {
+function willNormalize(media, partCount, stripSubtitles) {
   if (partCount < 2) return false;
   if (familyOfFormat(media.format) === 'mov') return false;
-  return !(media.subtitleCodecs || []).length;
+  // 字幕留在段里时不能归一（MP4 装不下 subrip/ass 的流拷贝）；能重新计时就已经把字幕摘出去了
+  return stripSubtitles || !(media.subtitleCodecs || []).length;
 }
 
 /**
@@ -382,10 +412,77 @@ function willNormalize(media, partCount) {
  * 不能这么做的情况：段里必须带上字幕轨（MP4 装不下 subrip/ass 的流拷贝，
  * 见 containers.js），这时只能沿用目标容器并承担 mkv 段的记账偏差。
  */
-function partsAsMp4(media, ext, dropSubtitles) {
+function partsAsMp4(media, ext, carrySubsInParts) {
   if (familyOfExt(ext) === 'mov') return false;                 // 本来就是 mov 族，无需改
-  if ((media.subtitleCodecs || []).length > 0 && !dropSubtitles) return false;
+  if (carrySubsInParts) return false;                            // 段必须带字幕时 MP4 装不下
   return true;
+}
+
+/**
+ * 抽文本字幕并留好原始解析结果。
+ *
+ * 只支持 srt / ass 这类文本字幕：位图字幕（PGS/DVD）重排需要 OCR，明确不做，
+ * 返回 null 让调用方退回旧路径（段里带字幕 + 自检按落点拦下）。
+ * 抽取或解析任何一步出错也返回 null —— 宁可不优化，也不能吐一份对不上的字幕。
+ */
+async function extractSubtitleDocs(bins, file, media, tmpDir) {
+  const codecs = media.subtitleCodecs || [];
+  if (!codecs.length || !codecs.every(isTextSubtitle)) return null;
+  const docs = [];
+  for (let k = 0; k < codecs.length; k++) {
+    const isAss = /ass|ssa/i.test(codecs[k]);
+    const raw = path.join(tmpDir, `sub${k}.src${isAss ? '.ass' : '.srt'}`);
+    try {
+      await run(bins.ffmpeg, ['-hide_banner', '-loglevel', 'error', '-y', '-i', file,
+        '-map', `0:s:${k}`, '-c:s', isAss ? 'ass' : 'srt', raw]);
+      docs.push({ track: k, isAss, doc: isAss ? parseAss(await fsp.readFile(raw, 'utf8')) : parseSrt(await fsp.readFile(raw, 'utf8')) });
+    } catch (err) {
+      await safeRemove(raw);
+      return null;
+    }
+    await safeRemove(raw);
+  }
+  return docs;
+}
+
+/**
+ * 把某条输出的字幕重排成 sidecar 文件。
+ * @returns {{file:string, cues:number[]}|null} 一条都没有时返回 null（该轨就不写进产物）
+ */
+async function writeRetimeSidecar(entry, keeps, progStarts, tmpDir, tag) {
+  const moved = retime(entry.doc.cues, keeps, progStarts);
+  if (!moved.length) return null;
+  const out = path.join(tmpDir, `sub${entry.track}-${tag}${entry.isAss ? '.ass' : '.srt'}`);
+  try {
+    await fsp.writeFile(out, applyRetime(entry.doc, moved), 'utf8');
+  } catch { return null; }
+  return { file: out, cues: moved.map((c) => c.start) };
+}
+
+/**
+ * 不能重排字幕时（位图字幕等）的基准：去源里数各保留区间内的 cue 时刻，
+ * 换算成成片时刻。自检拿它逐条比对成片字幕，就能把"漏一条 + 串一条"那种
+ * 条数刚好相等的情况也抓出来。
+ */
+async function expectedCuesFromSource(bins, file, media, keeps, plan, groups, progOfKeep, split, outIndex) {
+  try {
+    const cueLists = await sourceSubtitleCues(bins.ffprobe, file,
+      keeps.map((k) => [k.start, k.end]), media.startOffset, media.duration);
+    const ks = split
+      ? [...new Set(groups[outIndex].map((n) => plan[n].keepIndex).filter((k) => k != null))]
+      : keeps.map((_, k) => k);
+    return cueLists.map((list) => {
+      const out = [];
+      for (const t of list) {
+        const k = ks.find((ki) => t >= keeps[ki].start - 0.001 && t < keeps[ki].end);
+        if (k === undefined) continue;
+        out.push(split ? t - keeps[k].start : (progOfKeep[k] || 0) + (t - keeps[k].start));
+      }
+      return out.sort((a, b) => a - b);
+    });
+  } catch {
+    return null;
+  }
 }
 
 /** 纯拷贝把工作副本写成 MP4；关键帧表沿用源的（流拷贝不动报文）。 */
@@ -400,15 +497,15 @@ async function makeWorkingCopy(bins, file, media, tmpDir, token) {
   return { file: working, media: wm };
 }
 
-async function concatInto(parts, outPath, media, bins) {
+async function concatInto(parts, outPath, media, bins, opts = {}) {
   if (parts.length === 1) {
-    const args = argsForConcat(parts, outPath, media);
+    const args = argsForConcat(parts, outPath, media, undefined, opts);
     await run(bins.ffmpeg, args);
     return;
   }
   const listFile = listPathOf(outPath);
   await fsp.writeFile(listFile, concatListBody(parts), 'utf8');
-  const args = argsForConcat(parts, outPath, media);
+  const args = argsForConcat(parts, outPath, media, undefined, opts);
   try {
     await run(bins.ffmpeg, args);
   } finally {

@@ -111,11 +111,13 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
   const sSubs = all(srcMeta.streams, 'subtitle').length;
   const oSubs = all(outMeta.streams, 'subtitle').length;
   if (sSubs > 0) {
+    // 重排过的字幕：某条语言在保留区间里一条 cue 都不剩时就不写上轨，轨数可以比源少
+    const wantTracks = expect.subTracks != null ? Math.min(expect.subTracks, sSubs) : sSubs;
     if (expect.dropSubtitles) {
       add('字幕轨已按所选容器省略', oSubs === 0,
         `源 ${sSubs} 条装不进所选容器，导出 ${oSubs} 条（要保留字幕请选 MKV）`);
     } else {
-      add('字幕轨数量一致', sSubs === oSubs, `源 ${sSubs} → 导出 ${oSubs}`);
+      add('字幕轨数量一致', oSubs === wantTracks, `源 ${sSubs} 条（产物应保留 ${wantTracks} 条）→ 导出 ${oSubs} 条`);
     }
   }
 
