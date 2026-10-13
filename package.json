@@ -2,7 +2,7 @@
   "name": "fast-cut",
   "version": "0.1.0",
   "private": true,
-  "description": "Fast Cut - 剪辑位置精确到帧的极简视频裁剪工具（能流拷贝的段一律流拷贝）",
+  "description": "Fast Cut - 给录制视频做粗剪的 Windows 工具：轻、快、不掉画质（能流拷贝的段一律流拷贝）",
   "license": "MIT",
   "main": "src/main/index.js",
   "scripts": {
