@@ -377,7 +377,7 @@ async function main() {
   await js(win, '__t.dragTo(5.0); "ok"');
   const hudPlain = await js(win, 'document.getElementById("hud").textContent');
   check('HUD 只报磁吸状态不重复报时间',
-    /磁吸·关键帧/.test(hudSnapped) && !/\d{1,2}:\d{2}/.test(hudSnapped) && !/磁吸/.test(hudPlain),
+    /磁吸·GOP 边界/.test(hudSnapped) && !/\d{1,2}:\d{2}/.test(hudSnapped) && !/磁吸/.test(hudPlain),
     `吸上时 "${hudSnapped}" · 没吸时 "${hudPlain || '（空）'}"`);
 
   // 4) 滚轮 = 滚动，Alt + 滚轮 = 缩放，底部滚动条 = 平移
