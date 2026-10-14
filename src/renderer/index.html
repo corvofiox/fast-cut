@@ -123,16 +123,16 @@
 <div id="exportMask" class="modal-mask hidden">
   <section class="modal export">
     <h3>导出</h3>
-    <div class="modal-tip">默认吸附关键帧整段流拷贝（零损失、最快）；「精确模式」逐帧切点，入点那一小段有损重编码。</div>
+    <div class="modal-tip">默认吸附关键帧整段流拷贝（零损失、最快）；「精确模式」逐帧切点，入点那一小段有损重编码（CRF 18、同 profile）。</div>
     <label class="m-row">
       <span class="m-label">精确模式</span>
       <input type="checkbox" id="optPrecise" />
-      <span class="m-sub">入点精确到帧，不吸附关键帧；代价是入点那一小段做<b>有损重编码</b>（CRF 18、同 profile）</span>
+      <span class="m-sub">入点精确到帧，不吸附关键帧；代价是入点那一小段做<b>有损重编码</b></span>
     </label>
     <label class="m-row">
       <span class="m-label">每段一个文件</span>
       <input type="checkbox" id="optSplit" />
-      <span class="m-sub">默认按顺序拼接成一个文件；勾选后输出 part01 / part02 …</span>
+      <span class="m-sub">默认按顺序拼接成一个文件；勾选后依次命名 part01 / part02 / …</span>
     </label>
     <div class="m-row">
       <span class="m-label">输出目录</span>
