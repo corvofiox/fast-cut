@@ -327,7 +327,7 @@ function buildPlan(keeps, opts) {
         snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
         note: tailRaw > EPS
           ? `后面只剩 ${Math.round(tailRaw * (fpsNum || 1))} 帧，减去双向预测余量就不够了：整段重编码（有损）`
-          : 'GOP 边界已贴到出点：整段重编码（有损）',
+          : '关键帧已贴到出点：整段重编码（有损）',
       });
       continue;
     }

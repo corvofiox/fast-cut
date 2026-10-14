@@ -7,7 +7,7 @@
  * 因此所有指针位置都要在"成片时间 ↔ 源时间"之间换算，映射表由上层传进来（clips 带 ps/pe）。
  *
  * 交互（刻意不做任何"拖一下就删除"）：
- *  - 顶部刻度条（0–22px）= 唯一能移动播放头的地方，整条都能按下拖，带磁吸（片段边界、GOP 边界）
+ *  - 顶部刻度条（0–22px）= 唯一能移动播放头的地方，整条都能按下拖，带磁吸（片段边界、关键帧）
  *  - 胶片上按下拖动 = 改这段素材的顺序；单击只选中，都不动播放头
  *  - 拖片段之间的分割线 = 调整切点；双击分割线 = 合并
  *  - 平移视图 = 滚轮 或 底部滑块（刻度条已经让给播放头，不再兼作平移）
@@ -166,7 +166,7 @@ function createTimeline(options) {
     return -1;
   }
 
-  /** 磁吸：优先吸片段边界，其次吸 GOP 边界（只有还在成片上的 GOP 边界才算）。 */
+  /** 磁吸：优先吸片段边界，其次吸关键帧（只有还在成片上的关键帧才算）。 */
   function snapCandidate(x) {
     const t = xToT(x);
     let best = null;
@@ -864,7 +864,7 @@ function createTimeline(options) {
     clipIndexAtProg,
     timeToX: tToX,
     edgePad: () => PAD,
-    /** 磁吸候选点（给 HUD 显示"吸附到哪个 GOP 边界"用）。 */
+    /** 磁吸候选点（给 HUD 显示"吸附到哪个关键帧"用）。 */
     snapAtProgram: (pt) => {
       const x = tToX(pt);
       const hit = snapCandidate(x);

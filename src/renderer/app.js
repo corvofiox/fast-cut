@@ -350,8 +350,8 @@ function onScanResult(payload) {
   if (!state.src || payload.file !== state.src.file) return;
   state.scanning = false;
   if (!payload.ok) {
-    showError(`GOP 边界扫描失败：${payload.message}`);
-    toast('GOP 边界扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
+    showError(`关键帧扫描失败：${payload.message}`);
+    toast('关键帧扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
     updateExportEnabled();
     return;
   }
@@ -363,7 +363,7 @@ function onScanResult(payload) {
   syncTimeline();
   const headN = countCost('head');
   const copyN = state.plan && state.plan.plan ? state.plan.plan.filter((p) => p.kind === 'copy').length : 0;
-  toast(`GOP 边界扫描完成：${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
+  toast(`关键帧扫描完成：${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
 }
 
 function defaultOutDir(file) {
@@ -392,7 +392,7 @@ function updateInfo() {
   if (m.rotation) rows.push(['旋转', `${m.rotation}°`, '']);
   const kfCount = (m.keyframes || []).length;
   const gap = gopStats(m.keyframes);
-  rows.push(['GOP 边界', state.scanning ? '扫描中…' : `${kfCount} 个${gap ? ` · 间隔约 ${gap}` : ''}`, state.scanning ? 'warn' : '']);
+  rows.push(['关键帧', state.scanning ? '扫描中…' : `${kfCount} 个${gap ? ` · 间隔约 ${gap}` : ''}`, state.scanning ? 'warn' : '']);
 
   const dl = $('info');
   dl.innerHTML = '';
@@ -482,7 +482,7 @@ function updateHud() {
   const hud = $('hud');
   if (!state.src) { hud.textContent = ''; return; }
   const parts = [];
-  if (lastSnap) parts.push(lastSnap.kind === 'keyframe' ? '磁吸·GOP 边界' : '磁吸·分割点');
+  if (lastSnap) parts.push(lastSnap.kind === 'keyframe' ? '磁吸·关键帧' : '磁吸·分割点');
   const pt = tl.currentProgramTime();
   const srcT = tl.progToSrc(pt);
   if (Math.abs(srcT - pt) > 0.001) parts.push(`源 ${tcShort(srcT)}`);
@@ -890,7 +890,7 @@ function updateEstimate() {
   if (!isPreciseMode()) {
     // 吸附模式的预估：把"多带了什么"如实列出
     const extra = (Array.isArray(parts) ? parts : []).reduce((a, p) => a + Math.max(0, (p.snapFrom != null ? p.snapFrom - p.start : 0)), 0);
-    if (extra > 0.05) lines.push(`⚠ 吸附关键帧：会多带开头共 ${extra.toFixed(3)}s（切点对准 GOP 边界可避免，或勾「精确模式」）`);
+    if (extra > 0.05) lines.push(`⚠ 吸附关键帧：会多带开头共 ${extra.toFixed(3)}s（切点对准关键帧可避免，或勾「精确模式」）`);
     if (autoN) lines.push(`✂ ${autoN} 段吸附会吞掉已删的间隙：已自动改为局部精确（入点小段重编码）`);
   }
   if (headN) lines.push(`✂ ${headN} 段入点那一小段重编码：其余仍流拷贝`);
@@ -903,7 +903,7 @@ function updateEstimate() {
   const mode = state.plan && state.plan.subtitleMode;
   const subTracks = (state.src.media.subtitleCodecs || []).length;
   if (mode === 'unsupported' && parts2.length > 1) {
-    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是可重排的文本字幕（只支持 SRT/ASS）：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。出路：让每个入点都落在 GOP 边界上（实测整段流拷贝的那一刀字幕一条不缺），或改选会省略这条字幕轨的容器、把字幕当外挂文件另行处理`);
+    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是可重排的文本字幕（只支持 SRT/ASS）：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。出路：让每个入点都落在关键帧上（实测整段流拷贝的那一刀字幕一条不缺），或改选会省略这条字幕轨的容器、把字幕当外挂文件另行处理`);
   } else if (mode === 'retime') {
     lines.push(`· ${subTracks} 条字幕轨按保留区间重新计时（文本重排，不改编码）`);
   }
@@ -935,7 +935,7 @@ function updateExportEnabled() {
   const secs = keptSeconds();
   const why = !state.src ? '先导入视频'
     : !(state.env && state.env.ok) ? '未找到可用的 ffmpeg'
-      : state.scanning ? '正在 GOP 边界扫描，扫完才能确定哪些段能整段流拷贝'
+      : state.scanning ? '正在关键帧扫描，扫完才能确定哪些段能整段流拷贝'
         : !state.clips.length ? '素材全被删了，至少留一段'
           : secs < MIN_KEEP ? '剩余素材总长小于一帧，无法导出'
             : !$('outDir').value ? '先选择导出目录'
