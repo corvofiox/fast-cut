@@ -229,6 +229,9 @@ async function refreshEnv() {
     state.env = { ok: false, version: null, settings: {} };
   }
   paintContainers();
+  // 版本角标取 app.getVersion()（package.json 的 version），写死会在每次发版后变成假话
+  const badge = $('verBadge');
+  if (badge) badge.textContent = `v${state.env.appVersion || '0.1.0'}`;
   if (state.env.ok) {
     $('emptyNote').textContent = '导入只读取文件信息（ffprobe 探流 + 扫关键帧），不转码、不复制、不上传。';
   } else {
@@ -1301,7 +1304,7 @@ function bindUi() {
   });
   p.addEventListener('error', () => {
     if (!state.src) return;
-    toast('预览器无法解码该视频（常见于 HEVC／AV1）。这只影响预览，导出不受影响：该拷的照拷，拷不动的只重编码入点那一小段。', 'warn');
+    toast('预览器无法解码该视频（常见于 HEVC／AV1）。这只影响预览，导出不受影响：默认吸附模式下整段流拷贝；勾了「精确模式」则只重编码入点那一小段。', 'warn');
   });
 
   $('btnImportEmpty').addEventListener('click', pickAndImport);

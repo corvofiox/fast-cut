@@ -646,8 +646,8 @@ function registerIpc(getWindow) {
   ipcMain.handle('fc:app:about', () => dialog.showMessageBox(getWindow(), {
     type: 'info',
     title: 'Fast Cut',
-    message: 'Fast Cut v0.1',
-    detail: '只做裁剪的极简视频工具：默认吸附关键帧、整段流拷贝（零损失）；勾选「精确模式」则切点逐帧精确，只在不得不编的入点小段重编码。不上传、不写源文件。',
+    message: `Fast Cut v${app.getVersion()}`,
+    detail: '给录制视频做粗剪的 Windows 工具：轻、快、不掉画质。默认吸附关键帧、整段流拷贝（零重编码、最快）；勾选「精确模式」则切点逐帧精确，只重编码入点那一小段。不上传、不写源文件。',
     buttons: ['知道了'],
   }));
   ipcMain.handle('fc:app:quit', () => app.quit());
