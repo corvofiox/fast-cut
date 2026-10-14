@@ -374,6 +374,7 @@ function previewPlan(payload) {
   const { plan, warnings, keeps, keepSecs } = planFor(loaded, segments, {
     ordered: isReordered(segments),
     dropSubtitles: target.dropSubtitles,
+    precise: payload.precise === undefined ? true : !!payload.precise,
   });
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
@@ -465,7 +466,9 @@ async function startExport(win, payload) {
     throw new Error('关键帧还没扫完，稍等一下再导出');
   }
   const split = !!payload.split;
-  const targets = targetsFor(loaded, segments, outPath, ext, split, target.dropSubtitles);
+  // 吸附（precise=false）与精确（precise=true，默认）两种切割模式；行数按同一套计划算
+  const precise = payload.precise === undefined ? true : !!payload.precise;
+  const targets = targetsFor(loaded, segments, outPath, ext, split, target.dropSubtitles, precise);
   assertNotOverwrite(abs, targets);
 
   const token = createToken();
@@ -480,6 +483,7 @@ async function startExport(win, payload) {
       split,
       crf: 18,
       ordered: isReordered(segments),
+      precise,
       container: target.container,
       dropSubtitles: target.dropSubtitles,
       token,
@@ -504,9 +508,9 @@ async function startExport(win, payload) {
 }
 
 /** 本次导出会写哪些文件：拼接模式 1 个，「每段一个文件」按保留区间各 1 个。 */
-function targetsFor(loaded, segments, outPath, ext, split, dropSubtitles) {
+function targetsFor(loaded, segments, outPath, ext, split, dropSubtitles, precise = true) {
   if (!split) return [outPath];
-  const { plan } = planFor(loaded, segments, { ordered: isReordered(segments), dropSubtitles });
+  const { plan } = planFor(loaded, segments, { ordered: isReordered(segments), dropSubtitles, precise });
   return groupByKeep(plan).map((_, i) => numbered(outPath, i, ext));
 }
 

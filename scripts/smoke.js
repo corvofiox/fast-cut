@@ -687,14 +687,34 @@ async function main() {
     return JSON.stringify({ shown: Number(m[1]) * 3600 + Number(m[2]) * 60 + Number(m[3]), plan });
   })()`);
   const promise = promised === -1 ? null : JSON.parse(promised);
-  // 剪辑位置是硬性要求：计划里每一段的起点必须就是用户选的入点，一秒都不许回溯到关键帧
-  const noSnap = JSON.parse(await js(win, `(() => {
+  // 剪辑语义随模式分叉：精确模式（勾选）每段起点必须就是用户入点、一秒不许前移；
+  // 吸附模式（默认）每段起点必须落在关键帧上、且**绝不越过上一段出点**（防吞钳制，98 分钟 .mkv 的教训）
+  const modeCheck = JSON.parse(await js(win, `(() => {
+    const precise = document.getElementById('optPrecise') ? document.getElementById('optPrecise').checked : true;
     const keeps = __smoke.state.plan.keeps, parts = __smoke.state.plan.plan || [];
-    const bad = keeps.map((k, i) => [i, k, parts.filter((p) => p.keepIndex === i)[0]]).filter(([, k, p]) => p && p.start > k.start + 0.001);
-    return JSON.stringify({ bad, n: parts.length });
+    let bad;
+    if (precise) {
+      bad = keeps.map((k, i) => [i, k, parts.filter((p) => p.keepIndex === i)[0]])
+        .filter(([, k, p]) => p && p.start > k.start + 0.001)
+        .map(([i]) => i);
+    } else {
+      // 吸附：每段起点必须是关键帧（或 0），且 ≥ 上一条保留段的出点（防吞）——
+      // 上一段出点恰好是关键帧时允许相等（首尾相接不吞内容）
+      bad = keeps.map((k, i) => {
+        const p = parts.filter((q) => q.keepIndex === i)[0];
+        if (!p) return i;
+        if (k.start > 0.001 && p.start > k.start + 0.001) return i;          // 段起点晚于入点 = 跳过了内容
+        if (i > 0 && p.start < keeps[i - 1].end - 0.001) return i;           // 越过上一段出点 = 吞了间隙
+        return null;
+      }).filter((v) => v !== null);
+    }
+    return JSON.stringify({ bad, n: parts.length, precise });
   })()`));
-  check('计划不回溯关键帧：每段起点就是用户选的入点', noSnap.bad.length === 0,
-    JSON.stringify(noSnap.bad) + `（共 ${noSnap.n} 个切割段）`);
+  check(modeCheck.precise
+    ? '计划不回溯关键帧：每段起点就是用户选的入点'
+    : '吸附模式：每段起点落在关键帧上，且绝不越过上一段出点（防吞）',
+    modeCheck.bad.length === 0,
+    JSON.stringify(modeCheck.bad) + `（共 ${modeCheck.n} 个切割段，precise=${modeCheck.precise}）`);
   let res = await runExport(win);
   check('拼接导出通过自检', res.ok && res.outputs.length === 1, res.detail);
   if (res.ok && promise) {
@@ -714,6 +734,23 @@ async function main() {
   res = await runExport(win);
   check('每段一个文件通过自检', res.ok && res.outputs.length === groups, `${res.detail}（计划 ${groups} 组）`);
   await js(win, `__smoke.setOption('optSplit', false); 'ok'`);
+  await wait(250);
+
+  // 9-snap) 勾「精确模式」：计划回到"入点一秒不动"，导出仍通过自检 —— 两种模式都验到
+  await js(win, `__smoke.setOption('optPrecise', true); __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'precise'); 'ok'`);
+  await wait(300);
+  const precisePlan = JSON.parse(await js(win, `(() => {
+    const keeps = __smoke.state.plan.keeps, parts = __smoke.state.plan.plan || [];
+    const bad = keeps.map((k, i) => [i, parts.filter((p) => p.keepIndex === i)[0]])
+      .filter(([, k, p]) => p && p.start > k.start + 0.001).map(([i]) => i);
+    return JSON.stringify({ bad, reencodes: parts.filter((p) => p.kind === 'reencode').length });
+  })()`));
+  check('精确模式勾选后：计划回到入点不回溯，且有重编码段',
+    precisePlan.bad.length === 0 && precisePlan.reencodes > 0,
+    `坏段 ${JSON.stringify(precisePlan.bad)} · 重编码段 ${precisePlan.reencodes}`);
+  res = await runExport(win);
+  check('精确模式导出通过自检', res.ok && res.outputs.length === 1, res.detail);
+  await js(win, `__smoke.setOption('optPrecise', false); 'ok'`);
   await wait(250);
 
   // 9a) 用真实指针拖胶片：改顺序，且绝不移动播放头

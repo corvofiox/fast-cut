@@ -251,3 +251,66 @@ test('frameStart：入点向上落到帧网格，原点与无帧率两种情况�
   assert.ok(near(frameStart(0.5, 30, 0), 0.5), '原点 0 时按整帧刻度对齐');
   assert.strictEqual(frameStart(1.234, null, 0.023), 1.234, '没有帧率就原样返回，不编造网格');
 });
+
+// ---------------------------------------------------------------- 吸附模式（precise=false）
+
+// 吸附是 2026-10-14 应库主要求还原的模式（默认导出走它）：入点前移到 ≤ 它的最近关键帧，
+// 整段流拷贝、零损失、最快；防吞钳制（cc1ff73 的教训）必须原样保留——回溯绝不越过
+// 上一条保留段的出点，跨不过去就自动降级为局部精确。
+const SNAP = { ...OPTS, precise: false };
+
+test('吸附：入点前移到最近关键帧，整段流拷贝，snapFrom 保留用户原始入点', () => {
+  const { plan, warnings } = buildPlan([{ start: 3.4, end: 5.2 }], SNAP);
+  assertPlan(plan, [['copy', 2, 3.2]]);
+  assert.strictEqual(plan[0].snapFrom, 3.4, 'UI 显示"少掉多少"要用原始入点');
+  assert.match(plan[0].note, /前移/);
+  assert.ok(warnings.length === 0, `不该有警告：${warnings.join('、')}`);
+});
+
+test('吸附：入点正好在关键帧上 = 与精确模式同一条 copy 段', () => {
+  const { plan } = buildPlan([{ start: 4, end: 6 }], SNAP);
+  assertPlan(plan, [['copy', 4, 2]]);
+});
+
+test('吸附防吞钳制：回溯会跨过上一段出点时，自动降级为局部精确，绝不吞掉已删素材', () => {
+  // 整片只有一个关键帧（12s GOP 的形状）：每条非首段的吸附都会回溯到 0，跨过所有出点
+  const { plan, warnings } = buildPlan(
+    [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8, end: 9.5 }],
+    { keyframes: [0], duration: 10, fps: 30, precise: false },
+  );
+  assert.deepStrictEqual(plan.map((p) => p.kind), ['copy', 'reencode', 'reencode']);
+  assert.strictEqual(plan[0].start, 0, '首段允许片头回溯（不会并掉别人的区间）');
+  assert.strictEqual(plan[1].start, 4.1, '后两段的入点必须精确，绝不前移');
+  assert.strictEqual(plan[2].start, 8);
+  assert.ok(plan[1].autoPrecise && plan[2].autoPrecise);
+  assert.ok(warnings.some((w) => /自动.*局部精确/.test(w) && /吃掉已删/.test(w)), warnings.join('、'));
+});
+
+test('吸附防吞钳制（换编码源）：跨界时整段重编码，不混拼也不吞', () => {
+  const { plan, warnings } = buildPlan(
+    [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }],
+    { keyframes: [0], duration: 10, fps: 30, precise: false, sameCodec: false },
+  );
+  const second = plan.filter((p) => p.keepIndex === 1);
+  assert.strictEqual(second.length, 1, '换编码源跨界：整段单编码，绝不与拷贝段混拼');
+  assert.strictEqual(second[0].kind, 'reencode');
+  assert.strictEqual(second[0].start, 4.1, '入点仍是用户选的，绝不前移吞段');
+  assert.ok(second[0].codecChange, '自检要按「编码为重编码所选」判定');
+  assert.ok(warnings.some((w) => /带回已删|整段重编码/.test(w)), warnings.join('、'));
+});
+
+test('吸附：入点之前没有任何关键帧时从 0 开始，note 说明多带了开头', () => {
+  const { plan, warnings } = buildPlan([{ start: 1.5, end: 3 }], { keyframes: [2, 4], duration: 10, precise: false });
+  assertPlan(plan, [['copy', 0, 3]]);
+  assert.match(plan[0].note, /从 0 开始/);
+  assert.ok(plan[0].note.includes('1.500s'), 'note 里写明多带多少');
+  assert.strictEqual(warnings.length, 0, '从 0 起是唯一可行解，不算吸附偏差（首段无 prevEnd 可跨）');
+});
+
+test('吸附：相邻区间各自吸附后由 dedupePlan 合成一段（同类型吸收）', () => {
+  // [1.2,2] 吸附到 0（首段不跨界），[2.2,3] 吸附到 2（2 不小于前段出点 2，不跨界）
+  // 两段首尾相接 → dedupe 同类型吸收为 copy[0,3]
+  const { plan } = buildPlan([{ start: 1.2, end: 2 }, { start: 2.2, end: 3 }], SNAP);
+  assertPlan(plan, [['copy', 0, 3]]);
+  assert.strictEqual(plan[0].keepEnd, 3, '合并段的 keepEnd 取最大');
+});

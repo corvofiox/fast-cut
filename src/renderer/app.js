@@ -783,6 +783,7 @@ async function runPlan() {
       file: state.src.file,
       segments: state.clips.map((c) => ({ start: c.start, end: c.end })),
       container: containerChoice(),
+      precise: isPreciseMode(),
     });
   } catch (err) {
     showError(cleanErr(err));
@@ -791,6 +792,12 @@ async function runPlan() {
   renderClips();
   updateEstimate();
   updateExportEnabled();
+}
+
+/** 导出模态的「精确模式」勾选：默认不勾 = 吸附关键帧整段流拷贝。 */
+function isPreciseMode() {
+  const box = $('optPrecise');
+  return box ? box.checked : true;
 }
 
 function renderClips() {
@@ -861,6 +868,20 @@ function updateEstimate() {
   const headN = countCost('head');
   const wholeN = countCost('whole');
   const codecN = countCost('codec');
+  const autoN = (() => {
+    const list = Array.isArray(parts) ? parts : [];
+    return new Set(list.filter((p) => p.autoPrecise).map((p) => p.keepIndex)).size;
+  })();
+  const snapN = (() => {
+    const list = Array.isArray(parts) ? parts : [];
+    return new Set(list.filter((p) => p.kind === 'copy' && p.role === 'whole' && /前移到关键帧|从 0 开始/.test(p.note || '')).map((p) => p.keepIndex)).size;
+  })();
+  if (!isPreciseMode()) {
+    // 吸附模式的预估：把"多带了什么"如实列出
+    const extra = (Array.isArray(parts) ? parts : []).reduce((a, p) => a + Math.max(0, (p.snapFrom != null ? p.snapFrom - p.start : 0)), 0);
+    if (extra > 0.05) lines.push(`⚠ 吸附关键帧：会多带开头共 ${extra.toFixed(3)}s（切点对准 GOP 边界可避免，或勾「精确模式」）`);
+    if (autoN) lines.push(`✂ ${autoN} 段吸附会吞掉已删的间隙：已自动改为局部精确（入点小段重编码）`);
+  }
   if (headN) lines.push(`✂ ${headN} 段入点那一小段重编码：其余仍流拷贝`);
   if (wholeN) lines.push(`✂ ${wholeN} 段整段在同一个 GOP 内：有损重编码`);
   const srcCodec = state.src.media.video && state.src.media.video.codec;
@@ -925,6 +946,7 @@ async function runExport() {
     outDir: $('outDir').value,
     baseName: $('outName').value,
     split: $('optSplit').checked,
+    precise: isPreciseMode(),
     container: containerChoice(),
   };
 
@@ -969,7 +991,7 @@ function setBusy(busy) {
   $('btnExport').classList.toggle('hidden', busy);
   $('btnCancelExport').classList.toggle('hidden', !busy);
   $('btnImportEmpty').disabled = busy;
-  for (const id of ['optSplit', 'outName', 'outContainer', 'btnChooseDir']) $(id).disabled = busy;
+  for (const id of ['optPrecise', 'optSplit', 'outName', 'outContainer', 'btnChooseDir']) $(id).disabled = busy;
   updateToolButtons();
   updateExportEnabled();
 }
@@ -1329,6 +1351,13 @@ function bindUi() {
   $('outName').addEventListener('input', updateExportEnabled);
 
   $('optSplit').addEventListener('change', () => {
+    syncTimeline(false);
+    refreshPlan();
+  });
+
+  $('optPrecise').addEventListener('change', () => {
+    // 勾选框行染警告黄（唯一"勾上就有代价"的选项），并按新模式重算计划与预估
+    $('optPrecise').closest('.m-row').classList.toggle('on', $('optPrecise').checked);
     syncTimeline(false);
     refreshPlan();
   });

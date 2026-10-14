@@ -113,6 +113,8 @@ function planFor(loaded, segments, opts = {}) {
     sameCodec: keepsSourceCodec(loaded.media),
     // VFR 源帧长不均匀，按帧数切出来的时长与音频对不上：只能整段重编码成定帧率
     forceReencode: !!loaded.media.video?.vfr,
+    // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
+    precise: opts.precise !== false,
   });
   const keepSecs = opts.ordered
     ? snap(keeps.reduce((acc, k) => acc + (k.end - k.start), 0))
@@ -145,11 +147,11 @@ async function exportSegments(loaded, segments, opts) {
   const { file, media, bins } = loaded;
   const {
     outPath, split = false, crf = 18, ordered = false,
-    dropSubtitles = false, container = null,
+    precise = true, dropSubtitles = false, container = null,
     onProgress = () => {}, token = createToken(),
   } = opts;
 
-  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, dropSubtitles });
+  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, precise, dropSubtitles });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
 

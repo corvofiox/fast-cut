@@ -51,7 +51,7 @@ function frameIndex(t, fps, origin = 0) {
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false } = opts;
+  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   const bdepth = Math.max(0, Number(reorderDepth) || 0);
   // 帧网格原点：源首帧 pts 不一定落在 0（实测 HEVC 的 .mp4/.mkv 首帧 pts = 0.023，
@@ -114,6 +114,10 @@ function buildPlan(keeps, opts) {
       warnings.push(`区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 不足一帧，已忽略`);
       continue;
     }
+    // 吸附模式跨界自动降级标记：本条保留区间走了"局部精确"兜底时置位，
+    // 下面精确路径推出的段会带上 autoPrecise 与说明前缀（供 UI 区分"用户勾的"和"自动的"）。
+    let autoDegrade = false;
+    let autoNote = '';
 
     /**
      * 可变帧率源：帧长本身就不均匀，"按帧数切"出来的时长和音频对不上
@@ -131,6 +135,65 @@ function buildPlan(keeps, opts) {
         note: '源是可变帧率：按帧数切不准，整段重编码为定帧率（有损）',
       });
       continue;
+    }
+
+    /**
+     * 吸附模式（precise=false）：入点前移到 ≤ 它的最后一个关键帧，整段流拷贝。
+     * 防吞钳制（当年 cc1ff73 的核心教训）：回溯**跨过上一条保留段的出点** = 把用户
+     * 删掉的间隙吞回产物（实测 98 分钟 .mkv：删 1.9s，产物是整部片）。所以跨界时
+     * 无论能否同编码都**自动降级**：能同编码 → 局部精确（autoPrecise）；
+     * 不能（mpeg4/mjpeg…）→ 整段重编码（不混拼）。
+     * 只有入点本来就在关键帧上（吸附零代价）时才允许照旧拷贝。
+     */
+    if (!precise) {
+      const kfStart = lastKeyframeAtMost(keep.start, keyframes);
+      const snapStart = kfStart === null ? 0 : kfStart;
+      const prevEnd = ki > 0 ? keeps[ki - 1].end : null;
+      const crosses = snapStart < start - EPS && prevEnd != null && snapStart < prevEnd - EPS;
+      if (crosses && sameCodec) {
+        warnings.push(
+          `关键帧间隔比剪辑粒度粗（入点回溯到 ${snapStart.toFixed(3)}s，会吃掉已删的 ${(prevEnd - snapStart).toFixed(3)}s）：这一段已自动改为局部精确（入点一小段重编码，其余仍流拷贝）`,
+        );
+        // 落下去走下面的局部精确分支，并打上自动降级标记
+        autoDegrade = true;
+        autoNote = '关键帧比剪辑粒度粗，自动局部精确';
+      } else if (crosses) {
+        warnings.push(
+          `关键帧间隔比剪辑粒度粗：入点回溯到 ${snapStart.toFixed(3)}s 会带回已删的 ${(prevEnd - snapStart).toFixed(3)}s；`
+          + '源编码没有同编码重编码器，这一段整段重编码（不混拼）',
+        );
+        plan.push({
+          kind: 'reencode', role: 'whole', start, duration: wholeDur,
+          snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, codecChange: true,
+          note: '吸附会吞掉已删的间隙，且源编码没有同编码重编码器：整段重编码（编码改变）',
+        });
+        continue;
+      } else {
+        const snapDur = span(snapStart, end);
+        if (snapDur > EPS) {
+          const part = copyPart(snapStart, end);
+          if (part.duration > EPS) {
+            plan.push({
+              kind: 'copy', role: 'whole', start: snapStart, duration: part.duration, frames: part.frames,
+              snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
+              note: kfStart === null
+                ? `入点之前没有关键帧，从 0 开始（多 ${keep.start.toFixed(3)}s 内容）`
+                : snapStart < keep.start - EPS
+                  ? `入点前移到关键帧 ${snapStart.toFixed(3)}s（多带 ${(keep.start - snapStart).toFixed(3)}s）`
+                  : '整段流拷贝（不转码）',
+            });
+          } else {
+            plan.push({
+              kind: 'reencode', role: 'whole', start, duration: wholeDur,
+              snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
+              note: '区间比双向预测的重排窗口还短，流拷贝切不干净：整段重编码（有损）',
+            });
+          }
+          continue;
+        }
+        warnings.push(`区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 与关键帧对齐后为空，已忽略`);
+        continue;
+      }
     }
 
     // 入点落在 GOP 中间：需要重编码入点那一小段才能从任意时刻起；其余仍流拷贝。
@@ -185,7 +248,9 @@ function buildPlan(keeps, opts) {
       plan.push({
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
         snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
-        note: '入点不在关键帧上，这一段落在一个 GOP 内（后面没有可接续的关键帧）：整段重编码（有损）',
+        autoPrecise: autoDegrade || undefined,
+        note: autoDegrade ? `${autoNote} · 区间落在一个 GOP 内，整段重编码（有损）`
+          : '入点不在关键帧上，这一段落在一个 GOP 内（后面没有可接续的关键帧）：整段重编码（有损）',
       });
       continue;
     }
@@ -207,12 +272,15 @@ function buildPlan(keeps, opts) {
 
     plan.push({
       kind: 'reencode', role: 'head', start, duration: head,
-      snapFrom: keep.start, keepEnd: keep.end, note: '入点小段重编码',
+      snapFrom: keep.start, keepEnd: keep.end,
+      autoPrecise: autoDegrade || undefined,
+      note: autoDegrade ? `${autoNote} · 入点小段重编码` : '入点小段重编码',
     });
     plan.push({
       kind: 'copy', role: 'tail', start: kfHead, duration: tailPart.duration, frames: tailPart.frames,
       snapFrom: keep.start, keepEnd: keep.end, actualEnd: keep.end, trimmed: tailPart.trimmed,
-      note: `入点重编码 ${head.toFixed(3)}s，其余流拷贝`,
+      autoPrecise: autoDegrade || undefined,
+      note: autoDegrade ? `${autoNote} · 其余流拷贝` : `入点重编码 ${head.toFixed(3)}s，其余流拷贝`,
     });
     // 上面两段属于同一条保留区间，统一打标，上层按 keepIndex 分组才能"每条区间一个文件"
     plan[plan.length - 2].keepIndex = ki;
@@ -264,6 +332,16 @@ function firstKeyframeAtLeast(t, keyframes) {
     if (k >= t - KEY_TOL) return k;
   }
   return null;
+}
+
+/** ≤ t 的最后一个关键帧（keyframes 已升序；没有则 null）。吸附模式用。 */
+function lastKeyframeAtMost(t, keyframes) {
+  let best = null;
+  for (const k of keyframes) {
+    if (k <= t + KEY_TOL) best = k;
+    else break; // keyframes 已升序
+  }
+  return best;
 }
 
 /**
@@ -324,4 +402,4 @@ function dedupePlan(plan) {
   return out.filter((p) => p.duration > EPS);
 }
 
-module.exports = { buildPlan, frameStart };
+module.exports = { buildPlan, frameStart, lastKeyframeAtMost };
