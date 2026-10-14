@@ -154,6 +154,8 @@ function snapMap() {
   const map = {};
   for (const p of parts) {
     if (p.keepIndex == null || map[p.keepIndex] != null) continue;
+    // copy 段吸附后起点可能早于用户入点（多带开头）；reencode 段起点就是用户入点。
+    // timeline 的多带可视化按"实际导出起点 < 片段源起点"判定，直接给 start 即可。
     map[p.keepIndex] = p.start;
   }
   return map;
@@ -776,20 +778,26 @@ function refreshPlan() {
   planTimer = setTimeout(runPlan, 120);
 }
 
+let planSeq = 0;              // 计划请求代序：勾选切模式时防旧响应覆盖新计划（乱序完成时后者胜）
 async function runPlan() {
   if (!state.src || !state.clips.length) return;
+  const seq = ++planSeq;
   try {
-    state.plan = await window.fc.previewPlan({
+    const plan = await window.fc.previewPlan({
       file: state.src.file,
       segments: state.clips.map((c) => ({ start: c.start, end: c.end })),
       container: containerChoice(),
       precise: isPreciseMode(),
     });
+    if (seq !== planSeq) return;   // 已有更新的请求在路上，这份过期了
+    state.plan = plan;
   } catch (err) {
     showError(cleanErr(err));
     return;
   }
-  renderClips();
+  // 新计划必须推进时间轴：snapMap 变了（吸附差/自动降级角标都随模式变），
+  // 只刷列表 DOM 的话 tl 的 snapInfo 还是旧计划的——多带可视化与角标全踩旧数据
+  syncTimeline(false);
   updateEstimate();
   updateExportEnabled();
 }
@@ -1477,7 +1485,12 @@ window.__smoke = {
   programTotal,
   keptSeconds,
   runExport,
-  setOption(id, on) { $(id).checked = !!on; $(id).dispatchEvent(new Event('change')); },
+  setOption(id, on) {
+    const el = $(id);
+    el.checked = !!on;
+    // 无论值是否变化都发 change：调用方（如 smoke）切回同一个值时同样需要重算计划
+    el.dispatchEvent(new Event('change'));
+  },
   setOut(dir, name) { $('outDir').value = dir; $('outName').value = name; updateExportEnabled(); },
   setContainer(id) { $('outContainer').value = id; $('outContainer').dispatchEvent(new Event('change')); },
   ready: () => !!window.fc && !!tl,

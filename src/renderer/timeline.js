@@ -55,6 +55,8 @@ function createTimeline(options) {
   let levels = new Map();          // step -> { step, dir, imgs: Map<格号, Image> }，按缩放动态抽的层级
   let filmSig = '';                // 上一次向主进程要的是哪一档，避免自问自答
   let filmDrawn = 0;               // 最近一次 render 实际画了几格，给自检用
+  let snapExtraInfo = { count: 0, px: 0 };   // 最近一次画的多带延伸块：块数与总宽，给自检用
+  let renderSeq = 0;               // render 计数：自检等"新计划已渲染"用
   let filmStats = { step: null, cells: 0, minCell: 0, maxCell: 0, maxScale: 0 };
   let rulerInfo = { step: 0, labels: [] };   // 最近一次刻度尺画了什么，给自检用
   let reorder = null;              // { from, to } 正在拖哪一段、要插到哪
@@ -201,15 +203,48 @@ function createTimeline(options) {
 
   function render() {
     const { w } = resize();
+    renderSeq++;
     ctx.clearRect(0, 0, w, root.clientHeight);
     drawRuler();
     drawFilm();
     drawKeyframeTicks();      // tick 现在画在胶片底边上，必须压在胶片之上
+    drawSnapExtra();          // 吸附多带的区间：半透明延伸块，压在胶片上、片段块之下
     drawBlocks();
     drawCaret();
     drawPlayhead();
     drawScrollbar();
     askFilm();
+  }
+
+  /**
+   * 吸附模式的多带可视化：每条片段若被吸附前移（snapInfo[i] < 片段源起点），
+   * 在它的左侧画一个半透明块，宽度 = 多带的秒数在成片时间轴上的长度。
+   * 数据全部来自真实切割计划（snapInfo ← snapMap ← planFor），不前端另算。
+   * 精确模式（无吸附差）下这块自然消失。
+   */
+  function drawSnapExtra() {
+    snapExtraInfo = { count: 0, px: 0 };
+    if (!snapInfo || !clips.length) return;
+    const x0 = Math.max(0, tToX(view.t0));
+    const x1 = Math.min(width(), tToX(view.t1));
+    for (let i = 0; i < clips.length; i++) {
+      const s = snapInfo[i];
+      if (!s) continue;
+      const c = clips[i];
+      const extra = c.start - s;
+      if (extra <= 0.001) continue;
+      const px = extra * pxPerSec();
+      const right = tToX(c.ps);
+      const left = right - px;
+      if (right < x0 || left > x1) continue;   // 视口外不画
+      ctx.fillStyle = 'rgba(127, 211, 163, 0.28)';
+      ctx.fillRect(left, LANE_TOP, px, LANE_H);
+      ctx.fillStyle = 'rgba(127, 211, 163, 0.85)';
+      // 左缘一条 1px 竖线标出"真正的导出起点"
+      ctx.fillRect(Math.round(left) + 0.5, LANE_TOP, 1, LANE_H);
+      snapExtraInfo.count++;
+      snapExtraInfo.px += px;
+    }
   }
 
   /** 缩放/平移换了档位就通知上层去要那一档的格子；签名不变时什么都不做。 */
@@ -837,6 +872,8 @@ function createTimeline(options) {
     },
     get clips() { return clips.map((c) => ({ ...c })); },
     get filmDraws() { return filmDrawn; },
+    get snapExtras() { return { ...snapExtraInfo }; },
+    get renderSeq() { return renderSeq; },
     get ruler() { return { ...rulerInfo, labels: rulerInfo.labels.slice() }; },
     get total() { return total; },
   };

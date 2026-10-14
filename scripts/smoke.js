@@ -753,6 +753,31 @@ async function main() {
   await js(win, `__smoke.setOption('optPrecise', false); 'ok'`);
   await wait(250);
 
+  // 9-snap-viz) 吸附多带可视化：吸附模式下时间轴画出半透明延伸块，精确模式下消失。
+  // 直接断言 timeline 暴露的绘制统计（比读像素稳：胶片缩略图本身含绿色内容）。
+  // refreshPlan 是异步的（120ms debounce + IPC 往返），必须等"新计划已到且已重渲染"
+  // 再读 snapExtras，否则读到的是上一模式的渲染（renderSeq 不变 = 还没重画）。
+  const waitPlanMode = async (precise) => {
+    const seq0 = await js(win, '__smoke.tl.renderSeq');
+    const ok = await waitFor(
+      `__smoke.state.plan && __smoke.state.plan.precise === ${precise} && __smoke.tl.renderSeq > ${seq0}`, win, 8000);
+    if (!ok) {
+      const diag = await js(win, `JSON.stringify({ planP: __smoke.state.plan && __smoke.state.plan.precise, box: document.getElementById('optPrecise').checked, seq: __smoke.tl.renderSeq, seq0: ${seq0} })`);
+      throw new Error(`等待计划切到 precise=${precise} 超时 · 现场 ${diag}`);
+    }
+  };
+
+  await js(win, `__smoke.setOption('optPrecise', false); 'ok'`);
+  await waitPlanMode(false);
+  const viz = JSON.parse(await js(win, 'JSON.stringify(__smoke.tl.snapExtras)'));
+  check('吸附模式：时间轴画出"多带"延伸块', viz.count > 0 && viz.px > 4,
+    `${viz.count} 块 · 总宽 ${viz.px.toFixed(0)}px`);
+  await js(win, `__smoke.setOption('optPrecise', true); 'ok'`);
+  await waitPlanMode(true);
+  const viz2 = JSON.parse(await js(win, 'JSON.stringify(__smoke.tl.snapExtras)'));
+  check('精确模式：延伸块消失', viz2.count === 0 && viz2.px === 0,
+    `${viz2.count} 块 · 总宽 ${viz2.px.toFixed(0)}px`);
+
   // 9a) 用真实指针拖胶片：改顺序，且绝不移动播放头
   const orderBefore = JSON.parse(await js(win, 'JSON.stringify(__smoke.state.clips.map((c) => c.start + "-" + c.end))'));
   const filmDrag = JSON.parse(await js(win, '__t.dragFilm(1, 7).then((r) => JSON.stringify(r))'));

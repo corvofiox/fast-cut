@@ -139,27 +139,38 @@ function buildPlan(keeps, opts) {
 
     /**
      * 吸附模式（precise=false）：入点前移到 ≤ 它的最后一个关键帧，整段流拷贝。
-     * 防吞钳制（当年 cc1ff73 的核心教训）：回溯**跨过上一条保留段的出点** = 把用户
-     * 删掉的间隙吞回产物（实测 98 分钟 .mkv：删 1.9s，产物是整部片）。所以跨界时
-     * 无论能否同编码都**自动降级**：能同编码 → 局部精确（autoPrecise）；
-     * 不能（mpeg4/mjpeg…）→ 整段重编码（不混拼）。
-     * 只有入点本来就在关键帧上（吸附零代价）时才允许照旧拷贝。
+     *
+     * 两道钳制，任何一道触发都自动降级（能同编码 → autoPrecise 局部精确；
+     * 不能（mpeg4/mjpeg…）→ 整段重编码不混拼）：
+     *
+     * 1. **防吞**（cc1ff73 的教训，98 分钟 .mkv：删 1.9s 产物是整部片）：回溯跨过
+     *    【已排段的源出点】= 把用户删掉的间隙吞回产物。判据不是"数组里上一条"——
+     * 乱序导出（用户拖过顺序）时数组相邻 ≠ 源相邻，必须查**所有已排拷贝段**；
+     * 2. **防重叠**（乱序专属，cc1ff73 就有、自检因"计划自身含重复帧"拦不住）：
+     *    两条保留区间的吸附拷贝段可能在源上互相重叠（如 [6,10] 与 [2,8]），
+     *    concat 会把同一画面导出两遍。处理：吸附起点钳到重叠段右界后的第一个关键帧
+     *    （保住流拷贝）；钳不动才整段重编码。
      */
     if (!precise) {
       const kfStart = lastKeyframeAtMost(keep.start, keyframes);
       const snapStart = kfStart === null ? 0 : kfStart;
-      const prevEnd = ki > 0 ? keeps[ki - 1].end : null;
-      const crosses = snapStart < start - EPS && prevEnd != null && snapStart < prevEnd - EPS;
+      // 已排【计划段】（源时间轴上的实际拷贝范围，含前几条吸附扩出来的部分）：
+      // 本段吸附拷贝 [snapStart, end) 若与它们交叠 = 吞已删内容或重复导出。
+      // 对照 keeps 原始区间是错的——乱序下吸附扩出来的 [6,10] 不在任何 keep 源区间里。
+      const placedCopy = plan.filter((p) => p.kind === 'copy');
+      // 防吞：吸附起点落进某条已排拷贝段的内部（真回溯吃内容，关键帧对齐时无代价无所谓）
+      const swallow = placedCopy.find((p) => snapStart > p.start + EPS && snapStart < p.start + p.duration - EPS);
+      const crosses = swallow != null && snapStart < start - EPS;
       if (crosses && sameCodec) {
         warnings.push(
-          `关键帧间隔比剪辑粒度粗（入点回溯到 ${snapStart.toFixed(3)}s，会吃掉已删的 ${(prevEnd - snapStart).toFixed(3)}s）：这一段已自动改为局部精确（入点一小段重编码，其余仍流拷贝）`,
+          `关键帧间隔比剪辑粒度粗（入点回溯到 ${snapStart.toFixed(3)}s，会吃掉已删的 ${(swallow.start + swallow.duration - snapStart).toFixed(3)}s）：这一段已自动改为局部精确（入点一小段重编码，其余仍流拷贝）`,
         );
         // 落下去走下面的局部精确分支，并打上自动降级标记
         autoDegrade = true;
         autoNote = '关键帧比剪辑粒度粗，自动局部精确';
       } else if (crosses) {
         warnings.push(
-          `关键帧间隔比剪辑粒度粗：入点回溯到 ${snapStart.toFixed(3)}s 会带回已删的 ${(prevEnd - snapStart).toFixed(3)}s；`
+          `关键帧间隔比剪辑粒度粗：入点回溯到 ${snapStart.toFixed(3)}s 会带回已删的 ${(swallow.start + swallow.duration - snapStart).toFixed(3)}s；`
           + '源编码没有同编码重编码器，这一段整段重编码（不混拼）',
         );
         plan.push({
@@ -169,30 +180,67 @@ function buildPlan(keeps, opts) {
         });
         continue;
       } else {
-        const snapDur = span(snapStart, end);
-        if (snapDur > EPS) {
-          const part = copyPart(snapStart, end);
-          if (part.duration > EPS) {
-            plan.push({
-              kind: 'copy', role: 'whole', start: snapStart, duration: part.duration, frames: part.frames,
-              snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
-              note: kfStart === null
-                ? `入点之前没有关键帧，从 0 开始（多 ${keep.start.toFixed(3)}s 内容）`
-                : snapStart < keep.start - EPS
-                  ? `入点前移到关键帧 ${snapStart.toFixed(3)}s（多带 ${(keep.start - snapStart).toFixed(3)}s）`
-                  : '整段流拷贝（不转码）',
-            });
-          } else {
-            plan.push({
-              kind: 'reencode', role: 'whole', start, duration: wholeDur,
-              snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
-              note: '区间比双向预测的重排窗口还短，流拷贝切不干净：整段重编码（有损）',
-            });
+        // 防重叠：吸附拷贝段 [snapStart, end) 与已排拷贝段真重叠（相接不算）——
+        // concat 会把同一画面导出两遍，且"帧数符合计划"的自检拦不住（计划自身就含重复）。
+        // 处理：吸附起点**钳到已排重叠段右界之后的第一个关键帧**——既保住流拷贝，又无重叠；
+        // 钳完已越过出点、或没有更晚的关键帧（或换编码源不能混拼）时才整段重编码。
+        // （只降级"局部精确"不够：精确路径的拷贝尾段仍会与已排段重叠，实测 copy[6,8] ⊂ copy[6,10]。）
+        const overlap = placedCopy.find((p) => Math.min(p.start + p.duration, end) - Math.max(p.start, snapStart) > EPS);
+        if (overlap) {
+          const right = overlap.start + overlap.duration;
+          const clamped = sameCodec ? firstKeyframeAtLeast(right + EPS, keyframes) : null;
+          if (clamped !== null && clamped < end - EPS) {
+            const part = copyPart(clamped, end);
+            if (part.duration > EPS) {
+              warnings.push(
+                `吸附会与另一段的拷贝段在源上重叠（原回溯到 ${snapStart.toFixed(3)}s，与 [${overlap.start.toFixed(3)}–${right.toFixed(3)}] 交叠）：本段吸附起点钳到关键帧 ${clamped.toFixed(3)}s（少 ${(clamped - keep.start).toFixed(3)}s 片段开头）`,
+              );
+              plan.push({
+                kind: 'copy', role: 'whole', start: clamped, duration: part.duration, frames: part.frames,
+                snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
+                autoPrecise: true,
+                note: `吸附避开重叠：从关键帧 ${clamped.toFixed(3)}s 起（少 ${(clamped - keep.start).toFixed(3)}s 片段开头）`,
+              });
+              continue;
+            }
           }
+          warnings.push(
+            `吸附会让拷贝段在源上重叠（回溯到 ${snapStart.toFixed(3)}s 与 [${overlap.start.toFixed(3)}–${right.toFixed(3)}] 交叠），且无法避开`
+              + (sameCodec ? '：这一段整段重编码' : '；源编码没有同编码重编码器，整段重编码（不混拼）'),
+          );
+          plan.push({
+            kind: 'reencode', role: 'whole', start, duration: wholeDur,
+            snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, autoPrecise: true,
+            codecChange: !sameCodec || undefined,
+            note: '吸附拷贝段源区间重叠且无法避开：整段重编码（' + (sameCodec ? '同编码' : '编码改变，不混拼') + '）',
+          });
+          continue;
+        } else {
+          const snapDur = span(snapStart, end);
+          if (snapDur > EPS) {
+            const part = copyPart(snapStart, end);
+            if (part.duration > EPS) {
+              plan.push({
+                kind: 'copy', role: 'whole', start: snapStart, duration: part.duration, frames: part.frames,
+                snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
+                note: kfStart === null
+                  ? `入点之前没有关键帧，从 0 开始（多 ${keep.start.toFixed(3)}s 内容）`
+                  : snapStart < keep.start - EPS
+                    ? `入点前移到关键帧 ${snapStart.toFixed(3)}s（多带 ${(keep.start - snapStart).toFixed(3)}s）`
+                    : '整段流拷贝（不转码）',
+              });
+            } else {
+              plan.push({
+                kind: 'reencode', role: 'whole', start, duration: wholeDur,
+                snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
+                note: '区间比双向预测的重排窗口还短，流拷贝切不干净：整段重编码（有损）',
+              });
+            }
+            continue;
+          }
+          warnings.push(`区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 与关键帧对齐后为空，已忽略`);
           continue;
         }
-        warnings.push(`区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 与关键帧对齐后为空，已忽略`);
-        continue;
       }
     }
 
@@ -326,22 +374,26 @@ function frameStart(t, fps, origin = 0) {
   return o + Math.max(0, frameIndex(t, f, o)) / f;
 }
 
-/** ≥ t 的第一个关键帧（keyframes 已升序；没有则 null）。 */
+/** ≥ t 的第一个关键帧（keyframes 已升序；没有则 null）。二分：长素材关键帧表上万条时 O(log n)。 */
 function firstKeyframeAtLeast(t, keyframes) {
-  for (const k of keyframes) {
-    if (k >= t - KEY_TOL) return k;
+  let lo = 0, hi = keyframes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (keyframes[mid] < t - KEY_TOL) lo = mid + 1;
+    else hi = mid;
   }
-  return null;
+  return lo < keyframes.length ? keyframes[lo] : null;
 }
 
-/** ≤ t 的最后一个关键帧（keyframes 已升序；没有则 null）。吸附模式用。 */
+/** ≤ t 的最后一个关键帧（keyframes 已升序；没有则 null）。吸附模式用。二分。 */
 function lastKeyframeAtMost(t, keyframes) {
-  let best = null;
-  for (const k of keyframes) {
-    if (k <= t + KEY_TOL) best = k;
-    else break; // keyframes 已升序
+  let lo = 0, hi = keyframes.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (keyframes[mid] <= t + KEY_TOL) lo = mid + 1;
+    else hi = mid;
   }
-  return best;
+  return lo > 0 ? keyframes[lo - 1] : null;
 }
 
 /**

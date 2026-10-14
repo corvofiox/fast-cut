@@ -378,6 +378,8 @@ function previewPlan(payload) {
   });
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
+    // 回显本次计划用的切割模式：smoke 等它一致后再读时间轴的绘制统计，避免读到旧渲染
+    precise: payload.precise === undefined ? true : !!payload.precise,
     // 字幕怎么办，界面要提前说：SRT/ASS 这类文本字幕重新计时；其余（位图、mov_text 等）重排不了（自检会拦）
     subtitleMode: (() => {
       const subs = loaded.media.subtitleCodecs || [];

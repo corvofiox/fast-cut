@@ -272,8 +272,10 @@ test('吸附：入点正好在关键帧上 = 与精确模式同一条 copy 段',
   assertPlan(plan, [['copy', 4, 2]]);
 });
 
-test('吸附防吞钳制：回溯会跨过上一段出点时，自动降级为局部精确，绝不吞掉已删素材', () => {
-  // 整片只有一个关键帧（12s GOP 的形状）：每条非首段的吸附都会回溯到 0，跨过所有出点
+test('吸附防吞钳制：回溯会吞已排段的内容时，该段整段重编码，绝不吞掉已删素材', () => {
+  // 整片只有一个关键帧（12s GOP 的形状）：每条非首段的吸附都会回溯到 0，与已排拷贝段重叠。
+  // 语义修正（2026-10-14）：这种情况只降级"局部精确"不够——精确路径的拷贝尾段仍与
+  // 已排拷贝段重叠（copy[6,8] ⊂ copy[6,10] 实测），所以重叠侧必须整段重编码。
   const { plan, warnings } = buildPlan(
     [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8, end: 9.5 }],
     { keyframes: [0], duration: 10, fps: 30, precise: false },
@@ -283,7 +285,28 @@ test('吸附防吞钳制：回溯会跨过上一段出点时，自动降级为�
   assert.strictEqual(plan[1].start, 4.1, '后两段的入点必须精确，绝不前移');
   assert.strictEqual(plan[2].start, 8);
   assert.ok(plan[1].autoPrecise && plan[2].autoPrecise);
-  assert.ok(warnings.some((w) => /自动.*局部精确/.test(w) && /吃掉已删/.test(w)), warnings.join('、'));
+  // 拷贝段两两不重叠（防吞+防重叠的合成不变式）
+  const cp = plan.filter((p) => p.kind === 'copy');
+  for (let i = 0; i < cp.length; i++) for (let j = i + 1; j < cp.length; j++) {
+    const ov = Math.min(cp[i].start + cp[i].duration, cp[j].start + cp[j].duration) - Math.max(cp[i].start, cp[j].start);
+    assert.ok(ov <= 1e-6, `拷贝段 ${i}/${j} 重叠 ${ov}s`);
+  }
+  assert.ok(warnings.some((w) => /整段重编码/.test(w) && /交叠/.test(w)), warnings.join('、'));
+});
+
+test('吸附防重叠：乱序下吸附拷贝段与已排拷贝段重叠时整段重编码，重叠归零', () => {
+  // 旧版缺陷用例：拖乱顺序 + 吸附 → copy[6,10] 与 copy[2,8] 重复 2s（自检拦不住）
+  const { plan, warnings } = buildPlan(
+    [{ start: 9, end: 10 }, { start: 0, end: 2 }, { start: 5, end: 8 }],
+    { keyframes: [0, 2, 6], duration: 10, fps: 30, precise: false, ordered: true },
+  );
+  const cp = plan.filter((p) => p.kind === 'copy');
+  for (let i = 0; i < cp.length; i++) for (let j = i + 1; j < cp.length; j++) {
+    const ov = Math.min(cp[i].start + cp[i].duration, cp[j].start + cp[j].duration) - Math.max(cp[i].start, cp[j].start);
+    assert.ok(ov <= 1e-6, `拷贝段 ${i}/${j} 重叠 ${ov}s`);
+  }
+  assert.ok(plan.some((p) => p.keepIndex === 2 && p.kind === 'reencode'), '重叠段必须重编码');
+  assert.ok(warnings.some((w) => /交叠/.test(w)), warnings.join('、'));
 });
 
 test('吸附防吞钳制（换编码源）：跨界时整段重编码，不混拼也不吞', () => {
