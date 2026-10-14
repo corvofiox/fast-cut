@@ -938,7 +938,9 @@ function updateExportEnabled() {
             : !$('outDir').value ? '先选择导出目录'
               : state.busy ? '导出进行中' : '';
   $('btnExport').disabled = !!why;
-  $('btnExport').title = why || '剪辑位置精确到帧：入点不回溯，拷贝段整段流拷贝';
+  $('btnExport').title = why || (isPreciseMode()
+    ? '精确模式：剪辑位置精确到帧，入点不回溯，拷贝段整段流拷贝'
+    : '吸附模式（默认）：切点前移到最近关键帧，整段流拷贝、零重编码');
 }
 
 // ---------------------------------------------------------------- 导出

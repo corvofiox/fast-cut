@@ -468,7 +468,8 @@ async function startExport(win, payload) {
     throw new Error('关键帧还没扫完，稍等一下再导出');
   }
   const split = !!payload.split;
-  // 吸附（precise=false）与精确（precise=true，默认）两种切割模式；行数按同一套计划算
+  // 吸附（precise=false，应用层默认）与精确（precise=true，本层与 core 的缺省）两种切割模式；
+  // 行数按同一套计划算。渲染层每次都显式发 precise，这里的缺省只服务脚本/无 UI 调用。
   const precise = payload.precise === undefined ? true : !!payload.precise;
   const targets = targetsFor(loaded, segments, outPath, ext, split, target.dropSubtitles, precise);
   assertNotOverwrite(abs, targets);
@@ -646,7 +647,7 @@ function registerIpc(getWindow) {
     type: 'info',
     title: 'Fast Cut',
     message: 'Fast Cut v0.1',
-    detail: '只做裁剪的极简视频工具：剪辑位置精确到帧，能不重编码的段一律流拷贝；不上传、不写源文件。',
+    detail: '只做裁剪的极简视频工具：默认吸附关键帧、整段流拷贝（零损失）；勾选「精确模式」则切点逐帧精确，只在不得不编的入点小段重编码。不上传、不写源文件。',
     buttons: ['知道了'],
   }));
   ipcMain.handle('fc:app:quit', () => app.quit());
