@@ -544,23 +544,75 @@ async function main() {
   await js(win, '__smoke.resetClips(); "ok"');
   await wait(250);
 
-  // 8b) J/K/L 变速播放
-  await js(win, '__smoke.seekProgram(0); __smoke.stepRate(1); "ok"');
+  // 8b) J/K/L 走带：L 正放逐档加快，J 倒带逐档加快，Shift+L 慢放，Shift+J 慢倒，K 停并复位
+  await js(win, '__smoke.seekProgram(0); __smoke.stepRate(1, false); "ok"');
   await wait(450);
   const r1 = JSON.parse(await js(win,
     'JSON.stringify({ rate: __smoke.state.rate, paused: document.getElementById("player").paused, tag: document.getElementById("rateTag").textContent })'));
-  await js(win, '__smoke.stepRate(1); __smoke.stepRate(1); "ok"');
+  await js(win, '__smoke.stepRate(1, false); __smoke.stepRate(1, false); "ok"');
   await wait(300);
   const rUp = JSON.parse(await js(win, 'JSON.stringify({ rate: __smoke.state.rate, tag: document.getElementById("rateTag").textContent })'));
-  await js(win, '__smoke.stepRate(-1); __smoke.stepRate(-1); "ok"');
-  await wait(300);
-  const rDown = await js(win, '__smoke.state.rate');
+  check('L 正放并逐档加快', r1.rate === 1 && !r1.paused && rUp.rate === 4 && rUp.tag === '4×',
+    `1× → 2× → ${rUp.rate}×，速率标记 "${rUp.tag}"`);
+
+  // 快进到 16× 封顶，再按要报"已经是最快"
+  await js(win, '__smoke.stepRate(1, false); __smoke.stepRate(1, false); __smoke.stepRate(1, false); "ok"');
+  await wait(200);
+  const rMax = await js(win, '__smoke.state.rate');
+  check('快进封顶 16×', rMax === 16, `顶到 ${rMax}×`);
+
+  // 反向切档：正在 16× 正放时按 J，必须从 -1× 起倒，而不是一下跳到 -16×
+  await js(win, '__smoke.seekProgram(6); __smoke.stepRate(-1, false); "ok"');
+  await wait(250);
+  const rRev1 = JSON.parse(await js(win,
+    'JSON.stringify({ rate: __smoke.state.rate, paused: document.getElementById("player").paused, tag: document.getElementById("rateTag").textContent })'));
+  check('J 从正放切到倒带时从 -1× 起步', rRev1.rate === -1 && rRev1.paused && rRev1.tag === '-1×',
+    `16× 正放 → 按 J → ${rRev1.rate}×，标记 "${rRev1.tag}"`);
+
+  // 倒带真的在往回走：等一会儿，播放头必须比刚才更靠前（时间更小）
+  const revBefore = await js(win, '__smoke.tl.currentProgramTime()');
+  await wait(700);
+  const revAfter = await js(win, '__smoke.tl.currentProgramTime()');
+  check('倒带时播放头真的往回走', revAfter < revBefore - 0.05,
+    `${revBefore.toFixed(3)}s → ${revAfter.toFixed(3)}s（退了 ${(revBefore - revAfter).toFixed(3)}s）`);
+
+  await js(win, '__smoke.stepRate(-1, false); __smoke.stepRate(-1, false); "ok"');
+  await wait(200);
+  const rRevUp = await js(win, '__smoke.state.rate');
+  check('J 逐档加快倒带', rRevUp === -4, `-1× → -2× → ${rRevUp}×`);
+
+  // Shift+J 慢速倒带：从快档进来落在 -1×，再按逐档变慢
+  await js(win, '__smoke.stepRate(-1, true); "ok"');
+  await wait(200);
+  const rSlowRev1 = await js(win, '__smoke.state.rate');
+  await js(win, '__smoke.stepRate(-1, true); "ok"');
+  await wait(200);
+  const rSlowRev2 = await js(win, '__smoke.state.rate');
+  check('Shift+J 慢速倒带逐档变慢', rSlowRev1 === -1 && rSlowRev2 === -0.75,
+    `-4× 快档 → Shift+J 进 ${rSlowRev1}× → ${rSlowRev2}×`);
+
   await js(win, '__smoke.pausePlayback(); "ok"');
   await wait(300);
-  const rStop = JSON.parse(await js(win, 'JSON.stringify({ paused: document.getElementById("player").paused, rate: __smoke.state.rate })'));
-  check('L 播放并逐档加速', r1.rate === 1 && !r1.paused && rUp.rate === 2 && rUp.tag === '2×', `1× → 1.5× → ${rUp.rate}×，速率标记 "${rUp.tag}"`);
-  check('J 逐档减速', rDown === 1, `降回 ${rDown}×`);
-  check('K 暂停并复位速率', rStop.paused && rStop.rate === 1);
+  const rStop = JSON.parse(await js(win,
+    'JSON.stringify({ paused: document.getElementById("player").paused, rate: __smoke.state.rate, tag: document.getElementById("rateTag").textContent })'));
+  check('K 暂停并复位速率', rStop.paused && rStop.rate === 1 && rStop.tag === '', `rate=${rStop.rate} 标记 "${rStop.tag}"`);
+
+  // 停住之后播放头不许再自己动（倒带循环必须真的被掐掉）
+  const haltA = await js(win, '__smoke.tl.currentProgramTime()');
+  await wait(500);
+  const haltB = await js(win, '__smoke.tl.currentProgramTime()');
+  check('K 之后倒带循环彻底停下', Math.abs(haltB - haltA) < 1e-6, `${haltA.toFixed(3)}s → ${haltB.toFixed(3)}s`);
+
+  // Shift+L 慢放：正放档位里没有 1.5× 了，细档是 1 → 0.75 → 0.5 → 0.25
+  await js(win, '__smoke.seekProgram(3); __smoke.stepRate(1, true); "ok"');
+  await wait(250);
+  const rSlow1 = await js(win, '__smoke.state.rate');
+  await js(win, '__smoke.stepRate(1, true); "ok"');
+  await wait(200);
+  const rSlow2 = await js(win, '__smoke.state.rate');
+  await js(win, '__smoke.pausePlayback(); "ok"');
+  await wait(200);
+  check('Shift+L 慢放逐档变慢', rSlow1 === 1 && rSlow2 === 0.75, `1× → ${rSlow2}×`);
 
   // 8c) Backspace：删掉播放头所在的整段
   await js(win, '__smoke.resetClips(); "ok"');

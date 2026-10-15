@@ -18,7 +18,7 @@ const state = {
   src: null,            // { file, media }
   clips: [],            // [{start,end,ps,pe}] 源时间 + 成片时间，顺序即时间顺序
   sel: -1,
-  rate: 1,              // J/K/L 变速播放
+  rate: 1,              // 走带速率：正 = 正放，负 = 倒带（<video> 不接受负值，倒带走 seek 循环）
   plan: null,
   busy: false,
   scanning: false,
@@ -33,6 +33,8 @@ const pb = { index: 0 };      // 播放头当前落在第几个片段
 let lastSnap = null;          // 最近一次拖放的磁吸结果，给 #hud 用
 let tl = null;
 let rafId = 0;
+let rewindId = 0;             // 倒带循环的 rAF 句柄（与正放的 rafId 分开，两者不同时跑）
+const rewindClock = { last: 0 };   // 倒带上一帧的墙上时刻，用来算这一帧该退多少
 
 // ---------------------------------------------------------------- 工具
 
@@ -471,6 +473,8 @@ function seekSource(srcT) {
 
 function onScrub(srcT, progT, snap) {
   if (!state.src) return;
+  // 手动拖播放头 = 接管：倒带循环还在跑的话会跟手指抢位置，先掐掉
+  if (state.rate < 0) haltPlayback();
   $('player').currentTime = clamp(srcT, 0, state.src.media.duration);
   const i = tl.clipIndexAtProg(progT);
   if (i >= 0) pb.index = i;
@@ -509,8 +513,14 @@ function updateHud() {
   hud.classList.toggle('snap-on', on);
 }
 
-/** J/K/L 的档位表：L 往右走一档，J 往左走一档。 */
-const RATES = [0.25, 0.5, 0.75, 1, 1.5, 2, 4, 8];
+/**
+ * 走带档位。粗档越按越快（L 正放 / J 倒带），细档越按越慢（Shift+L 慢放 / Shift+J 慢倒）。
+ * 两张表都按"离 1× 越来越远"排，所以推进逻辑对两者是同一条：
+ * 粗档找第一个比当前更大的倍率，细档找第一个比当前更小的。
+ * 表里只有**倍率**，方向由按键决定（J 系一律取负）。
+ */
+const RATE_FAST = [1, 2, 4, 8, 16];
+const RATE_SLOW = [1, 0.75, 0.5, 0.25];
 
 /**
  * 播放头磁吸关键帧开关。片段边界磁吸不受它影响（恒开）——
@@ -533,10 +543,55 @@ function toggleKeyframeSnap() {
   window.fc.saveSnap(state.snapKf);
 }
 
+/** 停掉倒带循环。正放用的是 rafId，两者互斥，各管各的句柄。 */
+function stopRewind() {
+  if (rewindId) { cancelAnimationFrame(rewindId); rewindId = 0; }
+  rewindClock.last = 0;
+}
+
+/**
+ * 倒带循环：**`<video>` 不接受负的 `playbackRate`**（设 -1 直接抛 `NotSupportedError`），
+ * 所以倒放不能像正放那样交给播放器，只能自己按墙上时钟把播放头往回推：
+ * 每帧算一次目标成片时间再 seek。到片头就停。
+ *
+ * 代价是逐次 seek 的画面不如正放流畅 —— 这是浏览器预览的固有限制，导出完全不受影响
+ * （导出走 ffmpeg，跟这条预览路径无关）。
+ */
+function rewindTick(ts) {
+  rewindId = 0;
+  if (!state.src || state.rate >= 0) return;
+  const now = ts || performance.now();
+  if (!rewindClock.last) rewindClock.last = now;
+  // 切到后台再回来时 now 会跳一大截，夹一下，免得一下退到片头
+  const dt = Math.min(0.25, Math.max(0, (now - rewindClock.last) / 1000));
+  rewindClock.last = now;
+  const next = tl.currentProgramTime() - dt * Math.abs(state.rate);
+  if (next <= 0) { seekProgram(0); pausePlayback(); return; }
+  seekProgram(next);
+  rewindId = requestAnimationFrame(rewindTick);
+}
+
+function startRewind() {
+  stopRewind();
+  rewindId = requestAnimationFrame(rewindTick);
+}
+
+/** 设定走带速率：r > 0 正放（交给 playbackRate），r < 0 倒带（自己推播放头）。 */
 function applyRate(r) {
   state.rate = r;
-  $('player').playbackRate = r;
-  $('rateTag').textContent = r === 1 ? '' : `${r}×`;
+  const p = $('player');
+  if (r < 0) {
+    // 倒带时播放器必须停住，否则它一边往前放、我们一边往回 seek
+    if (!p.paused) p.pause();
+    startRewind();
+  } else {
+    stopRewind();
+    p.playbackRate = r;
+  }
+  const tag = $('rateTag');
+  tag.textContent = r === 1 ? '' : `${r}×`;
+  // 倒带时播放器是暂停的，按钮显示 ▶，光看按钮分不出"停住"和"正在倒"——用颜色区分
+  tag.classList.toggle('rew', r < 0);
 }
 
 function resumePlay() {
@@ -553,18 +608,44 @@ function togglePlay() {
 }
 
 function pausePlayback() {
-  if (state.src) $('player').pause();
+  if (!state.src) return;
+  stopRewind();
+  applyRate(1);
+  const p = $('player');
+  if (!p.paused) p.pause();
+  else { $('btnPlay').textContent = '▶'; onTimeUpdate(); }
 }
 
-/** dir > 0 = L（加速），dir < 0 = J（减速）。暂停时按下会从 1× / 0.5× 起播。 */
-function stepRate(dir) {
+/**
+ * 走带档位推进。`dir > 0` = L 系（正放），`dir < 0` = J 系（倒带）；
+ * `fine` 选细档（越按越慢），否则粗档（越按越快）。
+ *
+ * 停着起步、或**反向切档**时都从 1× 那一档重新开始：正在 4× 正放时按 J，
+ * 应该从 -1× 起倒、再按才加快，而不是一下跳到 -4×。
+ */
+function stepRate(dir, fine) {
   if (!state.src) return;
+  const table = fine ? RATE_SLOW : RATE_FAST;
   const p = $('player');
-  if (p.paused) { applyRate(dir > 0 ? 1 : 0.5); resumePlay(); return; }
-  const i = RATES.findIndex((r) => r >= state.rate - 1e-6);
-  const j = clamp((i < 0 ? RATES.indexOf(1) : i) + dir, 0, RATES.length - 1);
-  if (j === i) { toast(dir > 0 ? '已经是最快的 8×' : '已经是最慢的 0.25×', 'warn'); return; }
-  applyRate(RATES[j]);
+  const active = !p.paused || state.rate < 0;     // 正在倒带时 player 是停的，也算"在动"
+  const sameDir = state.rate >= 0 ? dir > 0 : dir < 0;
+  if (!active || !sameDir) {
+    applyRate(dir);
+    if (dir > 0) resumePlay();                    // 倒带由 applyRate 自己起循环，正放要显式起播
+    return;
+  }
+  const cur = Math.abs(state.rate);
+  // 粗档往前找更大的倍率，细档往前找更小的：两张表都按"离 1× 更远"排
+  const j = fine
+    ? table.findIndex((r) => r < cur - 1e-6)
+    : table.findIndex((r) => r > cur + 1e-6);
+  if (j < 0) {
+    toast(dir > 0
+      ? (fine ? '已经是最慢的 0.25×' : '已经是最快的 16×')
+      : (fine ? '倒带已经是最慢的 0.25×' : '倒带已经是最快的 16×'), 'warn');
+    return;
+  }
+  applyRate(table[j] * dir);
 }
 
 /** 播放循环：跨过片段接缝时把 <video> 跳到下一段的源起点，到片尾就停。 */
@@ -589,9 +670,20 @@ function tick() {
   if (!p.paused) rafId = requestAnimationFrame(tick);
 }
 
+/**
+ * 逐帧 / 跳关键帧 / 跳分割点这类"一次性定位"动作进来前先把走带停下。
+ * 必须同时掐掉倒带循环：倒带时 player 本来就是停的，光 pause() 停不住它。
+ */
+function haltPlayback() {
+  stopRewind();
+  applyRate(1);
+  const p = $('player');
+  if (!p.paused) p.pause();
+}
+
 function stepFrames(dir, count) {
   if (!state.src) return;
-  $('player').pause();
+  haltPlayback();
   const fps = fpsOf(state.src.media);
   seekProgram(tl.currentProgramTime() + dir * (count || 1) / fps);
 }
@@ -599,7 +691,7 @@ function stepFrames(dir, count) {
 /** 跳到源时间轴上最近的上/下一个关键帧（还在成片上的才算）。 */
 function stepKeyframe(dir) {
   if (!state.src) return;
-  $('player').pause();
+  haltPlayback();
   const srcT = tl.progToSrc(tl.currentProgramTime());
   const kfs = (state.src.media.keyframes || []).filter((k) => tl.srcToProg(k) != null);
   const target = dir > 0 ? kfs.find((k) => k > srcT + 1 / 120) : kfs.slice().reverse().find((k) => k < srcT - 1 / 120);
@@ -609,6 +701,7 @@ function stepKeyframe(dir) {
 
 function stepClip(dir) {
   if (!state.src) return;
+  haltPlayback();
   const pt = tl.currentProgramTime();
   const edges = state.clips.map((c) => c.ps).concat(programTotal());
   const target = dir > 0 ? edges.find((e) => e > pt + 1e-6) : edges.slice().reverse().find((e) => e < pt - 1e-6);
@@ -1134,7 +1227,7 @@ async function cancelExport() {
  */
 const KEYS = {
   rippleBefore: ['q'], split: ['w'], rippleAfter: ['e'], deleteClip: ['backspace'],
-  playPause: [' '], slower: ['j'], pause: ['k'], faster: ['l'],
+  playPause: [' '], rewind: ['j'], slowRewind: ['shift+j'], pause: ['k'], faster: ['l'], slowFaster: ['shift+l'],
   prevFrame: [',', 'arrowleft'], nextFrame: ['.', 'arrowright'],
   prevKeyframe: ['shift+arrowleft'], nextKeyframe: ['shift+arrowright'],
   prevEdge: ['shift+arrowup'], nextEdge: ['shift+arrowdown'],
@@ -1146,8 +1239,9 @@ const KEYS = {
 
 const KEY_LABELS = {
   rippleBefore: '删到上一个分割点', split: '在播放头处分割', rippleAfter: '删到下一个分割点',
-  deleteClip: '删除整段素材', playPause: '播放 / 暂停', slower: '减速播放', pause: '暂停',
-  faster: '加速播放', prevFrame: '上一帧', nextFrame: '下一帧',
+  deleteClip: '删除整段素材', playPause: '播放 / 暂停', rewind: '倒带（越按越快）', slowRewind: '慢速倒带',
+  pause: '暂停',
+  faster: '快进（越按越快）', slowFaster: '慢放', prevFrame: '上一帧', nextFrame: '下一帧',
   prevKeyframe: '上一个关键帧', nextKeyframe: '下一个关键帧',
   prevEdge: '上一个分割点', nextEdge: '下一个分割点',
   undo: '撤销', redo: '重做', zoomIn: '放大时间轴', zoomOut: '缩小时间轴', fit: '整条适应',
@@ -1155,7 +1249,7 @@ const KEY_LABELS = {
   importFile: '导入', exportNow: '导出', keysPanel: '打开本面板',
 };
 
-const KEY_ORDER = ['rippleBefore', 'split', 'rippleAfter', 'deleteClip', 'slower', 'pause', 'faster',
+const KEY_ORDER = ['rippleBefore', 'split', 'rippleAfter', 'deleteClip', 'rewind', 'slowRewind', 'pause', 'faster', 'slowFaster',
   'playPause', 'prevFrame', 'nextFrame', 'prevKeyframe', 'nextKeyframe', 'prevEdge', 'nextEdge',
   'undo', 'redo', 'zoomIn', 'zoomOut', 'fit', 'toStart', 'toEnd', 'cancelExport', 'importFile', 'exportNow'];
 
@@ -1302,9 +1396,11 @@ function runAction(action) {
     case 'rippleAfter': return rippleDeleteAfter();
     case 'split': return splitAtPlayhead();
     case 'deleteClip': return deleteClipAtPlayhead();
-    case 'slower': return stepRate(-1);
+    case 'rewind': return stepRate(-1, false);
+    case 'slowRewind': return stepRate(-1, true);
     case 'pause': return pausePlayback();
-    case 'faster': return stepRate(1);
+    case 'faster': return stepRate(1, false);
+    case 'slowFaster': return stepRate(1, true);
     case 'playPause': return togglePlay();
     case 'prevFrame': return stepFrames(-1);
     case 'nextFrame': return stepFrames(1);
@@ -1342,7 +1438,9 @@ function bindUi() {
   p.addEventListener('pause', () => {
     $('btnPlay').textContent = '▶';
     if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
-    applyRate(1);
+    // 倒带时播放器是**故意**停住的（applyRate 起倒带循环前先 pause），
+    // 这里再复位一次速率就会把刚起的倒带当场掐掉——所以倒带态下不动速率。
+    if (state.rate >= 0) applyRate(1);
     onTimeUpdate();
   });
   p.addEventListener('error', () => {
@@ -1472,8 +1570,8 @@ function onMenuAction(action, file) {
     split: splitAtPlayhead,
     rippleBefore: rippleDeleteBefore,
     rippleAfter: rippleDeleteAfter,
-    playSlower: () => stepRate(-1),
-    playFaster: () => stepRate(1),
+    playSlower: () => stepRate(-1, false),
+    playFaster: () => stepRate(1, false),
     pause: pausePlayback,
     undo: () => stepHistory(-1, '撤销'),
     redo: () => stepHistory(1, '重做'),
