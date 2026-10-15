@@ -65,7 +65,7 @@ function frameIndex(t, fps, origin = 0) {
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true } = opts;
+  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0 } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   const bdepth = Math.max(0, Number(reorderDepth) || 0);
   // 帧网格原点：源首帧 pts 不一定落在 0（实测 HEVC 的 .mp4/.mkv 首帧 pts = 0.023，
@@ -77,6 +77,7 @@ function buildPlan(keeps, opts) {
   const warnings = [];
   const plan = [];
   let warnedVfr = false;
+  let raslCounted = 0;              // RASL 剥除帧数：copyPart（源尾分支）与收尾循环共同累计，去重后给警告
 
   /**
    * [from, to) 之间有多少帧 = 会被导出的帧数。
@@ -106,14 +107,54 @@ function buildPlan(keeps, opts) {
    * @returns {{duration:number, frames:(number|null), trimmed:number}}
    */
   const atEnd = (to) => Number.isFinite(duration) && to >= duration - EPS;
+  /**
+   * [from, to) 里有多少个关键帧（不含 from 本身、含 to 吗？不含——区间端点约定与 span 一致，左闭右开）。
+   * HEVC 开放 GOP 的 RASL 剥除按「每个关键帧剥 raslPerKf 帧」记账用：filter_units 按解码序
+   * 把每个 IDR/CRA 之后的 RASL 包整个剥掉，无法区分"引用段内还是段外"，段内有几个
+   * 关键帧（不含起点——起点关键帧之后的 RASL 才会被切进段里）就剥几组。
+   */
+  const kfCountIn = (from, to) => {
+    let n = 0;
+    for (const k of keyframes) {
+      if (k <= from + KEY_TOL) continue;
+      if (k >= to - KEY_TOL) break;
+      n++;
+    }
+    return n;
+  };
   const copyPart = (from, to) => {
     const window = span(from, to);
-    if (!fpsNum || !bdepth || atEnd(to)) return { duration: window, frames: null, trimmed: 0 };
+    if (!fpsNum || !bdepth || atEnd(to)) {
+      // 源尾不加防吞余量（后面本来没有帧），但 **HEVC 的 RASL 剥除照剥**——
+      // filter_units 不管段尾是不是源尾，段内每个关键帧后的 RASL 都会消失，
+      // 所以哪怕到源尾也要给出明确的 frames 预期（null = 按 -t 收口，剥完就少帧、自检挂）
+      if (raslPerKf > 0 && fpsNum) {
+        const n = kfCountIn(from, to);
+        if (n > 0) {
+          const frames = Math.round(window * fpsNum) - n * raslPerKf;
+          if (frames > 0) {
+            raslCounted += n * raslPerKf;
+            return { duration: window, frames, trimmed: 0, raslTrimmed: true };
+          }
+        }
+      }
+      return { duration: window, frames: null, trimmed: 0 };
+    }
     const frames = Math.round(window * fpsNum) - bdepth;
     return frames > 0
       ? { duration: window, frames, trimmed: bdepth }
       : { duration: 0, frames: null, trimmed: 0 };
   };
+
+  /**
+   * HEVC 开放 GOP 的 RASL 记账：拷贝段里的每个关键帧（**不含段起点**——起点关键帧之后的
+   * RASL 才会被切进段里）后面都跟着 raslPerKf 个 RASL 帧，`filter_units remove_types=8|9`
+   * 会把这些包整个剥掉（NAL 级无法区分"引用段内还是段外"）。剥掉的帧不会出现在产物里，
+   * 帧数预期必须同步扣掉，否则"帧数符合切割计划"自检必挂。
+   *
+   * 实测（x265 open-gop，has_b_frames=2）：每个关键帧跟 3 个 RASL（= 深度 + 1），由上层折算传入。
+   * 只影响 frames 记账，duration 不动（RASL 显示时刻本就在段外或被后续帧补位）。
+   */
 
   for (let ki = 0; ki < keeps.length; ki++) {
     const keep = keeps[ki];
@@ -212,6 +253,7 @@ function buildPlan(keeps, opts) {
               plan.push({
                 kind: 'copy', role: 'whole', start: clamped, duration: part.duration, frames: part.frames,
                 snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
+                raslTrimmed: part.raslTrimmed || undefined,
                 autoPrecise: true,
                 note: `吸附避开重叠：从关键帧 ${clamped.toFixed(3)}s 起（少 ${(clamped - keep.start).toFixed(3)}s 片段开头）`,
               });
@@ -237,6 +279,7 @@ function buildPlan(keeps, opts) {
               plan.push({
                 kind: 'copy', role: 'whole', start: snapStart, duration: part.duration, frames: part.frames,
                 snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
+                raslTrimmed: part.raslTrimmed || undefined,
                 note: kfStart === null
                   ? `入点之前没有关键帧，从 0 开始（多 ${keep.start.toFixed(3)}s 内容）`
                   : snapStart < keep.start - EPS
@@ -265,6 +308,7 @@ function buildPlan(keeps, opts) {
         plan.push({
           kind: 'copy', role: 'whole', start, duration: part.duration, frames: part.frames,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
+          raslTrimmed: part.raslTrimmed || undefined,
           note: '整段流拷贝（不转码）',
         });
       } else {
@@ -341,6 +385,7 @@ function buildPlan(keeps, opts) {
     plan.push({
       kind: 'copy', role: 'tail', start: kfHead, duration: tailPart.duration, frames: tailPart.frames,
       snapFrom: keep.start, keepEnd: keep.end, actualEnd: keep.end, trimmed: tailPart.trimmed,
+      raslTrimmed: tailPart.raslTrimmed || undefined,
       autoPrecise: autoDegrade || undefined,
       note: autoDegrade ? `${autoNote} · 其余流拷贝` : `入点重编码 ${head.toFixed(3)}s，其余流拷贝`,
     });
@@ -357,6 +402,36 @@ function buildPlan(keeps, opts) {
       + '宁可短也不把你已经删掉的素材带回来；要末端也一帧不差只有一条路——这一段一直切到源尾'
       + '（实测把出点挪到关键帧上免不掉这个余量：2s→4s 两个关键帧之间照样少给 2 帧）',
     );
+  }
+
+  /**
+   * HEVC 开放 GOP：把 RASL 剥除的帧数从拷贝段预期里扣掉。
+   * `filter_units remove_types=8|9` 按**解码序**剥掉每个 IDR/CRA 之后的 RASL 包，
+   * 无法区分"这一条 RASL 引用的画面在段内还是段外"，所以段内几个关键帧（不含段起点——
+   * 起点关键帧的 RASL 显示序在起点之前，本来就不在拷贝窗口里）就剥几组。
+   * 剥掉的帧确实不出现在产物里，帧数预期不同步扣，"帧数符合切割计划"自检必挂
+   * （实测 HEVC 源入点在 GOP 中间、拷贝到源尾：期望 300 实际 297，差 3 = 1 个段内关键帧 × 3）。
+   *
+   * `copyPart` 的"切到源尾"分支已经扣过（见 raslTrimmed 标记），这里只补
+   * 走了 bdepth 路径的普通拷贝段，别两头重复扣。
+   */
+  if (raslPerKf > 0 && fpsNum) {
+    for (const p of plan) {
+      if (p.kind !== 'copy' || !Number.isFinite(p.frames) || p.frames <= 0) continue;
+      if (p.raslTrimmed) continue;
+      const n = kfCountIn(p.start, p.start + p.duration);
+      if (n > 0) {
+        p.frames = Math.max(1, p.frames - n * raslPerKf);
+        raslCounted += n * raslPerKf;
+      }
+    }
+    if (raslCounted > 0) {
+      warnings.push(
+        `源是 HEVC 开放 GOP：拼接用的参数集修正要求剥掉关键帧后的 RASL 前导帧，`
+        + `本次导出共剥 ${raslCounted} 帧（约 ${(raslCounted / (fpsNum || 30) * 1000).toFixed(0)}ms，分散在各关键帧处）——`
+        + '这是流拷贝拼接的固有代价，画面无损',
+      );
+    }
   }
 
   // 乱序（用户拖动改过顺序）时必须跳过 dedupePlan：它按"时间递增"假设合并相邻段，

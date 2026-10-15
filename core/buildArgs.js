@@ -23,13 +23,39 @@ const { familyOfExt } = require('./containers');
  */
 const HEVC_DROP_RASL = 'filter_units=remove_types=8|9';
 
+/**
+ * 混拼（计划里同时有重编码段和流拷贝段）时的参数集内嵌。
+ *
+ * 根因（2026-10-15 实测，HEVC 源入点在 GOP 中间必触发）：MP4 每条视频轨只存**一份**
+ * 参数集（hvcC），拼接产物取第一段的。重编码段的参数集是编码器新造的，与源的不一致
+ * （实测 md5：VPS 71e2… vs 962f…、SPS b0ea… vs f36c…），拷贝段的包却按源参数集编码——
+ * 解码器拿着头段那套 SPS/PPS 去解拷贝段，全部解析错乱
+ * （chroma_log2_weight_denom / slice_qp / cu_qp_delta 越界、Could not find ref with POC）。
+ * H.264 也会撞同样的结构问题，只是 x264 重编码参数集与源足够接近被解码器容错了——
+ * 同样补上，不能赌运气。
+ *
+ * 修法：先把流转成 Annex B（mp4toannexb 顺带把 extradata 换成裸参数集），
+ * 再用 dump_extra 把参数集内嵌进每个关键帧包。拼接时输出 muxer 会把两套参数集
+ * 都收进 hvcC，而拷贝段关键帧前还带着就地可用的那套——两条路都通。无损：
+ * 参数集本来就是解码必需的元数据，多存一份不改变任何画面。
+ */
+const MIXED_PARAM_BSF = {
+  hevc: 'hevc_mp4toannexb,dump_extra=freq=keyframe',
+  h264: 'h264_mp4toannexb,dump_extra=freq=keyframe',
+};
+
 /** 重编码段粗定位的提前量：够大到保住长视频寻址速度，多出来的再由输出侧 -ss 精确剪掉。 */
 const SEEK_LEAD = 2.0;
 
-function streamBsfFor(item, media) {
+function streamBsfFor(item, media, opts = {}) {
   if (item.kind !== 'copy') return [];
-  if (media?.video?.codec !== 'hevc') return [];
-  return ['-bsf:v', HEVC_DROP_RASL];
+  const codec = media?.video?.codec;
+  if (codec === 'hevc') {
+    if (opts.dumpParams) return ['-bsf:v', `${HEVC_DROP_RASL},${MIXED_PARAM_BSF.hevc}`];
+    return ['-bsf:v', HEVC_DROP_RASL];
+  }
+  if (codec === 'h264' && opts.dumpParams) return ['-bsf:v', MIXED_PARAM_BSF.h264];
+  return [];
 }
 
 /**
@@ -103,7 +129,7 @@ function argsForSegment(item, media, outPath, opts = {}) {
     args.push(...mapArgs);                        // 保留全部音轨 / 字幕轨
     args.push('-map_metadata', '0');             // 保留元数据与章节
     args.push('-dn');                            // 丢弃数据轨（章节附件字体常导致失败）
-    args.push(...streamBsfFor(item, media));      // HEVC 开放 GOP：剔 RASL，见上方注释
+    args.push(...streamBsfFor(item, media, opts));   // HEVC 剔 RASL；混拼时内嵌参数集，见上方注释
     if (media.rotation && media.rotation !== 0 && family === 'mov') {
       args.push('-display_rotation', 'copy');    // 保留旋转信息，避免竖屏视频方向错乱
     }
@@ -115,7 +141,23 @@ function argsForSegment(item, media, outPath, opts = {}) {
     // 加上它反而按"最小的音频 dts"整体平移，视频首帧被推到 +0.2~0.3s（实测），
     // 段首就多出一截只有声音没有画面的空档。
     args.push('-c:v', codec);
-    args.push('-c:a', 'copy');
+    /**
+     * 音频平时 copy（零损失），但**短段 + MP4 族目标是唯一会丢整条音轨的组合**：
+     * 重编码段不足 3 帧时（33ms 窗口只装得下 1 个 23ms 的 AAC 包），mp4 muxer 对
+     * "copy 进来的音轨一个包都没有" 直接不写这条轨（实测 mkv muxer 会写、ffmpeg 无警告）；
+     * 音频重编码（aac）时编码器按窗口填充就没这个问题。触发条件 = 精确模式整段重编码
+     * + 选区只有一两帧 + 输出 mp4/mov——极窄但真实（用户切 1 帧去导出就踩）。
+     * 段时长按帧数折算：≥3 帧一律 copy（正常路径不受影响）。
+     */
+    const tinyFrames = fps && Number.isFinite(item.duration) ? item.duration * fps : Infinity;
+    if (family === 'mov' && tinyFrames < 3) {
+      args.push('-c:a', 'aac');
+      const br = Number(media.audioTracks?.[0]?.bitRate) || 0;
+      if (br > 0) args.push('-b:a', String(Math.round(br)));
+      else if (media.audioTracks?.[0]?.channels) args.push('-b:a', `${96 * media.audioTracks[0].channels}k`);
+    } else {
+      args.push('-c:a', 'copy');
+    }
     // 重编码段也用同一个刻度，理由见上面拷贝段那段注释
     if (family === 'mov') args.push('-video_track_timescale', outputTimeScale(media));
     if (!opts.dropSubtitles) args.push('-c:s', 'copy');

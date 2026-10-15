@@ -113,6 +113,11 @@ function planFor(loaded, segments, opts = {}) {
     sameCodec: keepsSourceCodec(loaded.media),
     // VFR 源帧长不均匀，按帧数切出来的时长与音频对不上：只能整段重编码成定帧率
     forceReencode: !!loaded.media.video?.vfr,
+    // HEVC 开放 GOP：剥 RASL 时每个段内关键帧剥 (深度+1) 帧（x265 实测），
+    // 拷贝段的帧数预期要同步扣，见 cuttings.buildPlan 末尾的记账
+    raslPerKf: loaded.media.video?.codec === 'hevc' && loaded.media.video?.reorderDepth >= 0
+      ? loaded.media.video.reorderDepth + 1
+      : 0,
     // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
     precise: opts.precise !== false,
   });
@@ -215,11 +220,18 @@ async function exportSegments(loaded, segments, opts) {
         + '接缝处可能多带 1~2 帧画面——产物内容仍是按你选的区间切的');
     }
 
+    // 混拼（重编码段与流拷贝段并存）时，拷贝段要把源参数集内嵌进关键帧包：
+    // MP4 每轨只存一份参数集，拼接产物取第一段的；若第一段是重编码段，它那套
+    // 参数集与源的不一致，拷贝段就会解不开（HEVC 必炸，H.264 靠解码器容错侥幸活着）。
+    // 全拷贝（参数集同源）或全重编码（只有一套）都不需要。见 buildArgs.MIXED_PARAM_BSF。
+    const mixedCodecs = plan.some((p) => p.kind === 'copy') && plan.some((p) => p.kind === 'reencode');
+
     for (let i = 0; i < plan.length; i++) {
       const item = plan[i];
       const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${partExt}`);
       const args = argsForSegment(item, { ...src.media, file: src.file }, partFile, {
         crf, fps: cutFps, dropSubtitles: dropSubtitles || stripSubs, copyTs,
+        dumpParams: mixedCodecs,
       });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);

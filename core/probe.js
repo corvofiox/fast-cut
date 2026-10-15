@@ -208,6 +208,8 @@ function normalizeProbe(raw, file = '(unknown)') {
       codec: a.codec_name,
       channels: a.channels,
       sampleRate: a.sample_rate,
+      /** 短段 MP4 导出音频转 aac 时按源码率走（缺失则按声道数折算，见 buildArgs）。 */
+      bitRate: Number(a.bit_rate) || 0,
       language: a.tags?.language ?? null,
       title: a.tags?.title ?? null,
     })),

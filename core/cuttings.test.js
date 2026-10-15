@@ -114,6 +114,31 @@ test('没有关键帧索引时整段重编码并警告，而不是从 0 拷贝',
   assert.ok(warnings.some((w) => /没有可用关键帧/.test(w)), warnings.join('、'));
 });
 
+test('HEVC RASL 记账：拷贝段帧数按段内关键帧数扣减（含切到源尾的段）', () => {
+  // 实测根因（用户"精确模式导出报错"）：x265 open-gop 源每个关键帧后跟 (深度+1) 个 RASL，
+  // filter_units 剥 RASL 时这些包整个消失；拷贝到源尾的段旧实现 frames=null（按 -t 收口），
+  // 实际包数比时长折算少 3 → "帧数符合切割计划"自检挂掉 → 导出报错。
+  const rasl = { keyframes: [0, 4, 8], fps: 30, duration: 12, reorderDepth: 2, raslPerKf: 3 };
+  // 拷到源尾 [4,12)：8s 关键帧在段内 → 扣 3 帧
+  const { plan: pEnd } = buildPlan([{ start: 4, end: 12 }], rasl);
+  assert.strictEqual(pEnd[0].kind, 'copy');
+  assert.strictEqual(pEnd[0].frames, Math.round(8 * 30) - 3, '源尾段也要扣掉段内关键帧的 RASL');
+  // 拷到源中间 [4,10)：同样 8s 在段内 → 先扣防吞深度 2、再扣 RASL 3
+  const { plan: pMid } = buildPlan([{ start: 4, end: 10 }], rasl);
+  assert.strictEqual(pMid[0].frames, Math.round(6 * 30) - 2 - 3);
+  // 段内没有关键帧 [4,8) → 不扣 RASL（8 在左开右闭的边界外）
+  const { plan: pNone } = buildPlan([{ start: 4, end: 8 }], rasl);
+  assert.strictEqual(pNone[0].frames, Math.round(4 * 30) - 2);
+  // 警告要说明剥了多少帧
+  const { warnings } = buildPlan([{ start: 2, end: 12 }], rasl);
+  assert.ok(warnings.some((w) => /RASL/.test(w)), warnings.join('、'));
+});
+
+test('非 HEVC（raslPerKf=0）帧数记账与旧版完全一致', () => {
+  const { plan } = buildPlan([{ start: 4, end: 10 }], { keyframes: [0, 4, 8], fps: 30, duration: 12, reorderDepth: 2 });
+  assert.strictEqual(plan[0].frames, Math.round(6 * 30) - 2, '没有 raslPerKf 时只扣防吞深度');
+});
+
 test('相邻区间首尾严格相接：不重复导出，也不留空洞', () => {
   const { plan } = buildPlan([
     { start: 3.4, end: 4.4 },

@@ -995,8 +995,43 @@ async function main() {
     `预估「${String(warnLine).trim().slice(0, 46)}」· ${String(subChecks).replace(/\s+/g, ' ').slice(0, 90)}`);
   await js(win, '__smoke.setContainer("source"); "ok"');
 
+  // 15) HEVC 精确模式：入点在 GOP 中间 + 拷贝到源尾（旧版必报"帧数符合切割计划"失败）
+  //     根因是两层：①混拼参数集不一致（修复：拷贝段内嵌源参数集）；
+  //     ②RASL 剥除帧数没从预期里扣（修复：计划侧记账）。这里用真实 HEVC 素材各验一遍。
+  const hevcSrc = ensureHevcSource();
+  await js(win, `__smoke.importFile(${JSON.stringify(hevcSrc)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(hevcSrc)}`, win);
+  await waitFor('__smoke.state.scanning === false', win, 20000);
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'hevc-precise'); __smoke.setOption("optPrecise", true); __smoke.setContainer("source"); 'ok'`);
+  await js(win, '__smoke.seekProgram(2); __smoke.splitAtPlayhead(); __smoke.seekProgram(0); __smoke.rippleDeleteAfter(); "ok"');
+  await wait(500);
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'hevc-precise'); 'ok'`);
+  await wait(300);
+  res = await runExport(win);
+  check('HEVC 精确模式（入点在 GOP 中间、拷到源尾）通过自检', res.ok, res.detail);
+
   await longFileCheck(win);
   finish(win);
+}
+
+/**
+ * 精确模式 HEVC 用例的素材：x265 open-gop、关键帧每 4s 一个（GOP 120）、12 秒。
+ * 入点切在 2s（GOP 中间）→ 计划 = 重编码 [2,4) + 流拷贝 [4,12)；
+ * 拷贝段里有关键帧 8s（RASL 记账）+ 两段参数集不同（hvcC 单份），两条坑都踩得到。
+ */
+function ensureHevcSource() {
+  const out = path.join(ROOT, 'tmp', 'smoke-hevc-gop4.mp4');
+  if (fs.existsSync(out) && fs.statSync(out).size > 10000) return out;
+  const ffmpeg = resolveBin('ffmpeg', [path.join(ROOT, 'vendor', 'ffmpeg')]);
+  execFileSync(ffmpeg, [
+    '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=12',
+    '-f', 'lavfi', '-i', 'sine=frequency=440:duration=12',
+    '-c:v', 'libx265', '-preset', 'ultrafast', '-g', '120', '-keyint_min', '120',
+    '-sc_threshold', '0', '-pix_fmt', 'yuv420p',
+    '-c:a', 'aac', '-shortest', out,
+  ], { stdio: 'ignore' });
+  return out;
 }
 
 /**
