@@ -31,6 +31,8 @@ contextBridge.exposeInMainWorld('fc', {
   getSettings: () => ipcRenderer.invoke('fc:settings:get'),
   getKeymap: () => ipcRenderer.invoke('fc:keymap:get'),
   setKeymap: (map) => ipcRenderer.invoke('fc:keymap:set', map),
+  // 播放头磁吸关键帧的开关状态：跟着设置一起持久化，下次启动还是用户选的那一档
+  saveSnap: (on) => ipcRenderer.invoke('fc:snap:set', on),
   // 无边框窗口的自绘标题栏：最小化 / 最大化还原 / 关闭，以及最大化状态回推
   winMin: () => ipcRenderer.send('fc:win:min'),
   winMax: () => ipcRenderer.send('fc:win:max'),

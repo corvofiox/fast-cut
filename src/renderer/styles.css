@@ -265,6 +265,10 @@ html, body {
 #tlFoot .hint { color: #626d7d; font-size: 11px; }
 .hud { font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; color: var(--fg-dim); }
 .hud.snap-on { color: var(--accent-2); }
+
+/* 磁吸开关：与 HUD 的磁吸高亮用同一个强调色，一眼看出"现在吸不吸" */
+#btnSnapKf.on { color: var(--accent-2); border-color: #6b5326; background: #2e2818; }
+#btnSnapKf.on:hover { background: #3a3220; border-color: #8a6a30; }
 #tlFoot .hint b { color: var(--fg-dim); font-weight: 600; }
 
 /* 落位 / 吸附提示已经并进走带行；这里只留它的排版 */

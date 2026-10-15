@@ -22,6 +22,7 @@ const state = {
   plan: null,
   busy: false,
   scanning: false,
+  snapKf: true,          // 播放头磁吸关键帧：开 = 拖刻度条时吸到最近关键帧（片段边界恒吸）
   thumbs: null,        // { dir, step, count } 时间轴胶片条
   cut: { index: 0, total: 1, ratio: 0 },
   outputs: [],
@@ -215,7 +216,23 @@ async function boot() {
 
   bindUi();
   await loadKeys();
+  await loadSnapPref();
   await refreshEnv();
+}
+
+/**
+ * 播放头磁吸关键帧的开关状态从设置里读回来。读失败就当默认开——
+ * 磁吸是默认行为，不能因为读不到设置就把用户晾在自由拖动里。
+ */
+async function loadSnapPref() {
+  let on = true;
+  try {
+    const s = await window.fc.getSettings();
+    if (s && typeof s.snapKeyframes === 'boolean') on = s.snapKeyframes;
+  } catch { /* 首次运行没有配置文件 */ }
+  state.snapKf = on;
+  if (tl) tl.setKeyframeSnap(on);
+  updateToolButtons();
 }
 
 /**
@@ -480,17 +497,41 @@ function onTimeUpdate() {
  */
 function updateHud() {
   const hud = $('hud');
-  if (!state.src) { hud.textContent = ''; return; }
+  const on = !!(lastSnap && lastSnap.kind === 'keyframe');
+  if (!state.src) { hud.textContent = ''; hud.classList.remove('snap-on'); return; }
   const parts = [];
   if (lastSnap) parts.push(lastSnap.kind === 'keyframe' ? '磁吸·关键帧' : '磁吸·分割点');
   const pt = tl.currentProgramTime();
   const srcT = tl.progToSrc(pt);
   if (Math.abs(srcT - pt) > 0.001) parts.push(`源 ${tcShort(srcT)}`);
   hud.textContent = parts.join(' · ');
+  // 关键帧磁吸生效时给 HUD 上强调色，与走带行的磁吸开关同一套视觉语言
+  hud.classList.toggle('snap-on', on);
 }
 
 /** J/K/L 的档位表：L 往右走一档，J 往左走一档。 */
 const RATES = [0.25, 0.5, 0.75, 1, 1.5, 2, 4, 8];
+
+/**
+ * 播放头磁吸关键帧开关。片段边界磁吸不受它影响（恒开）——
+ * 吸到某一刀只是定位，不会改变剪辑结构；关键帧磁吸关掉后，
+ * 拖刻度条就是自由拖动，想要精确落位时再用逐帧/跳关键帧键。
+ */
+function toggleKeyframeSnap() {
+  state.snapKf = !state.snapKf;
+  const btn = $('btnSnapKf');
+  btn.classList.toggle('on', state.snapKf);
+  btn.setAttribute('aria-pressed', String(state.snapKf));
+  btn.title = state.snapKf
+    ? '播放头磁吸关键帧（拖动刻度条时自动吸到最近的关键帧）'
+    : '播放头自由拖动（不吸关键帧；片段边界仍会吸附）';
+  if (tl) tl.setKeyframeSnap(state.snapKf);
+  // 开关一翻，上一次的磁吸结论就作废了：开着时留下的"磁吸·关键帧"必须撤掉
+  lastSnap = null;
+  updateHud();
+  updateToolButtons();
+  window.fc.saveSnap(state.snapKf);
+}
 
 function applyRate(r) {
   state.rate = r;
@@ -929,6 +970,8 @@ function updateToolButtons() {
   $('btnRedo').disabled = !has || history.i >= history.stack.length - 1 || state.busy;
   $('btnReset').disabled = !has || state.busy || (state.clips.length === 1 && state.clips[0].start <= 0.001);
   for (const id of ['btnPrevKf', 'btnNextKf', 'btnStepBack', 'btnStepFwd', 'btnPlay']) $(id).disabled = !has || state.busy;
+  $('btnSnapKf').classList.toggle('on', state.snapKf);
+  $('btnSnapKf').setAttribute('aria-pressed', String(!!state.snapKf));
 }
 
 function updateExportEnabled() {
@@ -1354,6 +1397,7 @@ function bindUi() {
   $('btnUndo').addEventListener('click', () => stepHistory(-1, '撤销'));
   $('btnRedo').addEventListener('click', () => stepHistory(1, '重做'));
   $('btnReset').addEventListener('click', resetClips);
+  $('btnSnapKf').addEventListener('click', toggleKeyframeSnap);
   $('btnFit').addEventListener('click', () => tl.fit());
   $('btnKeys').addEventListener('click', openKeys);
 

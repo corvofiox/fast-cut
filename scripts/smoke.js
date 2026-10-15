@@ -380,6 +380,39 @@ async function main() {
     /磁吸·关键帧/.test(hudSnapped) && !/\d{1,2}:\d{2}/.test(hudSnapped) && !/磁吸/.test(hudPlain),
     `吸上时 "${hudSnapped}" · 没吸时 "${hudPlain || '（空）'}"`);
 
+  // 3b) 磁吸开关：关掉后同一个 4.06 不再被吸到关键帧，按钮态与 HUD 同步
+  await js(win, 'document.getElementById("btnSnapKf").click(); "ok"');
+  await wait(150);
+  const snapOff = JSON.parse(await js(win, '__t.dragTo(4.06).then((r) => JSON.stringify(r))'));
+  const offState = JSON.parse(await js(win, 'JSON.stringify({ on: document.getElementById("btnSnapKf").classList.contains("on"), pressed: document.getElementById("btnSnapKf").getAttribute("aria-pressed"), title: document.getElementById("btnSnapKf").title, hud: document.getElementById("hud").textContent })'));
+  check('关掉关键帧磁吸后：拖动落点不再被吸到关键帧',
+    Math.abs(snapOff.src - 4.06) < 0.02,
+    `拖到 4.06 → 源 ${snapOff.src}s（开时应为 4）`);
+  check('磁吸开关的按钮态与提示同步',
+    offState.on === false && offState.pressed === 'false' && /自由拖动/.test(offState.title),
+    `on=${offState.on} · aria-pressed=${offState.pressed} · title="${offState.title}"`);
+  check('关掉磁吸后 HUD 不再报磁吸·关键帧', !/磁吸/.test(offState.hud), `HUD="${offState.hud || '（空）'}"`);
+
+  // 片段边界磁吸不受开关影响：先在源 2s 处切一刀，拖到那个切点附近照样吸得住
+  await js(win, '__smoke.seekProgram(2); __smoke.splitAtPlayhead(); "ok"');
+  await wait(150);
+  // splitAtPlayhead 会走 syncTimeline，把 lastSnap 清掉；所以先分割再拖，落点与 HUD 都以这次拖动为准
+  const edgeOn = JSON.parse(await js(win, '__t.dragTo(2.04).then((r) => JSON.stringify(r))'));
+  const edgeOff = JSON.parse(await js(win, 'JSON.stringify({ src: __smoke.tl.progToSrc(__smoke.tl.currentProgramTime()), hud: document.getElementById("hud").textContent })'));
+  check('磁吸关掉后片段边界仍然吸附',
+    Math.abs(edgeOn.src - 2.04) > 0.02 && Math.abs(edgeOff.src - 2) < 0.02 && /磁吸·分割点/.test(edgeOff.hud),
+    `拖到 2.04 → 源 ${edgeOff.src}s · HUD="${edgeOff.hud}"`);
+
+  await js(win, 'document.getElementById("btnSnapKf").click(); "ok"');
+  await wait(120);
+  const backOn = JSON.parse(await js(win, '__t.dragTo(4.06).then((r) => JSON.stringify(r))'));
+  check('重新打开磁吸后恢复吸附', Math.abs(backOn.src - 4) < 0.001, `拖到 4.06 → 源 ${backOn.src}s`);
+
+  // 磁吸开关这一段动了片段结构（切了一刀），后面几项都从"整条素材"起算，
+  // 所以这里先复位，别把状态漏给 7) 之后的分割/删除断言
+  await js(win, '__smoke.resetClips(); "ok"');
+  await wait(300);
+
   // 4) 滚轮 = 滚动，Alt + 滚轮 = 缩放，底部滚动条 = 平移
   await js(win, '__smoke.tl.setZoomLevel(70); "ok"');
   await wait(200);

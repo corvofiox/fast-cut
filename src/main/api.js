@@ -27,7 +27,7 @@ const VIDEO_EXTENSIONS = ['mp4', 'mov', 'm4v', 'mkv', 'avi', 'webm', 'flv', 'ts'
 const SEEK_AFTER = 20 * 60;
 
 const state = {
-  settings: { ffmpegDir: null },
+  settings: { ffmpegDir: null, snapKeyframes: true },
   /** 已导入源缓存：绝对路径 → { file, media, bins }，避免每次导出重扫关键帧 */
   loaded: new Map(),
   /** 当前导出作业：并发互斥 + 取消 */
@@ -632,6 +632,13 @@ function registerIpc(getWindow) {
     state.settings.keymap = clean;
     writeSettings();
     return clean;
+  });
+
+  // 播放头磁吸关键帧的开关状态：跟着设置一起持久化，下次启动还是用户选的那一档
+  ipcMain.handle('fc:snap:set', (_e, on) => {
+    state.settings.snapKeyframes = !!on;
+    writeSettings();
+    return state.settings.snapKeyframes;
   });
 
   // 无边框窗口的自绘标题栏。放在这里而不是主入口：registerIpc 被自检跑过，

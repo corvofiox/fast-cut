@@ -52,6 +52,7 @@ function createTimeline(options) {
   let thumbs = null;               // 导入时整片抽的那一遍：{ dir, step, count, height }
   let thumbImgs = [];              // 与 thumbs.count 同序的 Image，加载完才画
   let fps = 30;                    // 抽帧间隔不能细于一帧
+  let snapKeyframes = true;        // 关键帧磁吸开关：false = 只吸片段边界（播放头自由走）
   let levels = new Map();          // step -> { step, dir, imgs: Map<格号, Image> }，按缩放动态抽的层级
   let filmSig = '';                // 上一次向主进程要的是哪一档，避免自问自答
   let filmDrawn = 0;               // 最近一次 render 实际画了几格，给自检用
@@ -166,8 +167,14 @@ function createTimeline(options) {
     return -1;
   }
 
-  /** 磁吸：优先吸片段边界，其次吸关键帧（只有还在成片上的关键帧才算）。 */
-  function snapCandidate(x) {
+  /**
+   * 磁吸：优先吸片段边界，其次吸关键帧（只有还在成片上的关键帧才算）。
+   *
+   * 两级吸附，可由上层按用户开关取舍：
+   *  - `edges`（片段边界）恒开 —— 吸到边界只是定位到某一刀上，不会改变剪辑结构
+   *  - `keyframes` 可关（磁吸关=只吸边界）—— 关键帧只在流拷贝导出时才是合法切割位置
+   */
+  function snapCandidate(x, opts) {
     const t = xToT(x);
     let best = null;
     const consider = (progT, kind, srcT) => {
@@ -181,9 +188,11 @@ function createTimeline(options) {
       consider(clips[i].ps, 'edge', clips[i].start);
       consider(clips[i].pe, 'edge', clips[i].end);
     }
-    for (const kf of keyframes) {
-      const prog = srcToProg(kf);
-      if (prog != null) consider(prog, 'keyframe', kf);
+    if (!opts || opts.keyframes !== false) {
+      for (const kf of keyframes) {
+        const prog = srcToProg(kf);
+        if (prog != null) consider(prog, 'keyframe', kf);
+      }
     }
     return best;
   }
@@ -506,7 +515,7 @@ function createTimeline(options) {
   /** 把成片时间落到一个可编辑的位置（含磁吸），并回调上层。 */
   function moveTo(x, { allowSnap = true, select = true } = {}) {
     const raw = Math.min(total, Math.max(0, xToT(x)));
-    const snap = allowSnap ? snapCandidate(x) : null;
+    const snap = allowSnap ? snapCandidate(x, { keyframes: snapKeyframes }) : null;
     const pt = snap ? snap.t : ms(raw);
     programTime = pt;
     if (select) selectClip(clipIndexAtProg(pt));
@@ -762,6 +771,8 @@ function createTimeline(options) {
     /** 播放头移动到成片时间 pt（不经过磁吸），供键盘逐帧/跳转使用。 */
     setProgramTime(pt) { programTime = ms(Math.min(total, Math.max(0, pt))); drawPlayhead(); ensureVisible(programTime); },
     moveToX: (x) => moveTo(x, { allowSnap: true, select: true }),
+    /** 关键帧磁吸开关（片段边界磁吸不受它影响，恒开）。 */
+    setKeyframeSnap(on) { snapKeyframes = on !== false; },
     currentProgramTime: () => programTime,
     setSource(media) {
       srcDuration = Math.max(0.001, Number(media.duration) || 0.001);
@@ -867,7 +878,7 @@ function createTimeline(options) {
     /** 磁吸候选点（给 HUD 显示"吸附到哪个关键帧"用）。 */
     snapAtProgram: (pt) => {
       const x = tToX(pt);
-      const hit = snapCandidate(x);
+      const hit = snapCandidate(x, { keyframes: snapKeyframes });
       return hit && Math.abs(hit.t - pt) < 1e-6 ? hit : null;
     },
     get clips() { return clips.map((c) => ({ ...c })); },
