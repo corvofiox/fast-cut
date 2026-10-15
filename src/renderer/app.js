@@ -33,8 +33,9 @@ const pb = { index: 0 };      // 播放头当前落在第几个片段
 let lastSnap = null;          // 最近一次拖放的磁吸结果，给 #hud 用
 let tl = null;
 let rafId = 0;
-let rewindId = 0;             // 倒带循环的 rAF 句柄（与正放的 rafId 分开，两者不同时跑）
-const rewindClock = { last: 0 };   // 倒带上一帧的墙上时刻，用来算这一帧该退多少
+let rewindTimer = 0;          // 倒带步进的 setTimeout 句柄
+let rewindWatchdog = 0;       // seek 卡死时的兜底定时器
+const rewind = { stepDurMs: 0, frameDurS: 1 / 30, nextWall: 0 };
 
 // ---------------------------------------------------------------- 工具
 
@@ -485,7 +486,9 @@ function onScrub(srcT, progT, snap) {
 
 function onTimeUpdate() {
   const p = $('player');
-  const pt = playheadProgram();
+  // 倒带时视频停在画面泵正在追的旧位置上，播放头/时间码要跟**逻辑播放头**（墙上时钟）走，
+  // 不能被 player.currentTime 拉回去——两条线的解耦在这也要守住
+  const pt = state.rate < 0 ? tl.currentProgramTime() : playheadProgram();
   const srcT = tl.progToSrc(pt);
   $('timecode').innerHTML = `${tcShort(pt)} <span class="sep">/</span> ${tcShort(programTotal())}`;
   const fps = state.src ? fpsOf(state.src.media) : 30;
@@ -543,37 +546,55 @@ function toggleKeyframeSnap() {
   window.fc.saveSnap(state.snapKf);
 }
 
-/** 停掉倒带循环。正放用的是 rafId，两者互斥，各管各的句柄。 */
+/** 停掉倒带循环（setTimeout 句柄 + seek 卡死的看门狗一起清）。 */
 function stopRewind() {
-  if (rewindId) { cancelAnimationFrame(rewindId); rewindId = 0; }
-  rewindClock.last = 0;
+  clearTimeout(rewindTimer); rewindTimer = 0;
+  clearTimeout(rewindWatchdog); rewindWatchdog = 0;
 }
 
 /**
  * 倒带循环：**`<video>` 不接受负的 `playbackRate`**（设 -1 直接抛 `NotSupportedError`），
- * 所以倒放不能像正放那样交给播放器，只能自己按墙上时钟把播放头往回推：
- * 每帧算一次目标成片时间再 seek。到片头就停。
+ * 所以倒放只能自己把播放头往回推——每个显示帧一次 seek。到片头就停。
  *
- * 代价是逐次 seek 的画面不如正放流畅 —— 这是浏览器预览的固有限制，导出完全不受影响
- * （导出走 ffmpeg，跟这条预览路径无关）。
+ * 节奏与驱动方式有两点讲究，都是踩过坑的：
+ *  1. **不能用 rAF 驱动**：窗口被遮挡时 rAF 直接停发，倒带整个冻结（smoke 里实测
+ *     `rate=-1` 但播放头纹丝不动）。setTimeout 后台会被节流到 ≥1s/次，但至少还在走。
+ *  2. **每帧等 `seeked` 落定再走下一步**：seek 落定要 30~100ms（HEVC 大 GOP 更慢），
+ *     60fps 的 rAF 远快于它，上一次 seek 还没出画面就被改目标 → 画面冻结（v1 的病根）。
+ *     落后就**跳帧追墙上时钟**（`skip`），画面帧率 = seek 能达到的最大速率，时间不漂移。
+ *
+ * 真正"像正放一样"丝滑的倒放（解码整个 GOP 再倒序显示）需要 WebCodecs 抓帧，
+ * 1 秒 1080p 素材的原始帧就要 ~500MB 内存，v0.1 不做；seek 步进的顿挫是浏览器
+ * 预览的固有限制，导出走 ffmpeg 完全不受影响。
  */
-function rewindTick(ts) {
-  rewindId = 0;
+function rewindStep() {
+  rewindTimer = 0;
   if (!state.src || state.rate >= 0) return;
-  const now = ts || performance.now();
-  if (!rewindClock.last) rewindClock.last = now;
-  // 切到后台再回来时 now 会跳一大截，夹一下，免得一下退到片头
-  const dt = Math.min(0.25, Math.max(0, (now - rewindClock.last) / 1000));
-  rewindClock.last = now;
-  const next = tl.currentProgramTime() - dt * Math.abs(state.rate);
-  if (next <= 0) { seekProgram(0); pausePlayback(); return; }
-  seekProgram(next);
-  rewindId = requestAnimationFrame(rewindTick);
+  const now = performance.now();
+  // 墙上时钟一律用**毫秒**（performance.now() 的原生单位），frameDur/stepDur 也是毫秒；
+  // 这段已经为单位混用栽过两跤：ms 差除以秒制 stepDur → skip ×1000 → 一按就到片头
+  const lateMs = Math.min(1000, Math.max(0, now - rewind.nextWall));   // 落后多少 ms（切后台夹到 1s）
+  rewind.nextWall = now + rewind.stepDurMs;
+  const skip = Math.floor(lateMs / rewind.stepDurMs);                  // 落后几帧跳几帧
+  const cur = tl.currentProgramTime();
+  const target = cur - rewind.frameDurS * (1 + skip);
+  if (target <= rewind.frameDurS * 0.5) { seekProgram(0); pausePlayback(); return; }
+  seekProgram(target);                        // 播放头与画面一起到位
+  // 等这一帧真正解出来（seeked 续拍，见 bindUi 的监听器）；seek 卡死由看门狗兜底
+  clearTimeout(rewindWatchdog);
+  rewindWatchdog = setTimeout(() => {
+    rewindWatchdog = 0;
+    if (state.rate < 0 && !rewindTimer) rewindTimer = setTimeout(rewindStep, 0);
+  }, 300);
 }
 
 function startRewind() {
   stopRewind();
-  rewindId = requestAnimationFrame(rewindTick);
+  const fps = fpsOf(state.src.media) || 30;
+  rewind.frameDurS = 1 / fps;                                        // 帧长（秒）
+  rewind.stepDurMs = (1000 / fps) / Math.abs(state.rate);            // 每个显示帧占的墙上时间（毫秒）
+  rewind.nextWall = performance.now();
+  rewindTimer = setTimeout(rewindStep, 0);
 }
 
 /** 设定走带速率：r > 0 正放（交给 playbackRate），r < 0 倒带（自己推播放头）。 */
@@ -581,7 +602,11 @@ function applyRate(r) {
   state.rate = r;
   const p = $('player');
   if (r < 0) {
-    // 倒带时播放器必须停住，否则它一边往前放、我们一边往回 seek
+    // 倒带时播放器必须停住，否则它一边往前放、我们一边往回 seek。
+    // **同步 cancel 正放的 rAF**：pause 事件是异步的，等它来 cancel 的话，
+    // 旧 tick 可能再跑一帧、把 currentTime 拉回片段起点（tick 的"出界拉回"分支），
+    // seekProgram 刚发的目标就被吞了——表现为切倒带后播放头纹丝不动。
+    if (rafId) { cancelAnimationFrame(rafId); rafId = 0; }
     if (!p.paused) p.pause();
     startRewind();
   } else {
@@ -609,9 +634,16 @@ function togglePlay() {
 
 function pausePlayback() {
   if (!state.src) return;
+  const wasRewinding = state.rate < 0;
   stopRewind();
   applyRate(1);
   const p = $('player');
+  // 从倒带停下来的那一刻，把视频对齐到逻辑播放头的最终位置——
+  // 停之前画面泵可能还差一帧没追上，不补这一下画面会停在半路
+  if (wasRewinding) {
+    const srcT = tl.progToSrc(tl.currentProgramTime());
+    p.currentTime = clamp(srcT, 0, state.src.media.duration);
+  }
   if (!p.paused) p.pause();
   else { $('btnPlay').textContent = '▶'; onTimeUpdate(); }
 }
@@ -652,6 +684,7 @@ function stepRate(dir, fine) {
 function tick() {
   rafId = 0;
   if (!state.src) return;
+  if (state.rate < 0) return;                 // 倒带走自己的泵，正放循环不掺和
   const p = $('player');
   if (p.paused) { onTimeUpdate(); return; }
   const c = state.clips[pb.index];
@@ -792,19 +825,27 @@ function splitAtPlayhead() {
 }
 
 
-/** Backspace：删掉播放头所在的整段，后面自动并拢。 */
+/**
+ * Backspace：删掉**鼠标选中的高亮段**（点胶片/列表选中的那段），后面自动并拢。
+ *
+ * 高亮（state.sel）与播放头停靠段（pb.index）是两个独立的东西——单击胶片只选中、
+ * 不动播放头，两者可以停在不同段上。删除跟随高亮才符合直觉（`448b6ff` 之前跟随
+ * 播放头，用户点选了第 3 段按 Backspace 却删掉播放头所在的第 1 段）。
+ * Q/E 的"删到上/下一个分割点"仍以播放头为基准，那是它们的定义。
+ */
 function deleteClipAtPlayhead() {
   if (!state.src) return;
-  const i = tl.clipIndexAtProg(tl.currentProgramTime());
-  if (i < 0) return;
+  let i = Number.isInteger(state.sel) ? state.sel : -1;
+  if (i < 0 || !state.clips[i]) i = tl.clipIndexAtProg(tl.currentProgramTime());
+  if (i < 0 || !state.clips[i]) return;
   if (state.clips.length === 1) { toast('只剩一段，删掉就没东西可导出了', 'warn'); return; }
   const c = state.clips[i];
   state.clips.splice(i, 1);
   relayout();
   state.sel = clamp(i - 1, 0, state.clips.length - 1);
-  pb.index = state.sel;
   pushHistory();
   syncTimeline();
+  // 播放头留在原成片时刻（被删段若不在播放头下，其它段的素材位置整体前移，画面跟着重算）
   seekProgram(clamp(tl.currentProgramTime(), 0, programTotal()));
   toast(`已删除 ${(c.end - c.start).toFixed(3)}s`);
 }
@@ -1433,6 +1474,12 @@ function bindUi() {
   const p = $('player');
   p.addEventListener('loadedmetadata', () => { onTimeUpdate(); tl.render(); });
   p.addEventListener('timeupdate', () => { if (!rafId) onTimeUpdate(); });
+  // 倒带的节奏驱动：一次 seek 落定就按拍点追下一帧（见 rewindStep 的注释）
+  p.addEventListener('seeked', () => {
+    if (state.rate >= 0 || rewindTimer) return;
+    clearTimeout(rewindWatchdog); rewindWatchdog = 0;
+    rewindTimer = setTimeout(rewindStep, Math.max(0, rewind.nextWall - performance.now()));
+  });
   p.addEventListener('durationchange', onTimeUpdate);
   p.addEventListener('play', () => { $('btnPlay').textContent = '⏸'; if (!rafId) rafId = requestAnimationFrame(tick); });
   p.addEventListener('pause', () => {

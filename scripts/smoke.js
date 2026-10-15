@@ -562,19 +562,40 @@ async function main() {
   check('快进封顶 16×', rMax === 16, `顶到 ${rMax}×`);
 
   // 反向切档：正在 16× 正放时按 J，必须从 -1× 起倒，而不是一下跳到 -16×
+  await js(win, `(() => {
+    window.__evlog = [];
+    const p = document.getElementById('player');
+    ['pause','play','seeked'].forEach((ev) => p.addEventListener(ev, () => window.__evlog.push([performance.now().toFixed(0), ev, 'rate=' + __smoke.state.rate, 'ct=' + p.currentTime.toFixed(2)]), true));
+    return 'ok';
+  })()`);
   await js(win, '__smoke.seekProgram(6); __smoke.stepRate(-1, false); "ok"');
-  await wait(250);
+  await wait(80);
+  const mid = JSON.parse(await js(win, `JSON.stringify({
+    rate: __smoke.state.rate, pt: __smoke.tl.currentProgramTime(), ct: document.getElementById('player').currentTime })`));
+  await wait(170);
   const rRev1 = JSON.parse(await js(win,
-    'JSON.stringify({ rate: __smoke.state.rate, paused: document.getElementById("player").paused, tag: document.getElementById("rateTag").textContent })'));
+    'JSON.stringify({ rate: __smoke.state.rate, paused: document.getElementById("player").paused, tag: document.getElementById("rateTag").textContent, pt: __smoke.tl.currentProgramTime() })'));
   check('J 从正放切到倒带时从 -1× 起步', rRev1.rate === -1 && rRev1.paused && rRev1.tag === '-1×',
-    `16× 正放 → 按 J → ${rRev1.rate}×，标记 "${rRev1.tag}"`);
+    `16× 正放 → 按 J → ${rRev1.rate}×（80ms 时 pt=${mid.pt}）`);
 
   // 倒带真的在往回走：等一会儿，播放头必须比刚才更靠前（时间更小）
   const revBefore = await js(win, '__smoke.tl.currentProgramTime()');
   await wait(700);
   const revAfter = await js(win, '__smoke.tl.currentProgramTime()');
+  const evlog = await js(win, '(window.__evlog || []).slice(0, 14).map((r) => r.join(" ")).join(" | ")');
   check('倒带时播放头真的往回走', revAfter < revBefore - 0.05,
-    `${revBefore.toFixed(3)}s → ${revAfter.toFixed(3)}s（退了 ${(revBefore - revAfter).toFixed(3)}s）`);
+    `rate=${rRev1.rate} ${revBefore.toFixed(3)}s → ${revAfter.toFixed(3)}s（退了 ${(revBefore - revAfter).toFixed(3)}s）`
+    + ` · 事件: ${evlog}`);
+
+  // 画面泵连续追帧：视频的 currentTime 在倒带期间必须持续更新（= 多次 seek 落定），
+  // 旧版 rAF 抢跑把 seek 全打断，currentTime 一次都不动、画面冻结
+  const vidA = await js(win, 'document.getElementById("player").currentTime');
+  await wait(600);
+  const vidB = await js(win, 'document.getElementById("player").currentTime');
+  check('倒带时画面在连续追帧（currentTime 持续更新）', vidB < vidA - 0.05,
+    `${vidA.toFixed(3)}s → ${vidB.toFixed(3)}s`);
+  check('倒带时画面与播放头不脱节', Math.abs(vidB - revAfter) < 1.5,
+    `画面 ${vidB.toFixed(3)}s · 播放头 ${revAfter.toFixed(3)}s`);
 
   await js(win, '__smoke.stepRate(-1, false); __smoke.stepRate(-1, false); "ok"');
   await wait(200);
@@ -614,18 +635,21 @@ async function main() {
   await wait(200);
   check('Shift+L 慢放逐档变慢', rSlow1 === 1 && rSlow2 === 0.75, `1× → ${rSlow2}×`);
 
-  // 8c) Backspace：删掉播放头所在的整段
+  // 8c) Backspace：删掉**鼠标选中的高亮段**（不是播放头停靠段——两者可以停在不同段上）
   await js(win, '__smoke.resetClips(); "ok"');
   await wait(300);
   await js(win, '__smoke.seekProgram(3); __smoke.splitAtPlayhead(); __smoke.seekProgram(7); __smoke.splitAtPlayhead(); "ok"');
   await wait(400);
   const beforeBs = JSON.parse(await js(win, 'JSON.stringify({ n: __smoke.state.clips.length, total: __smoke.programTotal() })'));
-  await js(win, '__smoke.seekProgram(5); __smoke.deleteClipAtPlayhead(); "ok"');
+  // 播放头停在第 1 段（seek 3），鼠标点选第 3 段（源 7-10）→ Backspace 删的必须是第 3 段
+  await js(win, '__smoke.seekProgram(5); __t.clickFilm(8); "ok"');
+  await wait(300);
+  await js(win, '__smoke.deleteClipAtPlayhead(); "ok"');
   await wait(400);
   const afterBs = JSON.parse(await js(win, 'JSON.stringify({ n: __smoke.state.clips.length, total: __smoke.programTotal(), clips: __smoke.state.clips })'));
-  check('Backspace 删掉整段并并拢',
-    beforeBs.n === 3 && afterBs.n === 2 && afterBs.total === 6 && afterBs.clips[1].start === 7 && afterBs.clips[1].ps === 3,
-    `${beforeBs.n} 段 ${beforeBs.total}s → ${afterBs.n} 段 ${afterBs.total}s`);
+  check('Backspace 删掉选中的高亮段',
+    beforeBs.n === 3 && afterBs.n === 2 && afterBs.total === 7 && afterBs.clips[1].start === 3,
+    `${beforeBs.n} 段 ${beforeBs.total}s → ${afterBs.n} 段 ${afterBs.total}s（删的是源 7-10 那段）`);
   await js(win, '__smoke.undo(); "ok"');
   await wait(300);
   check('撤销恢复被删的整段', (await js(win, '__smoke.state.clips.length')) === 3);
