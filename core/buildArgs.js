@@ -105,6 +105,17 @@ function argsForSegment(item, media, outPath, opts = {}) {
     : (fps && Number.isFinite(item.duration) ? Math.round(item.duration * fps) : null);
   if (frames) args.push('-frames:v', String(Math.max(1, frames)));
   else args.push('-t', fmtTime(item.duration));
+  /**
+   * 重编码段必须同时给 -t 上限（= 帧数×帧间隔）：-frames:v 的停止条件是第 N 帧
+   * **穿过编码器**，x264/x265 的 lookahead 让这滞后于 demuxer 好几十秒——期间流拷贝
+   * 的音频被原样灌进 muxer（实测 1.5s 的重编码头段音频拖到 47.5s，每条接缝被拉长
+   * 几十秒；30 分钟 .ts 素材两段混拼报"视频轨比计划多 226s"就是这个）。
+   * -t 与 -frames:v 双重约束后视频仍恰好 N 帧（实测 -t=帧数×帧间隔 不丢帧；取比
+   * "末帧 PTS"更长的整段时长才安全，取末帧 PTS 本身会削掉最后一帧），音频尾差被压回
+   * 约一个 AAC 包粒度，与拷贝段形态一致。拷贝段无编码器延迟、包数一到立即停止，
+   * 实测音频贴合视频，不存在此问题，刻意不下发。
+   */
+  if (item.kind === 'reencode' && fps && frames) args.push('-t', fmtTime(frames / fps));
 
   if (item.kind === 'copy') {
     args.push('-c', 'copy');

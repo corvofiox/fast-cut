@@ -96,6 +96,19 @@ test('重编码段沿用源的编码参数，音轨仍拷贝', () => {
   assert.ok(!args.includes('-avoid_negative_ts'));
 });
 
+test('重编码段在 -frames:v 之外再下 -t：编码器 lookahead 滞后会让拷贝音频无界灌入', () => {
+  // -frames:v 的停止条件是第 N 帧穿过编码器，x265 lookahead 期间 demuxer 早已把
+  // 几十秒流拷贝音频灌进 muxer（实测 1.5s 头段音频拖到 47.5s，拼接逐接缝拉长）。
+  const args = argsForSegment({ kind: 'reencode', start: 0, duration: 1.5, frames: 45 }, MEDIA, 'out.mp4', { fps: 30 });
+  const i = (x) => args.indexOf(x);
+  assert.strictEqual(args[i('-frames:v') + 1], '45');
+  // -t = 帧数×帧间隔（45/30），不能取整到末帧 PTS——取 PTS 会削掉最后一帧（实测 45→44）
+  assert.strictEqual(args[i('-t') + 1], '00:00:01.500');
+  // 拷贝段无编码器延迟、包数一到立即停，实测音频贴合视频，刻意不下发
+  const copy = argsForSegment({ kind: 'copy', start: 0, duration: 1.5, frames: 45 }, MEDIA, 'out.mp4', { fps: 30 });
+  assert.strictEqual(copy.indexOf('-t'), -1);
+});
+
 test('H.265 源重编码段选 libx265，且 colorRange unknown 不注入空参数', () => {
   const hevc = { ...MEDIA, video: { codec: 'hevc', profile: 'Main', pixFmt: 'yuv420p', fps: 25, colorPrimaries: 'unknown', colorTransfer: 'unknown', colorSpace: 'unknown' } };
   const args = argsForSegment({ kind: 'reencode', start: 1, end: 2 }, hevc, 'out.mp4');

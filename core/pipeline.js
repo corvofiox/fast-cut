@@ -13,7 +13,7 @@ const os = require('os');
 const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./segments');
 const { buildPlan, frameStart } = require('./cuttings');
 const { probeMedia, probeKeyframes, run, sourceSubtitleCues } = require('./probe');
-const { familyOfFormat, familyOfExt } = require('./containers');
+const { familyOfFormat, familyOfExt, byId, byExt } = require('./containers');
 const { parseSrt, parseAss, applyRetime, retime, isTextSubtitle } = require('./subtitles');
 const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
 const { verifyExport } = require('./verify');
@@ -156,6 +156,10 @@ async function exportSegments(loaded, segments, opts) {
     onProgress = () => {}, token = createToken(),
   } = opts;
 
+  // 自检用的容器家族：调用方传容器 id（'mp4'）或扩展名（'.mp4'）都行，转成
+  // containers 的家族对象（{family,label,ext}）；不传则 verify 退回"与源一致"判。
+  const containerFamily = (typeof container === 'string' ? byId(container) || byExt(container) : container);
+
   const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, precise, dropSubtitles });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
@@ -267,6 +271,19 @@ async function exportSegments(loaded, segments, opts) {
       const trimmed = idxList.reduce((a, n) => a + (plan[n].trimmed || 0), 0);
       return trimmed / frames;
     };
+    /**
+     * 时长自检的基准：Σframes/fps，而不是 Σ窗口时长。
+     * 窗口是"显示时刻跨度"，混拼产物首尾丢的是解码序的帧——B 帧收尾（trimmed）与
+     * HEVC RASL 剥除（已扣进 frames，raslTrimmed 段不重复扣）按显示时刻量不变，
+     * 但产物帧数就是少了，视频轨时长 = frames/fps。上轮把基准定为窗口和，短素材
+     * 损失小落在 -1.0s 允差里没露馅；60s 源 24 个关键帧剥 81 帧（2.7s）+ B 帧尾差
+     * 就把 -1.0s 冲穿（实测 55.5s 计划量出 52.767s，实际产物完全正确）。fps 缺失
+     * （折不出帧数）时回退窗口和，允差交给 verify 的 -1.0s 下界兜底。
+     */
+    const framesToSecs = (idxList) => {
+      const f = framesSum(idxList);
+      return f != null && cutFps ? f / cutFps : idxList.reduce((a, n) => a + plan[n].duration, 0);
+    };
     const expectSlack = [];
     // 每条保留区间在成片里的起点（拼接模式按全部区间累加）
     const progOfKeep = {};
@@ -305,7 +322,7 @@ async function exportSegments(loaded, segments, opts) {
           await concatInto(files, target, cutMedia, bins, { subs: subs.files });
         }
         outputs.push(target);
-        expectSecs.push(snap(groups[i].reduce((acc, n) => acc + plan[n].duration, 0)));
+        expectSecs.push(snap(framesToSecs(groups[i])));
         expectFrames.push(framesSum(groups[i]));
         expectSlack.push(rateSlackOf(groups[i]));
         wantCues.push(subs.cues);
@@ -320,7 +337,7 @@ async function exportSegments(loaded, segments, opts) {
       outputs = [outPath];
       // 基准按计划实算：段时长是整帧时刻，与用户选区最多差一帧。
       // 拿源长百分比当允差会宽到"吞掉剪辑"都查不出来（实测 98 分钟片删 1.9s 判通过）。
-      expectSecs.push(snap(plan.reduce((acc, p) => acc + p.duration, 0)));
+      expectSecs.push(snap(framesToSecs(plan.map((_, n) => n))));
       expectFrames.push(framesSum(plan.map((_, n) => n)));
       expectSlack.push(rateSlackOf(plan.map((_, n) => n)));
       wantCues.push(subs.cues);
@@ -343,7 +360,7 @@ async function exportSegments(loaded, segments, opts) {
       const r = await verifyExport(bins.ffmpeg, bins.ffprobe, file, outputs[i],
         {
           duration: expectSecs[i], userSecs: userSecs[i], frames: expectFrames[i],
-          rateSlack: expectSlack[i], container, wantCues: wantCues[i],
+          rateSlack: expectSlack[i], container: containerFamily, wantCues: wantCues[i],
           subTracks: subTracks[i],
           dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length,
           seams: seamsList[i],
