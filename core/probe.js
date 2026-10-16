@@ -399,4 +399,7 @@ async function probeHasRasl(ffmpegPath, file, keyframes = [], duration = 0) {
   return sawAny ? false : true;                        // 全部抽不出 → 保守判"有"
 }
 
-module.exports = { run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues, probeHasRasl };
+module.exports = {
+  run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues,
+  probeHasRasl,
+};

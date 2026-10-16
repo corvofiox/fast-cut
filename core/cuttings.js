@@ -65,7 +65,7 @@ function frameIndex(t, fps, origin = 0) {
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0 } = opts;
+  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0, seamNeedsIdr = false, forceWholeReencode = false } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   const bdepth = Math.max(0, Number(reorderDepth) || 0);
   // 帧网格原点：源首帧 pts 不一定落在 0（实测 HEVC 的 .mp4/.mkv 首帧 pts = 0.023，
@@ -77,6 +77,7 @@ function buildPlan(keeps, opts) {
   const warnings = [];
   const plan = [];
   let warnedVfr = false;
+  let warnedSeamBroken = false;
   let raslCounted = 0;              // RASL 剥除帧数：copyPart（源尾分支）与收尾循环共同累计，去重后给警告
 
   /**
@@ -175,6 +176,35 @@ function buildPlan(keeps, opts) {
     let autoNote = '';
 
     /**
+     * 通用探针判定"单个拷贝段自己就解不开"时的整段重编码。
+     *
+     * 实测（x264 开放 GOP）：它的"关键帧"NAL type 是 1（非 IDR），不是 5；
+     * ffprobe 的 K 标志只表示"可随机接入标记"，而这些帧从任意位置流拷贝出来
+     * 都报 `Missing reference picture` / `mmco: unref short failure`。
+     * 此时"开头重编码一小段"救不了——拷贝尾段本身就是从非 IDR 起的。
+     * 唯一保证可解码的出路是每个片段整段重编码（有损，但帧精确、必然可解）。
+     *
+     * 与 VFR 那条不同：这条是**通用探针实测结论**，不看编码。
+     */
+    if (forceWholeReencode && sameCodec) {
+      if (!warnedSeamBroken) {
+        warnedSeamBroken = true;
+        warnings.push(
+          '源的关键帧不是自包含随机接入点（实测：从它流拷贝出来的片段自己就解不开，'
+          + '报 "Missing reference picture" / "mmco: unref short failure"）——'
+          + '这类源的每个片段都改为整段重编码（有损，但可解码、切点精确）。'
+          + '常见于 x264 的开放 GOP（open-gop=1）编码',
+        );
+      }
+      plan.push({
+        kind: 'reencode', role: 'whole', start, duration: wholeDur,
+        snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
+        note: '源的关键帧不可独立起段：整段重编码（有损）',
+      });
+      continue;
+    }
+
+    /**
      * 可变帧率源：帧长本身就不均匀，"按帧数切"出来的时长和音频对不上
      * （实测 VFR 源每条区间视频比音频短 0.3~0.5s，自检判音画不一致）。
      * 只能整段重编码成定帧率输出，用有损换"时长与剪辑位置说得准"。
@@ -210,24 +240,21 @@ function buildPlan(keeps, opts) {
       const kfStart = lastKeyframeAtMost(keep.start, keyframes);
       const snapStart = kfStart === null ? 0 : kfStart;
       /**
-       * HEVC 开放 GOP 的接缝必须由 IDR 重置 POC（2026-10-17 实测）。
+       * 多段纯拷贝拼接的接缝必须由 IDR 重置 POC。
        *
-       * 开放 GOP 全片只有开头一个 IDR，其余关键帧是 CRA。CRA 的 POC 是**接着前一段
-       * 继续编号**的，把两个纯拷贝段首尾相接，解码器在接缝处看到 POC 回绕/重复，
-       * 报 `Duplicate POC in a sequence`，且实测有真坏帧（接缝后 37 帧在源里不存在）。
+       * 判据来自**通用探针的实测结果**（`seamNeedsIdr`，见 pipeline.scanKeyframes 里
+       * 的 probePureCopySeams），不按编码写死规则：实测这一步能同时抓住
+       * HEVC 开放 GOP（`Duplicate POC`）与 H.264 开放 GOP（`mmco: unref short failure`），
+       * 以及将来任何未知格式——它们单段都能解、拼起来才炸。
        *
-       * 实测规则（`tmp/rule3.js`，与段起点、与扣不扣 RASL 全无关）：
-       *   开放 GOP 纯拷贝 CC → **必坏**；闭合 GOP 纯拷贝 CC → 必干净。
-       * 而精确模式（每个区间开头有重编码段）天然自带 IDR，**多区间也必干净**。
+       * 做法：只要这**不是第一个拷贝段**，就让本段走局部精确——入点那一小段重编码
+       * （自带 IDR）把 POC 重置掉，其余仍流拷贝。代价是该片段开头 ≤ 一个关键帧间隔有损
+       * （与精确模式同价），换来接缝可解码；第一个片段不受影响。
        *
-       * 所以：只要源含 RASL（开放 GOP）且这**不是第一个拷贝段**，就让本段走局部精确
-       * ——入点那一小段重编码（自带 IDR）把 POC 重置掉，其余仍流拷贝。代价是该区间
-       * 开头 ≤ 一个 GOP 有损（与精确模式同价），换来接缝可解码；第一个区间不受影响。
-       *
-       * 不能用"往源里插 EOS/EOB"（实测无效，且 muxer 会把它们丢掉）、
-       * 也不能把 CRA 改写成 IDR（实测 `Could not find ref with POC`）。
+       * 试过但无效（都实测过，别再走）：源里插 EOS/EOB（muxer 会丢掉）、
+       * 把 CRA 改写成 IDR（`Could not find ref with POC`）、加长重编码段（无差别）。
        */
-      const needIdrSeam = raslPerKf > 0 && plan.some((p) => p.kind === 'copy');
+      const needIdrSeam = seamNeedsIdr && plan.some((p) => p.kind === 'copy');
       // 已排【计划段】（源时间轴上的实际拷贝范围，含前几条吸附扩出来的部分）：
       // 本段吸附拷贝 [snapStart, end) 若与它们交叠 = 吞已删内容或重复导出。
       // 对照 keeps 原始区间是错的——乱序下吸附扩出来的 [6,10] 不在任何 keep 源区间里。

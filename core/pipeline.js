@@ -74,6 +74,19 @@ async function scanKeyframes(loaded) {
       loaded.bins.ffmpeg, loaded.file, loaded.media.keyframes, loaded.media.duration,
     );
   }
+  /**
+   * 通用探针：这份源的多段纯拷贝拼接能不能解码干净。
+   * 一次实测约 0.2s（切 3 段 + 拼一次 + 解一遍），导入时跑一次；
+   * 结果决定吸附模式下要不要给非首个片段做接缝缓解（片段开头重编码）。
+   * 与编码无关——H.264 开放 GOP、HEVC 开放 GOP，以及将来任何未知格式一并覆盖。
+   */
+  if (keyframes.length >= 3) {
+    const seam = await probePureCopySeams(loaded);
+    loaded.media.seamSafe = seam.safe;
+    // 单段就解不开 → 只能整段重编码（接缝缓解救不了）；段干净、拼起来才坏 → 接缝重置即可
+    loaded.media.segmentsOk = seam.segmentsOk;
+    loaded.media.seamProbe = { detail: seam.detail, ms: seam.ms, segs: seam.segs, segmentsOk: seam.segmentsOk };
+  }
   return keyframes;
 }
 
@@ -131,6 +144,21 @@ function planFor(loaded, segments, opts = {}) {
       && loaded.media.hasRasl !== false
       ? loaded.media.video.reorderDepth + 1
       : 0,
+    /**
+     * 多段纯拷贝拼接是否需要"接缝缓解"（非首个片段开头重编码，自带 IDR 重置 POC）。
+     *
+     * 判据来自**通用探针的实测结果**（scanKeyframes 里跑的 probePureCopySeams），
+     * 而不是按编码写死规则。这样 H.264 开放 GOP、以及将来任何未知格式一并覆盖。
+     * 探针没跑（关键帧太少）时退回"有 RASL 就要缓解"，保守但不会漏。
+     */
+    seamNeedsIdr: loaded.media.seamSafe === false
+      || (loaded.media.seamSafe === undefined && loaded.media.hasRasl === true),
+    /**
+     * 更严重的一层：探针发现**单个拷贝段自己就解不开**（实测 x264 开放 GOP 的 K 帧
+     * NAL type 是 1 不是 5，根本不是 IDR）。此时"开头重编码一小段"也救不了——
+     * 拷贝尾段本身从非 IDR 起。唯一出路是每个片段整段重编码（有损，但可解码）。
+     */
+    forceWholeReencode: loaded.media.segmentsOk === false,
     // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
     precise: opts.precise !== false,
   });
@@ -582,6 +610,117 @@ async function concatInto(parts, outPath, media, bins, opts = {}) {
   }
 }
 
+/**
+ * 通用探针：这份源的**纯拷贝多段拼接**能不能解码干净？并区分坏在哪一层。
+ *
+ * 为什么要有它（2026-10-17）：视频格式太多（h264/hevc/vp9/av1/mpeg2/mpeg4…），
+ * 每种的随机接入语义都不同。逐个写规则要么漏（H.264 的开放 GOP 就没有对应代码），
+ * 要么互相打架。实测可以**完全不看编码**：拿生产自己的切段/拼接参数在源上做一次
+ * 微缩试跑，看产物解码有没有错。
+ *
+ * 三个实测得出的设计要点（每一条都是踩过坑才定下来的）：
+ *  1. 必须测**多段拼接**，不能测"单段能不能解"：HEVC 开放 GOP 单段全干净，
+ *     两段拼起来才报 `Duplicate POC`（前导帧引用了段外画面）。单段探针会漏判。
+ *  2. 必须用**生产函数**（planFor + argsForSegment）而不是手写 ffmpeg 参数：
+ *     手写时漏一个 `frames` 字段（该用 `-frames:v` 却用了 `-t`），切出的段就与生产
+ *     不同，实测会把 HEVC 开放 GOP 误判成安全。
+ *  3. 段要**够长（6s）**：2s 的段装不下足够的段内关键帧，被剥的 RASL 太少，
+ *     POC 冲突在解码器那里还没累积到报错的程度，会漏判。
+ *
+ * **必须看 stderr，不能只看退出码**：`Duplicate POC` / `mmco: unref short failure`
+ * 这类问题 ffmpeg 照样退出 0，只看退出码会把坏产物判成安全（实测漏判过）。
+ *
+ * 返回分两层，因为两类源的修法不同（实测）：
+ *  - `segmentsOk=false`：连**单个拷贝段**都解不开 → 该源的关键帧不是自包含接入点
+ *    （实测 x264 开放 GOP 的 K 帧 NAL type 是 1 不是 5，根本不是 IDR）；
+ *    只能整段重编码，接缝缓解救不了。
+ *  - `segmentsOk=true && concatOk=false`：段都干净、拼起来才炸（HEVC 开放 GOP）
+ *    → 用"非首个片段开头重编码"重置 POC 即可，代价只有一小段。
+ *
+ * @returns {Promise<{safe:boolean, segmentsOk:boolean, concatOk:boolean, detail:string, ms:number, segs:number}>}
+ */
+async function probePureCopySeams(loaded, opts = {}) {
+  const { segSec = 6.0, picks = 3 } = opts;
+  const { file, media, bins } = loaded;
+  const kfs = media?.keyframes || [];
+  const fps = Number(media?.video?.fps) > 0 ? Number(media.video.fps) : 30;
+  const dur = Number(media?.duration) || 0;
+  const none = { safe: true, segmentsOk: true, concatOk: true, detail: '', ms: 0, segs: 0 };
+  if (kfs.length < 3 || dur <= 0) return { ...none, detail: '关键帧/时长不足，跳过' };
+  /**
+   * 带字幕轨的源不能这么探：探针固定写 MP4 中间段，而 MP4 装不下 subrip/ass 的流拷贝
+   * （实测 `Could not find tag for codec subrip`）——探针会自己失败，把好源误判成坏源。
+   * 字幕在导出路径里另有处理（抽出来重排），与接缝问题无关，直接跳过探测。
+   */
+  if ((media.subtitleCodecs || []).length) return { ...none, detail: '源带字幕轨，跳过探测（不影响接缝判断）' };
+
+  const t0 = Date.now();
+  const usable = kfs.slice(0, Math.max(1, kfs.length - 1));
+  const step = Math.max(1, Math.floor(usable.length / (picks + 1)));
+  const starts = [];
+  for (let i = 1; i <= picks; i++) {
+    const k = usable[Math.min(usable.length - 1, i * step)];
+    if (Number.isFinite(k) && k + 0.4 < dur) starts.push(snap(k));
+  }
+  const uniq = [...new Set(starts)];
+  if (uniq.length < 2) return { ...none, detail: '可采样点不足 2 个，跳过' };
+
+  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fast-cut-probe-'));
+  try {
+    const parts = [];
+    let segBad = '';
+    for (let i = 0; i < uniq.length; i++) {
+      // 单条区间走吸附模式 → 拿到真实的纯拷贝计划项（含 frames），再只取拷贝段
+      const { plan } = planFor(loaded, [{ start: uniq[i] + 0.4, end: Math.min(uniq[i] + 0.4 + segSec, dur - 0.05) }],
+        { precise: false });
+      const copy = plan.find((p) => p.kind === 'copy');
+      if (!copy || !(copy.duration > 0.3)) continue;
+      const out = path.join(tmpDir, `s${i}.mp4`);
+      await run(bins.ffmpeg, argsForSegment(copy, media, out, { fps, copyTs: 'make_zero', dumpParams: false }));
+      // 单段自解：这一层决定"接缝缓解够不够"
+      if (!segBad) {
+        const e = await decodeNoise(bins.ffmpeg, out);
+        if (e) segBad = e;
+      }
+      parts.push(out);
+    }
+    if (parts.length < 2) return { ...none, detail: `只切出 ${parts.length} 段，跳过`, segs: parts.length };
+    if (segBad) {
+      return { safe: false, segmentsOk: false, concatOk: false, detail: segBad, ms: Date.now() - t0, segs: parts.length };
+    }
+
+    const joined = path.join(tmpDir, 'j.mp4');
+    await fsp.writeFile(listPathOf(joined), concatListBody(parts), 'utf8');
+    try {
+      await run(bins.ffmpeg, argsForConcat(parts, joined, media, 'concat_demuxer', {}));
+    } catch (err) {
+      return { safe: false, segmentsOk: true, concatOk: false, detail: `试拼失败：${String(err.message).split('\n')[0].slice(0, 100)}`, ms: Date.now() - t0, segs: parts.length };
+    }
+    const e = await decodeNoise(bins.ffmpeg, joined);
+    return {
+      safe: !e, segmentsOk: true, concatOk: !e,
+      detail: e, ms: Date.now() - t0, segs: parts.length,
+    };
+  } finally {
+    await rmrf(tmpDir);
+  }
+}
+
+/** 解一遍产物，返回第一条真正的错误（没有错误返回空串）。封装修辞按 verify 同一口径滤掉。 */
+async function decodeNoise(ffmpegPath, file) {
+  const BENIGN = /non monotonically increasing dts to muxer|Last message repeated \d+ times/i;
+  let stderr = '';
+  try {
+    const r = await run(ffmpegPath, ['-v', 'error', '-xerror', '-i', file, '-f', 'null', '-']);
+    stderr = r.stderr || '';
+  } catch (err) {
+    stderr = err.stderr || err.message || '';
+  }
+  const n = String(stderr).split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => l && !BENIGN.test(l)).map((l) => l.replace(/^\[[^\]]+\]\s*/, ''));
+  return n[0] || '';
+}
+
 function numbered(outPath, i, ext) {
   const dir = path.dirname(outPath);
   const base = path.basename(outPath, ext);
@@ -601,4 +740,5 @@ function fmtBytes(n) {
 
 module.exports = {
   loadSource, probeSource, scanKeyframes, exportSegments, createToken, planFor, numbered, groupByKeep,
+  probePureCopySeams,
 };

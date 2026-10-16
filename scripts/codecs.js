@@ -211,6 +211,30 @@ const FIXTURES = [
     snap: true,
     spanTol: 0.85,
   },
+  /**
+   * H.264 开放 GOP（2026-10-17 实测）：这类源的"关键帧"**不是 IDR**
+   * （实测 NAL type=1 而非 5），从它流拷贝出来的片段**自己就解不开**
+   * （`Missing reference picture` / `mmco: unref short failure`）。
+   *
+   * 与 HEVC 开放 GOP 不同：那边是"段干净、拼起来才炸"，靠"非首个片段开头重编码"
+   * 就能修；这边连单段都不干净，只能整段重编码。
+   * 通用探针（probePureCopySeams）的两层判定（segmentsOk / concatOk）就是为区分这个。
+   *
+   * 注：不带字幕（探针固定写 MP4 中间段，装不下 subrip/ass）。
+   */
+  {
+    name: 'h264 30s 开GOP 多区间',
+    file: 'h264open30.mp4',
+    note: 'x264 开放 GOP 的 K 帧不是 IDR，片段自身解不开：必须整段重编码',
+    args: ['-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=30',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=30',
+      '-c:v', 'libx264', '-x264-params', 'keyint=60:min-keyint=60:scenecut=0:open-gop=1',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'],
+    segs: 'long',
+    snap: true,
+    // 整段重编码后时长按帧数走，与"窗口和"的差就是 B 帧余量，放宽一点
+    spanTol: 0.5,
+  },
 ];
 
 const MODES = [
