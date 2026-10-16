@@ -67,8 +67,18 @@ function streamBsfFor(item, media, opts = {}) {
     return MIXED_PARAM_BSF[codec] ? ['-bsf:v', MIXED_PARAM_BSF[codec]] : [];
   }
   if (codec === 'hevc') {
-    if (opts.dumpParams) return ['-bsf:v', `${HEVC_DROP_RASL},${MIXED_PARAM_BSF.hevc}`];
-    return ['-bsf:v', HEVC_DROP_RASL];
+    /**
+     * 只在源**确实含 RASL**时才剔。闭合 GOP 的 HEVC（x265 `open-gop=0`）每个关键帧都是
+     * IDR、一个 RASL 都没有（实测 NAL 8/9 计数为 0），此时下发 `remove_types=8|9` 是空操作，
+     * 但配套的"每段内关键帧扣 raslPerKf 帧"记账会**白扣掉真实内容**（实测 1.03 秒）。
+     * 所以剥除与记账必须同进同退：都看 `media.hasRasl`（由 probeHasRasl 实测）。
+     * 字段缺失（老调用方/单测）时按 true 走保守路径，行为与本修改前一致。
+     */
+    const stripRasl = media?.hasRasl !== false;
+    if (opts.dumpParams) {
+      return ['-bsf:v', stripRasl ? `${HEVC_DROP_RASL},${MIXED_PARAM_BSF.hevc}` : MIXED_PARAM_BSF.hevc];
+    }
+    return stripRasl ? ['-bsf:v', HEVC_DROP_RASL] : [];
   }
   if (codec === 'h264' && opts.dumpParams) return ['-bsf:v', MIXED_PARAM_BSF.h264];
   return [];

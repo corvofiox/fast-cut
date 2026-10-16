@@ -12,7 +12,7 @@ const os = require('os');
 
 const { normalizeSegment, normalizeSegments, totalDuration, snap } = require('./segments');
 const { buildPlan, frameStart } = require('./cuttings');
-const { probeMedia, probeKeyframes, run, sourceSubtitleCues } = require('./probe');
+const { probeMedia, probeKeyframes, run, sourceSubtitleCues, probeHasRasl } = require('./probe');
 const { familyOfFormat, familyOfExt, byId, byExt } = require('./containers');
 const { parseSrt, parseAss, applyRetime, retime, isTextSubtitle } = require('./subtitles');
 const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
@@ -64,6 +64,14 @@ async function scanKeyframes(loaded) {
   loaded.media.lastKeyframe = snap(keyframes[keyframes.length - 1]);
   // 少数容器不写时长，用最后一个关键帧兜底
   if (!loaded.media.duration) loaded.media.duration = loaded.media.lastKeyframe;
+  /**
+   * 顺带探一次"源里有没有 RASL"（HEVC NAL 8/9）。只在 HEVC 上做，实测 35ms/0.1MB。
+   * 结果决定拷贝段要不要剥 RASL、帧数预期要不要扣——闭合 GOP 硬扣会白丢真实内容
+   * （实测 1.03s），开放 GOP 不扣会把已删素材带回来。两者都是硬伤，必须实测。
+   */
+  if (loaded.media.video?.codec === 'hevc') {
+    loaded.media.hasRasl = await probeHasRasl(loaded.bins.ffmpeg, loaded.file);
+  }
   return keyframes;
 }
 
@@ -114,8 +122,11 @@ function planFor(loaded, segments, opts = {}) {
     // VFR 源帧长不均匀，按帧数切出来的时长与音频对不上：只能整段重编码成定帧率
     forceReencode: !!loaded.media.video?.vfr,
     // HEVC 开放 GOP：剥 RASL 时每个段内关键帧剥 (深度+1) 帧（x265 实测），
-    // 拷贝段的帧数预期要同步扣，见 cuttings.buildPlan 末尾的记账
+    // 拷贝段的帧数预期要同步扣，见 cuttings.buildPlan 末尾的记账。
+    // **闭合 GOP 的 HEVC 没有 RASL**，一律扣会白丢内容（实测 1.03s），
+    // 所以 media.hasRasl 必须由 probeHasRasl 实测得到；未知时按"有"走保守路径。
     raslPerKf: loaded.media.video?.codec === 'hevc' && loaded.media.video?.reorderDepth >= 0
+      && loaded.media.hasRasl !== false
       ? loaded.media.video.reorderDepth + 1
       : 0,
     // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
@@ -542,6 +553,8 @@ async function makeWorkingCopy(bins, file, media, tmpDir, token) {
   const wm = await probeMedia(bins.ffprobe, working);
   wm.keyframes = media.keyframes;
   wm.lastKeyframe = media.lastKeyframe;
+  // 纯拷贝不改码流，RASL 的有无跟着源走（planFor 用的是源 media，这里只为一致）
+  wm.hasRasl = media.hasRasl;
   return { file: working, media: wm };
 }
 

@@ -21,11 +21,12 @@ function includesOffset(formatName) {
 }
 
 /** 构造 ffmpeg 参数：把 run({args, ...}) 展开成数组，便于测试注入假执行器。 */
-function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000 } = {}) {
+function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000, binary = false } = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { windowsHide: true });
     let stderr = '';
-    let stdout = '';
+    // binary=true 时按 Buffer 收集 stdout（裸码流是二进制，转成字符串会被破坏）
+    let stdout = binary ? [] : '';
     let settled = false;
 
     const timer = setTimeout(() => {
@@ -45,7 +46,7 @@ function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000 } =
       }, { once: true });
     }
 
-    child.stdout.on('data', (d) => { stdout += d.toString(); });
+    child.stdout.on('data', (d) => { if (binary) stdout.push(d); else stdout += d.toString(); });
     child.stderr.on('data', (d) => {
       stderr += d.toString();
       if (onProgress) {
@@ -65,7 +66,7 @@ function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000 } =
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      if (code === 0) resolve({ code, stdout, stderr });
+      if (code === 0) resolve({ code, stdout: binary ? Buffer.concat(stdout) : stdout, stderr });
       else {
         const err = new Error(`${bin} 退出码 ${code}\n${tail(stderr)}`);
         // 调用方（导出自检的解码判据）要按 stderr 分辨"真报错"与封装层碎语，
@@ -313,4 +314,49 @@ async function sourceSubtitleCues(ffprobePath, file, ranges, startOffset = 0, un
   return hits.map((list) => list.sort((a, b) => a - b));
 }
 
-module.exports = { run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues };
+/**
+ * 源里到底有没有 RASL（HEVC NAL 8/9）？—— 决定要不要剥、要不要扣帧数。
+ *
+ * 为什么必须实测而不能靠猜（2026-10-17）：
+ *  - x265 默认 `open-gop=1`，但**可以显式关掉**（`open-gop=0`）。闭合 GOP 的源
+ *    每个关键帧都是 IDR，**根本没有 RASL 可剥**；可代码一律按"HEVC 就扣
+ *    `段内关键帧数 × raslPerKf`"记账，实测白扣了 30 帧 = 1.03 秒**真实内容**：
+ *    闭合 GOP 源切 [4.5, 25]，产物末帧只到源 23.967s，用户的出点内容整段没了。
+ *  - 反过来，开放 GOP 不扣就会超收（末帧冲到 26.1s，把已删素材带回来）。
+ *
+ * 只扫开头 `sec` 秒（默认 2s）就够：RASL 紧跟在每个关键帧后面，扫到**任意一个**
+ * 就足以判定开放 GOP。实测（640x360/30fps）：35ms、只读 0.1MB，四种源全部判对。
+ * 扫不出 RASL 就按闭合处理——**宁可多给内容也不能凭空扣掉用户的帧**，
+ * 且下游自检会比对帧数，真判错会响亮失败而不是静默交差。
+ *
+ * @returns {Promise<boolean>} true = 源含 RASL（开放 GOP）
+ */
+async function probeHasRasl(ffmpegPath, file, sec = 2) {
+  let stdout;
+  try {
+    ({ stdout } = await run(ffmpegPath, [
+      '-v', 'error',
+      '-t', String(sec),
+      '-i', file,
+      '-map', '0:v:0',
+      '-c', 'copy',
+      '-bsf:v', 'hevc_mp4toannexb',
+      '-f', 'hevc', '-',
+    ], { binary: true }));
+  } catch {
+    // 抽不出裸流（异常封装/损坏）就别自作聪明，按"有 RASL"走保守路径
+    return true;
+  }
+  const buf = Buffer.isBuffer(stdout) ? stdout : Buffer.from(String(stdout), 'binary');
+  // Annex B 起始码后第一个字节右移 1 位 = NAL type；8=RASL_N 9=RASL_R
+  for (let i = 0; i + 4 < buf.length; i++) {
+    if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) {
+      const t = (buf[i + 3] >> 1) & 0x3f;
+      if (t === 8 || t === 9) return true;
+      i += 3;
+    }
+  }
+  return false;
+}
+
+module.exports = { run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues, probeHasRasl };
