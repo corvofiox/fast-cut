@@ -493,7 +493,7 @@ function buildPlan(keeps, opts) {
       warnings.push(
         `源是 HEVC 开放 GOP：拼接用的参数集修正要求剥掉关键帧后的 RASL 前导帧，`
         + `本次导出共剥 ${raslCounted} 帧（约 ${(raslCounted / (fpsNum || 30) * 1000).toFixed(0)}ms，分散在各关键帧处）——`
-        + '这是流拷贝拼接的固有代价，画面无损',
+        + '这是流拷贝拼接的固有代价',
       );
     }
   }
