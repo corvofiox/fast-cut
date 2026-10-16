@@ -109,7 +109,7 @@ async function precheckSpace(outPath, media, keepSecs) {
  */
 function planFor(loaded, segments, opts = {}) {
   const keeps = opts.ordered ? orderPreserving(segments) : normalizeSegments(segments);
-  const { plan, warnings } = buildPlan(keeps, {
+  const { plan, warnings, raslStripped = 0 } = buildPlan(keeps, {
     keyframes: loaded.media.keyframes,
     // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
     // 实测 VFR 源改用 -t 限长时长根本收不住（要 2.27s 给出 4.83s，把删掉的内容又带回来）
@@ -140,7 +140,7 @@ function planFor(loaded, segments, opts = {}) {
    * 字幕按文本重新计时要拿它做减法，否则每条 cue 都比口型晚半帧（见 cuttings.frameStart）。
    */
   const keepAligns = keeps.map((k) => frameStart(k.start, loaded.media.video?.fps, loaded.media.gridOrigin));
-  return { keeps, plan, warnings, keepSecs, keepAligns };
+  return { keeps, plan, warnings, keepSecs, keepAligns, raslStripped };
 }
 
 /**
@@ -283,17 +283,23 @@ async function exportSegments(loaded, segments, opts) {
       return trimmed / frames;
     };
     /**
-     * 时长自检的基准：Σframes/fps，而不是 Σ窗口时长。
-     * 窗口是"显示时刻跨度"，混拼产物首尾丢的是解码序的帧——B 帧收尾（trimmed）与
-     * HEVC RASL 剥除（已扣进 frames，raslTrimmed 段不重复扣）按显示时刻量不变，
-     * 但产物帧数就是少了，视频轨时长 = frames/fps。上轮把基准定为窗口和，短素材
-     * 损失小落在 -1.0s 允差里没露馅；60s 源 24 个关键帧剥 81 帧（2.7s）+ B 帧尾差
-     * 就把 -1.0s 冲穿（实测 55.5s 计划量出 52.767s，实际产物完全正确）。fps 缺失
-     * （折不出帧数）时回退窗口和，允差交给 verify 的 -1.0s 下界兜底。
+     * 时长自检的基准：**Σframes/fps + 被剥掉的 RASL 帧的显示时长**。
+     *
+     * 为什么不直接用 Σframes/fps（c13a55f 的写法）：`filter_units` 剥掉的是**包**，
+     * 剩下的帧仍保留原 PTS，所以时间轴上留下空洞、**容器时长不随帧数缩短**。
+     * 实测（30s 开放 GOP、精确模式）：Σframes/fps = 16.967s，产物视频轨 17.733s ——
+     * 差的 0.766s 正是被剥的 23 帧（23/30）。不加回去就会把固有代价误判成"接缝被拉长"。
+     *
+     * 为什么不退回 Σ窗口（更早的写法）：B 帧收尾（trimmed）确实会让产物比窗口短，
+     * 且那段**没有**空洞（帧是被真删掉的）。两种成分方向相反，必须分开算：
+     *   基准 = frames/fps + raslStripped/fps。
+     * fps 缺失（折不出帧数）时回退窗口和，允差交给 verify 的 -1.0s 下界兜底。
      */
     const framesToSecs = (idxList) => {
       const f = framesSum(idxList);
-      return f != null && cutFps ? f / cutFps : idxList.reduce((a, n) => a + plan[n].duration, 0);
+      if (f == null || !cutFps) return idxList.reduce((a, n) => a + plan[n].duration, 0);
+      const stripped = idxList.reduce((a, n) => a + (plan[n].raslStripped || 0), 0);
+      return (f + stripped) / cutFps;
     };
     const expectSlack = [];
     // 每条保留区间在成片里的起点（拼接模式按全部区间累加）

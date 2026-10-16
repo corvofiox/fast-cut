@@ -189,12 +189,46 @@ const FIXTURES = [
      */
     spanTol: 0.85,
   },
+  /**
+   * 开放 GOP 多区间（吸附模式）回归（2026-10-17 实测）：
+   * 全片只有一个 IDR、其余是 CRA，两个纯拷贝段首尾相接时 POC 不重置 →
+   * `Duplicate POC in a sequence`，且接缝后有源里不存在的坏帧。
+   *
+   * 修法是让第二个及以后的拷贝段走局部精确（入点小段重编码自带 IDR 重置 POC）。
+   * 这条素材专门守它：`.mp4` 源（输出也是 mp4，才会撞参数集/POC 这一族问题）、
+   * ultrafast（参数集差异够大）、30s（拷贝段装得下内部关键帧）。
+   */
+  {
+    name: 'hevc 30s 开GOP 多区间',
+    file: 'open30.mp4',
+    note: '开放 GOP 的第二个拷贝段必须由 IDR 重置 POC，否则接缝报 Duplicate POC',
+    args: ['-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=30',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=30',
+      '-c:v', 'libx265', '-preset', 'ultrafast',
+      '-x265-params', 'log-level=none:keyint=60:min-keyint=60:scenecut=0:open-gop=1',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'],
+    segs: 'long',
+    snap: true,
+    spanTol: 0.85,
+  },
 ];
 
 const MODES = [
   { key: 'exact', label: '拼接', opts: {}, avBudget: 0.3 },
   { key: 'split', label: '每段一文件', opts: { split: true }, avBudget: 0.3 },
 ];
+
+/**
+ * 吸附模式（precise:false）——**应用层默认模式**。
+ *
+ * 这里刻意不做成全矩阵都跑：实测把所有素材都加一格"吸附"会打红 4 格，
+ * 其中 3 格是**既有缺陷**（hevc-mov 跨度、mpeg4ASP 帧数、开放 GOP 跨度），
+ * 与本轮改动无关。那批要单独排期修，不该混进这次提交。
+ *
+ * 只给下面的开放 GOP 素材用，因为"第二个拷贝段要重置 POC"这个回归
+ * **只在吸附模式的多区间下出现**（精确模式每个区间开头本就有重编码段）。
+ */
+const SNAP_ONLY = { key: 'snap', label: '吸附', opts: { precise: false }, avBudget: 0.3 };
 
 function sh(cmd, args) {
   execFileSync(cmd, args, { stdio: ['ignore', 'ignore', 'pipe'] });
@@ -348,7 +382,9 @@ async function runMatrix() {
     }
     const targets = [null, ...(fx.remux || [])];
     const segs = fx.segs === 'long' ? LONG_SEGS : SEGS;
-    for (const mode of MODES) {
+    // 多数素材只跑常规模式；个别素材（如开放 GOP 多区间）额外补一格吸附模式
+    const modes = fx.snap ? [...MODES, SNAP_ONLY] : MODES;
+    for (const mode of modes) {
       for (const target of targets) {
         const label = `${fx.name} / ${mode.label}${target ? ` → ${target.toUpperCase()}` : ''}`;
         const { ext, container, dropSubtitles } = targetFor(fx, loaded, target);
@@ -373,7 +409,9 @@ async function runMatrix() {
          *  2) 时间线跨度：容器记账口径（mkv 的块时长、ts 的 90kHz 取整、VFR）会让跨度
          *     与计划差几帧，允差 4 帧，并把差值打印出来供人工核对。
          */
-        const planned = planFor(loaded, segs, { dropSubtitles });
+        // 基准计划必须用**与导出同一套 opts**（含 precise），否则"吸附模式"
+        // 会拿精确模式的计划去比对吸附模式的产物，全是假失败。
+        const planned = planFor(loaded, segs, { dropSubtitles, precise: mode.opts.precise !== false });
         const plan = planned.plan;
         const fpsOf = loaded.media.video?.fps || 30;
         const framesOf = (p) => (Number.isFinite(p.frames) && p.frames > 0

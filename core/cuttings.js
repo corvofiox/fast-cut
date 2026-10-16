@@ -209,6 +209,25 @@ function buildPlan(keeps, opts) {
     if (!precise) {
       const kfStart = lastKeyframeAtMost(keep.start, keyframes);
       const snapStart = kfStart === null ? 0 : kfStart;
+      /**
+       * HEVC 开放 GOP 的接缝必须由 IDR 重置 POC（2026-10-17 实测）。
+       *
+       * 开放 GOP 全片只有开头一个 IDR，其余关键帧是 CRA。CRA 的 POC 是**接着前一段
+       * 继续编号**的，把两个纯拷贝段首尾相接，解码器在接缝处看到 POC 回绕/重复，
+       * 报 `Duplicate POC in a sequence`，且实测有真坏帧（接缝后 37 帧在源里不存在）。
+       *
+       * 实测规则（`tmp/rule3.js`，与段起点、与扣不扣 RASL 全无关）：
+       *   开放 GOP 纯拷贝 CC → **必坏**；闭合 GOP 纯拷贝 CC → 必干净。
+       * 而精确模式（每个区间开头有重编码段）天然自带 IDR，**多区间也必干净**。
+       *
+       * 所以：只要源含 RASL（开放 GOP）且这**不是第一个拷贝段**，就让本段走局部精确
+       * ——入点那一小段重编码（自带 IDR）把 POC 重置掉，其余仍流拷贝。代价是该区间
+       * 开头 ≤ 一个 GOP 有损（与精确模式同价），换来接缝可解码；第一个区间不受影响。
+       *
+       * 不能用"往源里插 EOS/EOB"（实测无效，且 muxer 会把它们丢掉）、
+       * 也不能把 CRA 改写成 IDR（实测 `Could not find ref with POC`）。
+       */
+      const needIdrSeam = raslPerKf > 0 && plan.some((p) => p.kind === 'copy');
       // 已排【计划段】（源时间轴上的实际拷贝范围，含前几条吸附扩出来的部分）：
       // 本段吸附拷贝 [snapStart, end) 若与它们交叠 = 吞已删内容或重复导出。
       // 对照 keeps 原始区间是错的——乱序下吸附扩出来的 [6,10] 不在任何 keep 源区间里。
@@ -216,6 +235,16 @@ function buildPlan(keeps, opts) {
       // 防吞：吸附起点落进某条已排拷贝段的内部（真回溯吃内容，关键帧对齐时无代价无所谓）
       const swallow = placedCopy.find((p) => snapStart > p.start + EPS && snapStart < p.start + p.duration - EPS);
       const crosses = swallow != null && snapStart < start - EPS;
+      // 开放 GOP 的非首个拷贝段：接缝必须由 IDR 重置 POC，走局部精确（见上方 needIdrSeam 注释）
+      if (needIdrSeam && sameCodec && !crosses) {
+        warnings.push(
+          `源是 HEVC 开放 GOP（全片只有一个 IDR，其余是 CRA）：第二个及以后的片段若也整段流拷贝，`
+          + `接缝处 POC 不重置、解码报 "Duplicate POC"（实测接缝后会出现源里不存在的坏帧）。`
+          + `这一段已自动改为局部精确——入点那一小段（≤ 一个关键帧间隔）重编码以重置 POC，其余仍流拷贝`,
+        );
+        autoDegrade = true;
+        autoNote = '开放 GOP 接缝需重置 POC，自动局部精确';
+      }
       if (crosses && sameCodec) {
         warnings.push(
           `关键帧间隔比剪辑粒度粗（入点回溯到 ${snapStart.toFixed(3)}s，会吃掉已删的 ${(swallow.start + swallow.duration - snapStart).toFixed(3)}s）：这一段已自动改为局部精确（入点一小段重编码，其余仍流拷贝）`,
@@ -271,6 +300,12 @@ function buildPlan(keeps, opts) {
             note: '吸附拷贝段源区间重叠且无法避开：整段重编码（' + (sameCodec ? '同编码' : '编码改变，不混拼') + '）',
           });
           continue;
+        } else if (autoDegrade && sameCodec) {
+          /**
+           * 已判定要走局部精确（开放 GOP 接缝需重置 POC，或防吞降级）：
+           * 这里不再产出整段拷贝段，而是落到函数末尾的"局部精确"分支去
+           * ——入点那一小段重编码（自带 IDR）+ 其余流拷贝。
+           */
         } else {
           const snapDur = span(snapStart, end);
           if (snapDur > EPS) {
@@ -422,6 +457,8 @@ function buildPlan(keeps, opts) {
       const n = kfCountIn(p.start, p.start + p.duration);
       if (n > 0) {
         p.frames = Math.max(1, p.frames - n * raslPerKf);
+        // 记在段上：上层算"产物该多长"时要把这些帧的显示时长加回去（见返回值的 raslStripped）
+        p.raslStripped = n * raslPerKf;
         raslCounted += n * raslPerKf;
       }
     }
@@ -436,7 +473,18 @@ function buildPlan(keeps, opts) {
 
   // 乱序（用户拖动改过顺序）时必须跳过 dedupePlan：它按"时间递增"假设合并相邻段，
   // 遇到 [5-10, 0-5] 这种会把后一段整个吞掉，导出就少了一半内容。
-  return { plan: ordered ? plan.filter((p) => p.duration > EPS) : dedupePlan(plan), warnings };
+  return {
+    plan: ordered ? plan.filter((p) => p.duration > EPS) : dedupePlan(plan),
+    warnings,
+    /**
+     * 本次计划因剥 RASL 一共少了多少帧。上层算"产物该多长"时必须把它加回去：
+     * `filter_units` 剥掉的是包，**剩下的帧仍保留原 PTS**，所以时间轴上留下空洞、
+     * 容器时长并不随之缩短。实测（30s 开放 GOP 源、精确模式）：Σframes/fps = 16.967s，
+     * 而产物视频轨 17.733s —— 差的 0.766s 就是被剥掉的 23 帧（23/30 ≈ 0.767s）。
+     * 拿 Σframes/fps 当基准会把这个固有代价判成"接缝被拉长"。
+     */
+    raslStripped: raslCounted,
+  };
 }
 
 /** t 处正好是关键帧吗？ */
