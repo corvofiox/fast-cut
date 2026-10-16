@@ -324,39 +324,79 @@ async function sourceSubtitleCues(ffprobePath, file, ranges, startOffset = 0, un
  *    闭合 GOP 源切 [4.5, 25]，产物末帧只到源 23.967s，用户的出点内容整段没了。
  *  - 反过来，开放 GOP 不扣就会超收（末帧冲到 26.1s，把已删素材带回来）。
  *
- * 只扫开头 `sec` 秒（默认 2s）就够：RASL 紧跟在每个关键帧后面，扫到**任意一个**
- * 就足以判定开放 GOP。实测（640x360/30fps）：35ms、只读 0.1MB，四种源全部判对。
+ * **不能只看开头**（这是修这个 bug 时踩的坑）：RASL 只跟在**CRA 关键帧**后面，
+ * 而第一个关键帧往往是 IDR。实测 `-preset veryfast` 编的源关键帧间隔 8.33s，
+ * 第一个 CRA 在 8.33s —— 只扫前 2s 会判成"没有 RASL"，于是既不剥也不做接缝缓解，
+ * 产物照样报 `Duplicate POC`。所以改成**围绕各关键帧扫**：默认每 5 秒开一个 2 秒窗，
+ * 并在尾部补一个窗；扫到任意一个 RASL 即判开放 GOP。
+ *
  * 扫不出 RASL 就按闭合处理——**宁可多给内容也不能凭空扣掉用户的帧**，
  * 且下游自检会比对帧数，真判错会响亮失败而不是静默交差。
  *
+ * @param {string} ffmpegPath
+ * @param {string} file
+ * @param {number[]} keyframes 关键帧时刻（秒，相对时间原点）；给了就围绕它们扫
+ * @param {number} duration 源时长（秒），用于在尾部补窗
  * @returns {Promise<boolean>} true = 源含 RASL（开放 GOP）
  */
-async function probeHasRasl(ffmpegPath, file, sec = 2) {
-  let stdout;
-  try {
-    ({ stdout } = await run(ffmpegPath, [
-      '-v', 'error',
-      '-t', String(sec),
-      '-i', file,
-      '-map', '0:v:0',
-      '-c', 'copy',
-      '-bsf:v', 'hevc_mp4toannexb',
-      '-f', 'hevc', '-',
-    ], { binary: true }));
-  } catch {
-    // 抽不出裸流（异常封装/损坏）就别自作聪明，按"有 RASL"走保守路径
-    return true;
-  }
-  const buf = Buffer.isBuffer(stdout) ? stdout : Buffer.from(String(stdout), 'binary');
-  // Annex B 起始码后第一个字节右移 1 位 = NAL type；8=RASL_N 9=RASL_R
-  for (let i = 0; i + 4 < buf.length; i++) {
-    if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) {
-      const t = (buf[i + 3] >> 1) & 0x3f;
-      if (t === 8 || t === 9) return true;
-      i += 3;
+async function probeHasRasl(ffmpegPath, file, keyframes = [], duration = 0) {
+  /** 扫一个时间窗，命中 RASL 即 true；抽不出裸流时返回 null（交给调用方决定回退） */
+  const scanWindow = async (at, len) => {
+    let stdout;
+    try {
+      const args = ['-v', 'error'];
+      if (at > 0.01) args.push('-ss', String(at));
+      args.push('-t', String(len), '-i', file, '-map', '0:v:0', '-c', 'copy',
+        '-bsf:v', 'hevc_mp4toannexb', '-f', 'hevc', '-');
+      ({ stdout } = await run(ffmpegPath, args, { binary: true }));
+    } catch {
+      return null;
     }
+    const buf = Buffer.isBuffer(stdout) ? stdout : Buffer.from(String(stdout), 'binary');
+    // Annex B 起始码后第一个字节右移 1 位 = NAL type；8=RASL_N 9=RASL_R
+    for (let i = 0; i + 4 < buf.length; i++) {
+      if (buf[i] === 0 && buf[i + 1] === 0 && buf[i + 2] === 1) {
+        const t = (buf[i + 3] >> 1) & 0x3f;
+        if (t === 8 || t === 9) return true;
+        i += 3;
+      }
+    }
+    return false;
+  };
+
+  /**
+   * 窗口计划：优先围绕关键帧扫（RASL 只可能跟在 CRA 后）。
+   * 关键帧表为空或不给时，退化成"从 0 起每 5 秒一个窗"的盲扫。
+   */
+  const WIN = 2.0;
+  const points = [];
+  if (Array.isArray(keyframes) && keyframes.length) {
+    for (const k of keyframes) {
+      if (!Number.isFinite(k) || k < 0) continue;
+      points.push(k);
+      if (points.length >= 24) break;                  // 上限：24 个窗已足够判定
+    }
+  } else if (duration > 0) {
+    for (let t = 0; t < duration; t += 5) points.push(t);
+  } else {
+    points.push(0);
   }
-  return false;
+  // 尾部补一窗：RASL 密集的源开头可能全是 IDR，末端更容易命中
+  if (duration > WIN + 0.1) points.push(Math.max(0, duration - WIN - 0.1));
+
+  const uniq = [...new Set(points.map((p) => snap(Math.max(0, p))))];
+  let sawAny = false;
+  for (const at of uniq) {
+    const r = await scanWindow(at, WIN);
+    if (r === null) {
+      // 一个窗都抽不出来（异常封装/损坏）：别自作聪明，按"有 RASL"走保守路径
+      if (!sawAny) continue;
+      return true;
+    }
+    sawAny = true;
+    if (r === true) return true;
+  }
+  return sawAny ? false : true;                        // 全部抽不出 → 保守判"有"
 }
 
 module.exports = { run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues, probeHasRasl };

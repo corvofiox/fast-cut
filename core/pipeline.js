@@ -70,7 +70,9 @@ async function scanKeyframes(loaded) {
    * （实测 1.03s），开放 GOP 不扣会把已删素材带回来。两者都是硬伤，必须实测。
    */
   if (loaded.media.video?.codec === 'hevc') {
-    loaded.media.hasRasl = await probeHasRasl(loaded.bins.ffmpeg, loaded.file);
+    loaded.media.hasRasl = await probeHasRasl(
+      loaded.bins.ffmpeg, loaded.file, loaded.media.keyframes, loaded.media.duration,
+    );
   }
   return keyframes;
 }
