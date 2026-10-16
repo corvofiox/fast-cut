@@ -29,6 +29,13 @@ const ROOT = path.join(__dirname, '..');
 const DIR = path.join(ROOT, 'tmp', 'codecs');
 const SEGS = [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8.0, end: 9.5 }];
 
+/**
+ * 长素材专用区间（配合 fx.segs === 'long' 的素材）。
+ * 每条区间都跨多个关键帧：入点不在关键帧上 → 重编码头段；后面还有长拷贝尾段。
+ * 两三条这样的区间拼起来就是 R→C→R→C，正是混拼参数集错乱的必要形态。
+ */
+const LONG_SEGS = [{ start: 3.4, end: 12.3 }, { start: 16.4, end: 25.3 }];
+
 const V = ['-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=10'];
 const A = (freq = 440) => ['-f', 'lavfi', '-i', `sine=frequency=${freq}:duration=10`];
 
@@ -142,6 +149,45 @@ const FIXTURES = [
     file: 'longgop.mp4',
     note: '整片只有一个关键帧：每条区间都要整段重编码，产物时长必须贴着计划',
     args: [...V, ...A(), '-c:v', 'libx264', '-g', '360', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'],
+  },
+  /**
+   * 混拼长段回归（2026-10-17）：多区间精确模式产物必报参数集错乱
+   * （`Invalid number of merging MVP candidates` / `delta_idx in slice header RPS`）。
+   *
+   * 上面所有素材都只有 10s，切出来的拷贝段只有 0.3~0.7s，装不下一个内部关键帧；
+   * 于是"重编码段排在别段后面"这条通路从没被走到——这就是该 bug 活到发布的原因。
+   * 这条素材 30s / 关键帧每 2s，配合 LONG_SEGS 让每条区间都产生
+   * `重编码头段 + 长拷贝尾段`，完整覆盖 R→C→R→C 的拼接形态。
+   *
+   * 用 **HEVC + 闭合 GOP（open-gop=0）+ preset ultrafast**：
+   *  - 必须是 HEVC：H.264 的 x264 参数集与源足够接近，靠解码器容错侥幸活着（实测不炸）；
+   *  - 必须是 .mp4 源：矩阵输出容器跟随素材扩展名，而"MP4 每轨只容一份参数集"
+   *    才是根源；写成 .mkv 参数集走带内、根本触发不到；
+   *  - **必须是 ultrafast**：实测源用默认/medium preset 时，它与我们重编码段
+   *    （`-preset veryfast`）的参数集恰好兼容，这个 bug 不复现；ultrafast 的
+   *    SPS/PPS 差异够大才露馅。这条是实测结论，不是猜的——漏了它这条素材就白加。
+   */
+  {
+    name: 'hevc 30s 混拼长段(闭GOP)',
+    file: 'mixed30.mp4',
+    note: '多区间精确模式（重编码头段+长拷贝尾段交替）：产物必须解码干净且帧数=计划',
+    args: ['-f', 'lavfi', '-i', 'testsrc2=size=320x180:rate=30:duration=30',
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=30',
+      '-c:v', 'libx265', '-preset', 'ultrafast',
+      '-x265-params', 'log-level=none:keyint=60:min-keyint=60:scenecut=0:open-gop=0',
+      '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'],
+    segs: 'long',
+    /**
+     * 跨度允差放宽到 0.85s（默认 4 帧 ≈ 0.133s）。
+     *
+     * 这条素材的拷贝段很长（8.3s / 7.3s），把两条已知的记账分歧放大了：
+     *  - 结束在源中间的拷贝段按 B 帧重排深度少给 2 帧（`trimmed`），窗口仍按原时长算；
+     *  - 拷贝段的帧数预期还按"段内关键帧 × raslPerKf"扣，而 `raslPerKf` 只按编码
+     *    是不是 HEVC 判断、没区分开/闭 GOP（闭合 GOP 没有 RASL 可剥，扣多了）。
+     * 这条素材真正要守的是**帧数判据与解码判据**（实测 509=509、全片解码零报错）；
+     * 跨度在长段上是已知不可靠的信号，故放宽，理由留档于此。
+     */
+    spanTol: 0.85,
   },
 ];
 
@@ -301,6 +347,7 @@ async function runMatrix() {
       continue;
     }
     const targets = [null, ...(fx.remux || [])];
+    const segs = fx.segs === 'long' ? LONG_SEGS : SEGS;
     for (const mode of MODES) {
       for (const target of targets) {
         const label = `${fx.name} / ${mode.label}${target ? ` → ${target.toUpperCase()}` : ''}`;
@@ -309,7 +356,7 @@ async function runMatrix() {
         const outPath = path.join(DIR, `${stem}-${mode.key}${target ? `-${target}` : ''}${ext}`);
         let r;
         try {
-          r = await exportSegments(loaded, SEGS, { ...mode.opts, outPath, container, dropSubtitles });
+          r = await exportSegments(loaded, segs, { ...mode.opts, outPath, container, dropSubtitles });
         } catch (err) {
           console.log(`${pad(label, 34)}✗ 异常  ${cut(err.message, 48)}`);
           problems.push(`${label} 抛异常：${err.message}`);
@@ -326,7 +373,7 @@ async function runMatrix() {
          *  2) 时间线跨度：容器记账口径（mkv 的块时长、ts 的 90kHz 取整、VFR）会让跨度
          *     与计划差几帧，允差 4 帧，并把差值打印出来供人工核对。
          */
-        const planned = planFor(loaded, SEGS, { dropSubtitles });
+        const planned = planFor(loaded, segs, { dropSubtitles });
         const plan = planned.plan;
         const fpsOf = loaded.media.video?.fps || 30;
         const framesOf = (p) => (Number.isFinite(p.frames) && p.frames > 0
@@ -335,6 +382,16 @@ async function runMatrix() {
         const wantFrames = mode.opts.split
           ? groups.map((g) => g.reduce((a, n) => a + framesOf(plan[n]), 0))
           : [plan.reduce((a, p) => a + framesOf(p), 0)];
+        /**
+         * 跨度基准 = Σplan.duration（窗口和）。
+         *
+         * 注意这与内核自检的尺子（core/verify 的 framesToSecs = Σframes/fps）**不同**，
+         * 而两者对"结束在源中间"的拷贝段会分歧：那种段按 B 帧重排深度少给 2 帧，
+         * 但容器记账仍按窗口算，实测产物落在两者之间。谁"对"取决于问的是
+         * "容器记了多久"还是"计划里有多少帧"——短素材（10s、切得碎）两者差不到 4 帧，
+         * 分不出来；长段多时会露馅，见下面 mixed30 素材的 spanTol。
+         * 这个分歧本身待定，暂不改尺子（曾试过改成 Σframes/fps，一次性打红 8 格）。
+         */
         const wantSecs = mode.opts.split
           ? groups.map((g) => g.reduce((a, n) => a + plan[n].duration, 0))
           : [plan.reduce((a, p) => a + p.duration, 0)];

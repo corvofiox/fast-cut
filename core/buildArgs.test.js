@@ -34,10 +34,45 @@ test('HEVC 流拷贝段剔掉 RASL 前导帧：开放 GOP 多段拼接报 "Could
   assert.strictEqual(args[i + 1], 'filter_units=remove_types=8|9');
 });
 
-test('H.264 段与重编码段都不下发该过滤器（NAL 编号不同 / 那一段本来就是新编码的）', () => {
+test('H.264 纯拷贝段不下发该过滤器（NAL 编号不同）；重编码段默认也不下发', () => {
   assert.ok(!argsForSegment({ kind: 'copy', start: 0, duration: 2 }, MEDIA, 'out.mp4', { fps: 30 }).includes('-bsf:v'));
   const hevc = { ...MEDIA, video: { codec: 'hevc', fps: 30 } };
   assert.ok(!argsForSegment({ kind: 'reencode', start: 0, duration: 2 }, hevc, 'out.mp4').includes('-bsf:v'));
+});
+
+/**
+ * 混拼回归（2026-10-17）：多区间精确模式产物必报参数集错乱
+ * （`Invalid number of merging MVP candidates` / `delta_idx in slice header RPS`）。
+ *
+ * 根因：concat 产物的参数集只取**第一段**的 hvcC，而 MP4 每轨只容得下一份。
+ * 实测相邻组合：`R→C` 干净、`C→R` 报错、`R→C→R` 报错、完整 `R→C→R→C` 报错 ——
+ * 规律是"任何不在第一位、自身又不带参数集的段，就会拿别人的参数集解码"。
+ * 拷贝段早有 dump_extra，重编码段没有，所以多区间精确模式必中。
+ *
+ * 修法：重编码段在混拼时（dumpParams=true）同样内嵌参数集。
+ * 这里把"两条分支都要下发"钉死，防止将来谁又把它收窄回 `kind === 'copy'`。
+ */
+test('混拼时重编码段也要内嵌参数集（多区间精确模式报参数集错乱的根因）', () => {
+  const hevc = { ...MEDIA, video: { codec: 'hevc', profile: 'Main', pixFmt: 'yuv420p', fps: 30 } };
+  const args = argsForSegment({ kind: 'reencode', start: 0, duration: 1.5 }, hevc, 'out.mp4',
+    { fps: 30, dumpParams: true });
+  const i = args.indexOf('-bsf:v');
+  assert.ok(i >= 0, '重编码段必须带 -bsf:v');
+  assert.strictEqual(args[i + 1], 'hevc_mp4toannexb,dump_extra=freq=keyframe');
+  // 且不能带上剔 RASL：重编码段本来就是新编码的，没有 RASL 可剔
+  assert.ok(!/remove_types/.test(args[i + 1]));
+});
+
+test('混拼时 H.264 重编码段也内嵌参数集；非混拼（dumpParams=false）一律不下发', () => {
+  const h264 = { ...MEDIA, video: { codec: 'h264', fps: 30 } };
+  const mixed = argsForSegment({ kind: 'reencode', start: 0, duration: 1.5 }, h264, 'out.mp4',
+    { fps: 30, dumpParams: true });
+  const i = mixed.indexOf('-bsf:v');
+  assert.ok(i >= 0);
+  assert.strictEqual(mixed[i + 1], 'h264_mp4toannexb,dump_extra=freq=keyframe');
+
+  assert.ok(!argsForSegment({ kind: 'reencode', start: 0, duration: 1.5 }, h264, 'out.mp4',
+    { fps: 30, dumpParams: false }).includes('-bsf:v'));
 });
 
 test('无 fps 时退回 -t 时长控制', () => {

@@ -48,8 +48,24 @@ const MIXED_PARAM_BSF = {
 const SEEK_LEAD = 2.0;
 
 function streamBsfFor(item, media, opts = {}) {
-  if (item.kind !== 'copy') return [];
   const codec = media?.video?.codec;
+  /**
+   * 重编码段也要把参数集内嵌进关键帧包（混拼时）。
+   *
+   * 根因（2026-10-17 实测，逐相邻组合对照）：concat 产物的参数集取**第一段**的 hvcC，
+   * 而 MP4 每轨只容得下一份。实测 `R→C` 干净、`C→R` 报参数集错乱、`R→C→R` 报错、
+   * `C→C` 报 Duplicate POC —— 规律是"**任何段只要不在第一位、且自身没有带内参数集，
+   * 就会拿别人的参数集解码**"。拷贝段本就有 dump_extra（3cdce0f 加的），
+   * 所以只有"重编码段排在后面"的那几路会炸：多区间精确模式（R→C→R→C）必中，
+   * 而单区间（R→C）侥幸能过——这正是矩阵 10s 素材只切 3 段、看不出问题的原因。
+   *
+   * 修法：重编码段同样内嵌参数集。实测 `dump_extra=freq=keyframe` 一条即可让
+   * C→R / R→C→R / 完整 R→C→R→C 全部解码干净。不改任何画面数据，只多带解码必需的元数据。
+   */
+  if (item.kind === 'reencode') {
+    if (!opts.dumpParams || !codec) return [];
+    return MIXED_PARAM_BSF[codec] ? ['-bsf:v', MIXED_PARAM_BSF[codec]] : [];
+  }
   if (codec === 'hevc') {
     if (opts.dumpParams) return ['-bsf:v', `${HEVC_DROP_RASL},${MIXED_PARAM_BSF.hevc}`];
     return ['-bsf:v', HEVC_DROP_RASL];
@@ -190,6 +206,12 @@ function argsForSegment(item, media, outPath, opts = {}) {
     if (media.video?.colorSpace && media.video.colorSpace !== 'unknown') {
       args.push('-colorspace', media.video.colorSpace);
     }
+    /**
+     * 混拼时重编码段也要内嵌参数集（见 streamBsfFor 顶部注释：任何不在第一位的段
+     * 若自身不带参数集，就会拿产物第一段的 hvcC 去解码 → 参数集错乱）。
+     * 必须放在所有编码选项之后：`-bsf:v` 作用于编码器输出流。
+     */
+    args.push(...streamBsfFor(item, media, opts));
   }
 
   args.push(outPath);
