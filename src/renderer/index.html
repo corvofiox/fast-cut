@@ -17,6 +17,7 @@
       <button id="btnMenu" class="btn icon" title="菜单">☰</button>
       <div id="menuPop" class="popover menu hidden" role="menu">
         <button class="mi" data-action="import">导入视频…<kbd>Ctrl+O</kbd></button>
+        <button class="mi" data-action="append">追加导入…<kbd>Ctrl+Shift+O</kbd></button>
         <button class="mi" data-action="export">导出…<kbd>Ctrl+E</kbd></button>
         <div class="mi-sep"></div>
         <button class="mi" data-action="undo">撤销<kbd>Ctrl+Z</kbd></button>
@@ -118,8 +119,12 @@
   <div class="modal">
     <h3>导入视频</h3>
     <button class="m-row" id="btnImportPick">
-      <span class="m-label">选择文件…</span><kbd class="m-chip">Ctrl+O</kbd>
+      <span class="m-label">导入（替换当前素材）</span><kbd class="m-chip">Ctrl+O</kbd>
     </button>
+    <button class="m-row" id="btnImportAppend">
+      <span class="m-label">追加导入…</span><kbd class="m-chip">Ctrl+Shift+O</kbd>
+    </button>
+    <div class="modal-tip">「追加导入」把新素材接到轨道末尾，不动已有的片段。素材参数不一致时，导出前需要选择统一的封装与编码。</div>
     <div class="m-foot"><span class="grow"></span><button class="btn" data-close="importMask">关闭</button></div>
   </div>
 </div>
@@ -145,12 +150,24 @@
         <button id="btnChooseDir" class="btn tiny">浏览…</button>
       </span>
     </div>
-    <div class="m-row">
+    <div class="m-row" id="rowContainer">
       <span class="m-label">封装容器</span>
       <span class="m-field">
         <select id="outContainer" class="m-select" title="只换封装，不重编码"></select>
       </span>
     </div>
+    <div class="m-row" id="rowCodec">
+      <span class="m-label">编码格式</span>
+      <span class="m-field">
+        <select id="outCodec" class="m-select" title="多段素材参数不一致时，必须选一个统一编码">
+          <option value="">跟随源（仅参数一致时可用）</option>
+          <option value="h264">H.264（最通用）</option>
+          <option value="hevc">H.265 / HEVC（体积更小）</option>
+          <option value="av1">AV1（体积最小，编码慢）</option>
+        </select>
+      </span>
+    </div>
+    <div id="codecHint" class="m-note hidden"></div>
     <div class="m-row">
       <span class="m-label">文件名</span>
       <span class="m-field">

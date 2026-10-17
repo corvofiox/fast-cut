@@ -65,7 +65,13 @@ function frameIndex(t, fps, origin = 0) {
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0, seamNeedsIdr = false, forceWholeReencode = false, splitOutput = false } = opts;
+  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0, seamNeedsIdr = false,
+    /**
+     * `forceWholeReencode`：**参数与其它素材不一致**，这一段必须整段重编码（多源统一参数专用）。
+     * `forceWholeReencodeNative`：探针实测这个源的关键帧不可独立起段（x264 开放 GOP）。
+     * 两者都导致"整段重编码"，但判据来源不同，警告文案也不同，故分开。
+     */
+    forceWholeReencode = false, forceWholeReencodeNative = false, splitOutput = false } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   const bdepth = Math.max(0, Number(reorderDepth) || 0);
   // 帧网格原点：源首帧 pts 不一定落在 0（实测 HEVC 的 .mp4/.mkv 首帧 pts = 0.023，
@@ -78,6 +84,7 @@ function buildPlan(keeps, opts) {
   const plan = [];
   let warnedVfr = false;
   let warnedSeamBroken = false;
+  let warnedParamMismatch = false;
 
   /**
    * 警告收集器（2026-10-18 改）：同一类原因按**段**聚合，不再每段推一条几乎相同的长句。
@@ -194,6 +201,34 @@ function buildPlan(keeps, opts) {
     let autoNote = '';
 
     /**
+     * **强制整段重编码**（2026-10-18，多源统一参数专用）。
+     *
+     * 跨素材拼接时，参数与基准不一致的源**不能流拷贝**：实测纯流拷贝会静默丢帧
+     * （273/300 帧、帧间隔塌到 0.0001s，而解码不报错）。这类源必须整段重编码，
+     * 顺便把尺寸/帧率/像素格式统一到基准。
+     *
+     * 与下面 `forceWholeReencode`（关键帧不可独立起段）分开是因为判据来源不同：
+     * 那条是探针实测"切出来的段自己解不开"，这条是"参数和别的源不一样"。
+     * 旧实现想把这条塞进 sameCodec=false 来表达，但 sameCodec=false 只影响
+     * "入点不在关键帧"的分支——入点正好在关键帧上时仍会走整段流拷贝（实测踩到）。
+     */
+    if (forceWholeReencode) {
+      if (!warnedParamMismatch) {
+        warnedParamMismatch = true;
+        warnOnce('param-mismatch',
+          '有素材的参数与其它素材不一致（分辨率/帧率/编码/音频等），无法与其它段流拷贝拼接：'
+          + '这些片段的每一段都整段重编码，统一到基准参数（有损）');
+      }
+      plan.push({
+        kind: 'reencode', role: 'whole', start, duration: wholeDur,
+        snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
+        autoPrecise: true,
+        note: '参数与其它素材不一致：整段重编码统一到基准参数（有损）',
+      });
+      continue;
+    }
+
+    /**
      * 通用探针判定"单个拷贝段自己就解不开"时的整段重编码。
      *
      * 实测（x264 开放 GOP）：它的"关键帧"NAL type 是 1（非 IDR），不是 5；
@@ -204,7 +239,7 @@ function buildPlan(keeps, opts) {
      *
      * 与 VFR 那条不同：这条是**通用探针实测结论**，不看编码。
      */
-    if (forceWholeReencode && sameCodec) {
+    if (forceWholeReencodeNative && sameCodec) {
       if (!warnedSeamBroken) {
         warnedSeamBroken = true;
         warnOnce('seam-broken',
@@ -663,6 +698,14 @@ function dedupePlan(plan, opts = {}) {
   // 合并边界 = 输出分组：默认一条区间一组；「多段合并导出」时同组几段可以互相吸收。
   // 用 outGroup（已打好）而不是 keepIndex——分组是用户意图，keepIndex 只是内部编号。
   const sameGroup = (a, b) => !preserveGroups || a.outGroup === b.outGroup;
+  /**
+   * **不同来源永不合并**（2026-10-18 多素材）。这是多素材拼接的地基：
+   * 两份素材各自从源 0 开始，它们的区间在数值上完全重合（都可能是 [0,10]），
+   * 旧判据只看时间，会把第二份素材当成"重复段"整段吸收掉——
+   * 实测追加两份 10s 素材，产物只有 10.000s（第二份凭空消失），而自检照样"通过"
+   * （因为计划里本来就只有一段）。所以判重必须先比来源。
+   */
+  const sameSource = (a, b) => (a.srcIndex ?? 0) === (b.srcIndex ?? 0);
   const out = [];
   for (const raw of plan) {
     let prev = out[out.length - 1];
@@ -672,8 +715,10 @@ function dedupePlan(plan, opts = {}) {
     }
     const prevEnd = prev.start + prev.duration;
     const itemEnd = raw.start + raw.duration;
+    // 不同来源的相邻项：源时间各自独立，"重叠"毫无意义，一律各自保留
+    const crossSource = !sameSource(prev, raw);
 
-    if (prev.kind === raw.kind && raw.start <= prevEnd + EPS && sameGroup(prev, raw)) {
+    if (!crossSource && prev.kind === raw.kind && raw.start <= prevEnd + EPS && sameGroup(prev, raw)) {
       // 同类型：吸收后段新增的部分（可能重叠，不重复计算时长）
       prev.duration = Math.max(prev.duration, itemEnd - prev.start);
       prev.keepEnd = Math.max(prev.keepEnd, raw.keepEnd);
@@ -682,7 +727,7 @@ function dedupePlan(plan, opts = {}) {
       continue;
     }
 
-    if (raw.start < prevEnd - EPS && raw.kind === 'copy' && raw.start > prev.start + EPS && sameGroup(prev, raw)) {
+    if (!crossSource && raw.start < prevEnd - EPS && raw.kind === 'copy' && raw.start > prev.start + EPS && sameGroup(prev, raw)) {
       // 后段是拷贝段：把它起点保住，反过来把前一段截断到关键帧处
       prev.duration = snap(raw.start - prev.start);
       prev.frames = null;
@@ -697,7 +742,7 @@ function dedupePlan(plan, opts = {}) {
       continue;
     }
 
-    if (raw.start < prevEnd - EPS && sameGroup(prev, raw)) {
+    if (!crossSource && raw.start < prevEnd - EPS && sameGroup(prev, raw)) {
       // 不同类型且重叠：后段起点对齐到前段结束时刻
       const newStart = Math.min(prevEnd, itemEnd);
       if (itemEnd - newStart <= EPS) continue; // 整段被前段覆盖，丢弃

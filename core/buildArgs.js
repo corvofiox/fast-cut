@@ -55,7 +55,19 @@ const MIXED_PARAM_BSF = {
 const SEEK_LEAD = 2.0;
 
 function streamBsfFor(item, media, opts = {}) {
-  const codec = media?.video?.codec;
+  const srcCodec = media?.video?.codec;
+  /**
+   * **编码器输出的编码**才是 bsf 要匹配的对象（2026-10-18）。
+   *
+   * 旧实现直接拿源编码选 bsf：hevc 源 → `hevc_mp4toannexb`。可一旦跨素材统一参数
+   * 把这段重编码成 h264，ffmpeg 就报
+   * `Codec 'h264' is not supported by the bitstream filter 'hevc_mp4toannexb'`
+   * ——重编码段的输出编码由 opts.targetCodec 决定，必须优先用它。
+   * 拷贝段没有编码器，仍按源编码（流拷贝不改码流）。
+   */
+  const codec = item.kind === 'reencode'
+    ? (opts.targetCodec || (opts.reencodeCodec ? (CODEC_OF_ENCODER[opts.reencodeCodec] || srcCodec) : srcCodec))
+    : srcCodec;
   /**
    * 重编码段也要把参数集内嵌进关键帧包（混拼时）。
    *
@@ -126,9 +138,19 @@ function argsForSegment(item, media, outPath, opts = {}) {
   // 长度：能折算成帧数就用 -frames:v，避免"帧数与时长不一致"导致 concat 错位。
   // 计划给了明确包数时（拷贝段要按解码序留双向预测余量）一律以计划为准。
   const fps = Number(opts.fps) > 0 ? Number(opts.fps) : null;
+  /**
+   * 跨素材归一化时，帧数必须按**目标帧率**折算（2026-10-18）。
+   *
+   * 旧实现按源帧率算 `-frames:v`：30fps 源取 2s → 60 帧。可归一化后输出是 24fps，
+   * 60 帧要占 2.5s，而 `-t`（= 帧数/帧率）仍按 30fps 算成 2.0s ——
+   * 视频被 `-t` 截在 2.0s（48 帧），音频也只有 2.0s，但拼接时按"视频时长"推偏移，
+   * 两段合计比计划短 0.4s，自检报"音画不一致"。实测产物 4.042s / 96 帧（应 120）。
+   * 归一化时帧数与时长都按目标帧率算，两者才一致。
+   */
+  const outFps = (opts.normalize && Number(opts.normalize.fps) > 0) ? Number(opts.normalize.fps) : fps;
   const frames = Number.isFinite(item.frames) && item.frames > 0
     ? Math.round(item.frames)
-    : (fps && Number.isFinite(item.duration) ? Math.round(item.duration * fps) : null);
+    : (outFps && Number.isFinite(item.duration) ? Math.round(item.duration * outFps) : null);
   if (frames) args.push('-frames:v', String(Math.max(1, frames)));
   else args.push('-t', fmtTime(item.duration));
   /**
@@ -141,7 +163,7 @@ function argsForSegment(item, media, outPath, opts = {}) {
    * 约一个 AAC 包粒度，与拷贝段形态一致。拷贝段无编码器延迟、包数一到立即停止，
    * 实测音频贴合视频，不存在此问题，刻意不下发。
    */
-  if (item.kind === 'reencode' && fps && frames) args.push('-t', fmtTime(frames / fps));
+  if (item.kind === 'reencode' && outFps && frames) args.push('-t', fmtTime(frames / outFps));
 
   if (item.kind === 'copy') {
     args.push('-c', 'copy');
@@ -171,7 +193,13 @@ function argsForSegment(item, media, outPath, opts = {}) {
       args.push('-display_rotation', 'copy');    // 保留旋转信息，避免竖屏视频方向错乱
     }
   } else {
-    const codec = pickVideoCodec(media, opts);
+    /**
+     * 跨素材统一参数时，编码器必须由**目标编码**决定（opts.targetCodec），
+     * 不能再跟着各自的源走——否则 hevc 源会派 libx265，重编码出来还是 hevc，
+     * 与 h264 的流拷贝段拼在一起必崩（实测 missing picture / 帧数对不上）。
+     */
+    const forced = opts.targetCodec ? encoderForCodec(opts.targetCodec) : null;
+    const codec = forced || pickVideoCodec(media, opts);
     args.push(...mapArgs);
     args.push('-map_metadata', '0');
     // 这里刻意不加 -avoid_negative_ts：重编码段的时间戳本来就被编码器归零，
@@ -187,7 +215,17 @@ function argsForSegment(item, media, outPath, opts = {}) {
      * 段时长按帧数折算：≥3 帧一律 copy（正常路径不受影响）。
      */
     const tinyFrames = fps && Number.isFinite(item.duration) ? item.duration * fps : Infinity;
-    if (family === 'mov' && tinyFrames < 3) {
+    /**
+     * 跨素材统一参数时，音频也必须跟着统一（2026-10-18）：
+     * 采样率/声道不同却 `-c:a copy`，产物会宣布"44100/1ch"而第二段实际是 48000/2ch，
+     * 实测音画差 0.917s、自检直接拦下。所以归一化时音频改重编码并显式给出目标参数。
+     */
+    const normAudio = opts.normalize && opts.normalize.audio ? opts.normalize.audio : null;
+    if (normAudio) {
+      args.push('-c:a', 'aac');
+      if (normAudio.sampleRate) args.push('-ar', String(normAudio.sampleRate));
+      if (normAudio.channels) args.push('-ac', String(normAudio.channels));
+    } else if (family === 'mov' && tinyFrames < 3) {
       args.push('-c:a', 'aac');
       const br = Number(media.audioTracks?.[0]?.bitRate) || 0;
       if (br > 0) args.push('-b:a', String(Math.round(br)));
@@ -204,9 +242,39 @@ function argsForSegment(item, media, outPath, opts = {}) {
     const profile = profileArg(media.video, codec);
     if (profile) args.push('-profile:v', profile);
     if (media.video?.pixFmt) args.push('-pix_fmt', media.video.pixFmt);
-    if (media.video?.fps) args.push('-r', String(media.video.fps));
+    /**
+     * 输出帧率：归一化时必须用**目标帧率**（2026-10-18）。
+     * 旧实现恒用源帧率，于是"把 30fps 源归一成 24fps"实际输出仍是 30fps：
+     * 48 帧本该占 2.000s，结果只占 1.600s，整段莫名少了 0.4s，
+     * 拼接后自检报"音画比视频短 0.395s"（实测）。
+     */
+    const outFpsArg = (opts.normalize && Number(opts.normalize.fps) > 0)
+      ? Number(opts.normalize.fps)
+      : media.video?.fps;
+    if (outFpsArg) args.push('-r', String(outFpsArg));
     // 定帧率输出，时间戳连续，避免拼接处 PTS 回跳
     args.push('-fps_mode', 'cfr');
+    /**
+     * 跨素材归一（2026-10-18）：这一段来源的参数与"基准参数"不一致时，
+     * 必须显式把画面统一过去，否则拼接会静默丢帧（实测 273/300 帧、帧间隔塌到 0.0001s，
+     * 而解码不报错）。见 core/compat.js 顶部实验记录。
+     *
+     * 只在 opts.normalize 给了目标尺寸时才加 filter：同源导出完全不受影响。
+     * 顺序有讲究：fps → scale → pad → setsar，且 sar 必须显式写成目标值，
+     * 否则 concat 会报 "parameters (SAR 1:1) do not match"。
+     * 窄高比不同时用 pad 而不是拉伸：保持画面比例，补黑边（拉伸会让内容变形）。
+     */
+    if (opts.normalize) {
+      const n = opts.normalize;
+      const filters = [];
+      if (n.fps) filters.push(`fps=${n.fps}`);
+      if (n.width && n.height) {
+        filters.push(`scale=${n.width}:${n.height}:force_original_aspect_ratio=decrease`);
+        filters.push(`pad=${n.width}:${n.height}:(ow-iw)/2:(oh-ih)/2`);
+      }
+      if (n.sar) filters.push(`setsar=${String(n.sar).replace(':', '/')}`);
+      if (filters.length) args.push('-vf', filters.join(','));
+    }
     if (media.video?.colorPrimaries && media.video.colorPrimaries !== 'unknown') {
       args.push('-color_primaries', media.video.colorPrimaries);
     }
@@ -236,6 +304,25 @@ function pickVideoCodec(media, opts = {}) {
   if (c === 'av1') return 'libsvtav1';
   if (c === 'vp9') return 'libvpx-vp9';
   return 'libx264';
+}
+
+/**
+ * 用户选的**目标编码**（ffprobe 口径，如 'h264'）→ 对应的编码器。
+ *
+ * 跨素材拼接必须用它：`pickVideoCodec` 是"尽量保持源编码"的语义，
+ * hevc 源就派 libx265——于是重编码出来的段还是 hevc，与 h264 的流拷贝段
+ * 拼在一起必然崩（实测 `missing picture in access unit`，产物帧数 96/178）。
+ * 统一参数时编码器必须由**目标编码**决定，不能再跟着各自的源走。
+ */
+const ENCODER_OF_CODEC = {
+  h264: 'libx264',
+  hevc: 'libx265',
+  av1: 'libsvtav1',
+  vp9: 'libvpx-vp9',
+};
+
+function encoderForCodec(codec) {
+  return ENCODER_OF_CODEC[String(codec || '').toLowerCase()] || null;
 }
 
 /**
@@ -399,5 +486,5 @@ function pad(n, w) {
 
 module.exports = {
   argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime,
-  pickVideoCodec, profileArg, keepsSourceCodec, CODEC_OF_ENCODER,
+  pickVideoCodec, profileArg, keepsSourceCodec, CODEC_OF_ENCODER, encoderForCodec, ENCODER_OF_CODEC,
 };

@@ -127,17 +127,42 @@ function createTimeline(options) {
   }
 
   /** 成片时间 → 源时间 */
+  /**
+   * 成片时间 → 源时间。
+   *
+   * 多素材（2026-10-18）：返回值仍是"该源内的秒数"，但同时把**这段属于哪个源**也算出来
+   * ——`srcIndexAtProg(pt)`。不同源的时间轴各自从 0 起，单看秒数无法区分
+   * "A 的第 3 秒"与"B 的第 3 秒"，拿错源就会播/切另一份素材。
+   * 时间轴组件不持有源列表，只按片段上的 `srcIndex` 透传，具体换哪个 video 由上层决定。
+   */
   function progToSrc(pt) {
-    for (const c of clips) {
-      if (pt >= c.ps - EPS && pt <= c.pe + EPS) return ms(c.start + (pt - c.ps));
+    const c = clipAtProg(pt);
+    if (!c) {
+      if (!clips.length) return 0;
+      const edge = pt < clips[0].ps ? clips[0] : clips[clips.length - 1];
+      return ms(edge.start + (pt < edge.ps ? 0 : edge.end - edge.start));
     }
-    if (!clips.length) return 0;
-    return pt < clips[0].ps ? clips[0].start : clips[clips.length - 1].end;
+    return ms(c.start + (pt - c.ps));
   }
 
-  /** 源时间 → 成片时间；落在被删掉的素材上时返回最近的可显示位置 */
-  function srcToProg(st) {
+  /** 成片时间落在哪个片段上（含端点容差）。 */
+  function clipAtProg(pt) {
     for (const c of clips) {
+      if (pt >= c.ps - EPS && pt <= c.pe + EPS) return c;
+    }
+    return null;
+  }
+
+  /** 成片时间所属的源序号（0 起）；空轨道返回 0。 */
+  function srcIndexAtProg(pt) {
+    const c = clipAtProg(pt);
+    return c && Number.isInteger(c.srcIndex) ? c.srcIndex : 0;
+  }
+
+  /** 源时间 → 成片时间；落在被删掉的素材上时返回最近的可显示位置。 */
+  function srcToProg(st, srcIndex) {
+    for (const c of clips) {
+      if (srcIndex != null && Number.isInteger(c.srcIndex) && c.srcIndex !== srcIndex) continue;
       if (st >= c.start - EPS && st <= c.end + EPS) return ms(c.ps + (st - c.start));
     }
     return null;
@@ -192,9 +217,17 @@ function createTimeline(options) {
       consider(clips[i].pe, 'edge', clips[i].end);
     }
     if (!opts || opts.keyframes !== false) {
+      /**
+       * 关键帧磁吸（多素材 2026-10-18）：`keyframes` 现在是**所有源的关键帧合并表**，
+       * 每条带 `srcIndex`。必须按"该关键帧所属源"去换算成片位置——不同源的时间
+       * 互相独立，拿 A 的关键帧时刻去 B 的片段里找位置会吸到毫不相干的点上。
+       * 兼容旧数据：没有 srcIndex 的条目按源 0 处理（单素材时这就是全部）。
+       */
       for (const kf of keyframes) {
-        const prog = srcToProg(kf);
-        if (prog != null) consider(prog, 'keyframe', kf);
+        const si = kf && typeof kf === 'object' && Number.isInteger(kf.srcIndex) ? kf.srcIndex : 0;
+        const t = kf && typeof kf === 'object' ? kf.t : kf;
+        const prog = srcToProg(t, si);
+        if (prog != null) consider(prog, 'keyframe', t);
       }
     }
     return best;
@@ -321,8 +354,12 @@ function createTimeline(options) {
     ctx.fillStyle = '#8f9aa8';
     const pxSec = pxPerSec();
     const stride = pxSec < 14 ? Math.max(1, Math.round(1 / (pxSec * 0.15))) : 1;
+    // 多素材：关键帧表是各源合并来的，换算成片位置时必须带上它所属的源（否则吸错位置）
     for (let i = 0; i < keyframes.length; i += stride) {
-      const prog = srcToProg(keyframes[i]);
+      const kf = keyframes[i];
+      const si = kf && typeof kf === 'object' && Number.isInteger(kf.srcIndex) ? kf.srcIndex : 0;
+      const t = kf && typeof kf === 'object' ? kf.t : kf;
+      const prog = srcToProg(t, si);
       if (prog == null) continue;
       const x = tToX(prog);
       if (x < -2 || x > width() + 2) continue;
@@ -875,6 +912,29 @@ function createTimeline(options) {
       fitted = false;
       render();
     },
+    /**
+     * 多素材（2026-10-18）：一次性喂进**所有源**的信息。
+     *
+     * `list` = `[{ srcIndex, duration, fps, keyframes }]`。
+     * 关键帧被摊平成带 srcIndex 的合并表（磁吸与 tick 都要用）；
+     * `srcDuration` 取最长的那份——胶片条按缩放取帧时需要一个量级参考，
+     * 用最长的才不会在短素材上把格子抽得过密。
+     * 单素材调用与老 setSource 等价。
+     */
+    setSources(list) {
+      const arr = Array.isArray(list) && list.length ? list : [{ srcIndex: 0, duration: 1, fps: 30, keyframes: [] }];
+      const merged = [];
+      for (const s of arr) {
+        for (const k of (s.keyframes || [])) merged.push({ t: k, srcIndex: s.srcIndex });
+      }
+      merged.sort((a, b) => a.srcIndex - b.srcIndex || a.t - b.t);
+      keyframes = merged;
+      srcDuration = Math.max(0.001, ...arr.map((s) => Number(s.duration) || 0.001));
+      fps = Number(arr[0]?.fps) || 30;
+      minSpan = Math.min(srcDuration, 24 / fps);
+      fitted = false;
+      render();
+    },
     setClips(next, sel, snapMap) {
       clips = next.map((c) => ({ ...c }));
       total = Math.max(0.001, clips.length ? clips[clips.length - 1].pe : 0.001);
@@ -979,6 +1039,8 @@ function createTimeline(options) {
     view: () => ({ ...view, total, srcDuration }),
     progToSrc,
     srcToProg,
+    srcIndexAtProg,
+    clipAtProg,
     clipIndexAtProg,
     timeToX: tToX,
     edgePad: () => PAD,

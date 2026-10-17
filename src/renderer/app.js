@@ -15,8 +15,14 @@ const EPS = 1e-6;
 
 const state = {
   env: null,
-  src: null,            // { file, media }
-  clips: [],            // [{start,end,ps,pe,group?}] 源时间 + 成片时间，顺序即时间顺序
+  src: null,            // 主源（第一份素材）——保留这个字段，几十处读它当"当前播放的源"
+  /**
+   * 全部素材（2026-10-18 追加导入）：
+   * `[{ id, file, media }]`，`src` 恒等于 `sources[0]`。
+   * 片段用 `srcIndex` 指向这里的某一项；播放/切割按片段所属源取文件与长度。
+   */
+  sources: [],
+  clips: [],            // [{start,end,ps,pe,srcIndex?,group?}] 源时间 + 成片时间，顺序即时间顺序
   sel: -1,
   selSet: [],           // 多选（含 sel）：把几段"并成一次导出"时用
   groupSeq: 0,          // 分组号发号器（只增不减，撤销后复用也不会撞）
@@ -29,6 +35,24 @@ const state = {
   cut: { index: 0, total: 1, ratio: 0 },
   outputs: [],
 };
+
+/**
+ * 片段所属的源（多素材）：没有 srcIndex 时一律当主源。
+ * 单素材时恒等于 `state.src`，行为与改造前完全一致。
+ */
+function srcOfClip(clip) {
+  const i = Number(clip && clip.srcIndex);
+  if (Number.isInteger(i) && i >= 0 && state.sources[i]) return state.sources[i];
+  return state.src;
+}
+
+/** 成片时间 pt 处的源（播放器该播哪一份）。 */
+function srcAtProgram(pt) {
+  const list = state.sources || [];
+  if (list.length <= 1) return state.src;
+  const i = tl && tl.srcIndexAtProg ? tl.srcIndexAtProg(pt) : 0;
+  return list[i] || state.src;
+}
 
 const history = { stack: [], i: -1 };
 const pb = { index: 0 };      // 播放头当前落在第几个片段
@@ -332,13 +356,15 @@ async function applySource(src) {
       !window.confirm('更换源文件会丢掉当前的分割与删除记录，继续？')) return;
 
   state.src = src;
+  // 替换导入 = 从"只有这一份素材"重新开始（旧的多素材列表整个丢掉，上面的 confirm 已确认过）
+  state.sources = [{ id: '0', file: src.file, media: src.media }];
   state.sel = 0;
   state.rate = 1;
   state.plan = null;
   state.outputs = [];
   state.scanning = !!src.scanning;
   state.thumbs = null;
-  state.clips = [{ start: 0, end: round3(src.media.duration), ps: 0, pe: round3(src.media.duration) }];
+  state.clips = [{ start: 0, end: round3(src.media.duration), ps: 0, pe: round3(src.media.duration), srcIndex: 0 }];
   pb.index = 0;
   history.stack = [snapshot()];
   history.i = 0;
@@ -356,11 +382,72 @@ async function applySource(src) {
   $('outExt').textContent = extOf(src.file);
 
   updateInfo();
-  tl.setSource(src.media);
+  syncSourcesToTimeline();
   $('player').src = fileUrl(src.file);
   syncTimeline();
   pullThumbs(src.file);
   if (state.scanning) toast('已开始预览；正在后台扫描关键帧，长视频可能要等一会儿', 'warn');
+}
+
+/**
+ * 把"全部素材"推进时间轴（2026-10-18）：关键帧合并表、最长时长、帧率。
+ * 单素材时就等价于老的 `tl.setSource(media)`。
+ */
+function syncSourcesToTimeline() {
+  const list = (state.sources || []).map((s, i) => ({
+    srcIndex: i,
+    duration: s.media?.duration || 0,
+    fps: fpsOf(s.media || {}),
+    keyframes: s.media?.keyframes || [],
+  }));
+  tl.setSources(list);
+}
+
+/**
+ * 追加导入（2026-10-18）：把新素材接到现有轨道末尾，**不覆盖**已有片段。
+ *
+ * 做法：每份新素材在轨道末尾追加一条完整片段（源 0 → 源时长），
+ * 片段带 `srcIndex` 指向新加的源。已有片段一律不动——这正是"追加"与"替换"的区别。
+ * 若两份素材的参数不一致，导出时就必须选封装+编码（见 previewPlan 的 compat，
+ * 界面会用红字拦），这里不提前拒绝：用户可能只是想先摆好顺序再决定参数。
+ */
+async function appendSources(files) {
+  if (!files || !files.length) return;
+  if (state.busy) { toast('导出进行中，请先等待或取消', 'warn'); return; }
+  const results = await window.fc.appendFiles(files);
+  const ok = results.filter((r) => !r.error);
+  const bad = results.filter((r) => r.error);
+  if (bad.length) {
+    toast(`${bad.length} 份素材导入失败：${bad[0].error}`, 'warn', 6000);
+  }
+  if (!ok.length) return;
+
+  /**
+   * 第一份素材 + 已有片段 = 保持原样；后面每份追加一条片段。
+   * 追加位置永远是"轨道末尾"（成片时间最后），符合"接着剪"的直觉。
+   */
+  for (const r of ok) {
+    const media = r.media;
+    if (!media || !media.video) continue;
+    const localIndex = state.sources.length;
+    state.sources.push({ id: String(localIndex), file: r.file, media });
+    const dur = round3(media.duration);
+    state.clips.push({ start: 0, end: dur, ps: 0, pe: dur, srcIndex: localIndex });
+  }
+  relayout();
+  // 关键帧/时长/帧率要按"全部源"重建，否则磁吸与胶片条还停在第一份素材上
+  syncSourcesToTimeline();
+  state.plan = null;
+  pushHistory();
+  syncTimeline();
+  const n = state.sources.length;
+  toast(n > 1 ? `已追加 ${ok.length} 份素材（共 ${n} 份）` : `已追加 ${ok.length} 份素材`);
+}
+
+async function pickAndAppend() {
+  const files = await window.fc.pickFile({ multiple: true });
+  const list = Array.isArray(files) ? files : (files ? [files] : []);
+  if (list.length) await appendSources(list);
 }
 
 /**
@@ -494,10 +581,34 @@ function seekProgram(pt) {
   const i = tl.clipIndexAtProg(clamped);
   pb.index = i >= 0 ? i : 0;
   const srcT = tl.progToSrc(clamped);
-  $('player').currentTime = clamp(srcT, 0, state.src.media.duration);
+  // 多素材：播放头跨到另一份素材上时，必须先把 <video> 切到那个文件再 seek
+  const want = srcAtProgram(clamped);
+  switchPlayerTo(want);
+  pc.src = want;
+  $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
   tl.setProgramTime(clamped);
   lastSnap = null;        // 键盘 / 按钮移动播放头，谈不上磁吸
   onTimeUpdate();
+}
+
+/**
+ * 播放器当前挂的是哪一份素材（多素材切换用）。
+ *
+ * `<video>` 一次只能播一个文件，而时间轴是"多份素材首尾相接"的成片时间轴。
+ * 所以播放头跨源时必须换 `src` —— 换完要重新 seek 到该源内的时刻。
+ * 单素材时 `pc.src === state.src` 恒成立，这段就完全不动作。
+ */
+const pc = { src: null };
+
+/** 把播放器切到某个源（同一份就什么都不做，避免 reload 打断播放）。 */
+function switchPlayerTo(src) {
+  if (!src || pc.src === src) return false;
+  const p = $('player');
+  p.src = fileUrl(src.file);
+  pc.src = src;
+  // 胶片条也跟着当前源走（时间轴每段按自己的源抽帧）
+  pullThumbs(src.file);
+  return true;
 }
 
 function seekSource(srcT) {
@@ -509,7 +620,10 @@ function onScrub(srcT, progT, snap) {
   if (!state.src) return;
   // 手动拖播放头 = 接管：倒带循环还在跑的话会跟手指抢位置，先掐掉
   if (state.rate < 0) haltPlayback();
-  $('player').currentTime = clamp(srcT, 0, state.src.media.duration);
+  // 拖到别的素材上时先换文件，再按该源内的时刻定位
+  const want = srcAtProgram(progT);
+  switchPlayerTo(want);
+  $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
   const i = tl.clipIndexAtProg(progT);
   if (i >= 0) pb.index = i;
   lastSnap = snap || null;
@@ -722,12 +836,27 @@ function tick() {
   if (p.paused) { onTimeUpdate(); return; }
   const c = state.clips[pb.index];
   if (!c) { p.pause(); return; }
-  const fps = fpsOf(state.src.media);
+  // 帧率取**这一段所属源**的：多素材混剪时各源帧率可能不同（容差按谁算都行，但不能恒用主源）
+  const fps = fpsOf((srcOfClip(c) || {}).media || state.src.media);
   const slack = (0.5 / fps) * Math.max(1, state.rate);     // 倍速下一帧跨度更大，容差跟着放大
   if (p.currentTime >= c.end - slack) {
     const next = state.clips[pb.index + 1];
     if (!next) { p.currentTime = c.end; p.pause(); onTimeUpdate(); return; }
     pb.index += 1;
+    /**
+     * 跨到下一段时，如果它属于**另一个源**，必须先换 <video> 的 src 再 seek。
+     * 不做这一步，播放器会拿上一份素材的画面去对下一段的源时刻——跨素材拼接时
+     * 那条时间轴完全对不上（实测会一直停在第一个源的画面）。
+     */
+    const want = srcOfClip(next);
+    if (switchPlayerTo(want)) {
+      // 换 src 是异步加载：等元数据就绪后再 seek，否则 currentTime 会被立刻忽略
+      const targetT = next.start + 0.5 / fps;
+      p.addEventListener('loadedmetadata', () => { p.currentTime = targetT; }, { once: true });
+      onTimeUpdate();
+      if (!p.paused) rafId = requestAnimationFrame(tick);
+      return;
+    }
     p.currentTime = next.start + 0.5 / fps;
   } else if (p.currentTime < c.start - 0.05) {
     p.currentTime = c.start + 0.5 / fps;
@@ -1012,10 +1141,20 @@ function unmergeSelected() {
 // ---------------------------------------------------------------- 撤销 / 重做
 
 function snapshot() {
-  // group 也要进快照：分组是用户的一次编辑动作，撤销必须能把它撤回
-  return state.clips.map((c) => (c.group == null
-    ? { start: c.start, end: c.end }
-    : { start: c.start, end: c.end, group: c.group }));
+  // group / srcIndex 都要进快照：分组是用户的一次编辑动作，srcIndex 是多素材的来源标记
+  // （丢了它，撤销后那几段会被当成主源素材，切出完全不相干的内容）
+  return state.clips.map((c) => {
+    const one = { start: c.start, end: c.end };
+    if (c.group != null) one.group = c.group;
+    if (Number.isInteger(c.srcIndex)) one.srcIndex = c.srcIndex;
+    return one;
+  });
+}
+
+/** 片段所属源的序号（缺省 0 = 主源）。界面各处取源信息都走它，避免到处 `?? 0`。 */
+function srcIndexOf(clip) {
+  const i = Number(clip && clip.srcIndex);
+  return Number.isInteger(i) && i >= 0 && state.sources[i] ? i : 0;
 }
 
 function pushHistory() {
@@ -1058,17 +1197,104 @@ function refreshPlan() {
   planTimer = setTimeout(runPlan, 120);
 }
 
+/**
+ * 把片段转成主进程要的 segments（`srcIndex` 与 `group` 都必须带上）。
+ * 少带 srcIndex 的后果不是报错，而是"按主源切出另一份素材"——必须统一从这里出。
+ *
+ * 没有 srcIndex 的片段按**主源（0）**补齐：早期版本创建的片段（或撤销回很旧的状态）
+ * 不带这个字段，缺省成 0 与"它就是第一份素材"完全等价，但显式写出来能让
+ * 主进程/计划层始终拿到完整信息，不必到处 `?? 0`。
+ */
+function segmentsPayload() {
+  return state.clips.map((c) => {
+    const one = { start: c.start, end: c.end };
+    if (c.group != null) one.group = c.group;
+    one.srcIndex = Number.isInteger(c.srcIndex) && state.sources[c.srcIndex] ? c.srcIndex : 0;
+    return one;
+  });
+}
+
+/** 全部素材的路径（主进程据此解析源数组；单素材时就是一项）。 */
+function sourceFiles() {
+  return (state.sources && state.sources.length ? state.sources : []).map((s) => s.file);
+}
+
+/**
+ * 多素材参数不一致时，把"必须选封装与编码"这件事说清楚（2026-10-18）。
+ *
+ * 用户定的是：参数不一致 → 拒绝导出、在**对应项上标红字**，让他知道要选什么。
+ * 所以这里既写面板上的提示条，也给两行加红框；选好编码后由 updateCodecHint 清掉。
+ */
+function showCodecRequired(compat) {
+  const box = $('codecHint');
+  if (!box) return;
+  const diffs = (compat.diffs || []).map((d) => `${d.label} ${d.values.map((v) => v.value).join(' / ')}`).join('；');
+  box.innerHTML = '';
+  const line1 = document.createElement('div');
+  line1.className = 'note-strong';
+  line1.textContent = '这些素材的参数不一致，无法直接流拷贝拼接，请选择封装与编码格式';
+  const line2 = document.createElement('div');
+  line2.textContent = diffs;
+  const line3 = document.createElement('div');
+  const base = compat.baseline;
+  line3.textContent = base
+    ? `其余参数将统一到 ${base.width}×${base.height} @ ${base.fps}fps（基准取自参数最强的那份素材）`
+    : '';
+  box.append(line1, line2, line3);
+  box.classList.remove('hidden');
+  $('rowCodec')?.classList.add('need');
+  $('rowContainer')?.classList.add('need');
+}
+
+/** 参数一致 / 已选编码时清掉红字与提示。 */
+function updateCodecHint() {
+  const box = $('codecHint');
+  const compat = state.plan && state.plan.compat;
+  const chosen = $('outCodec') ? $('outCodec').value : '';
+  if (!box) return;
+  if (!compat || compat.uniform) {
+    // 参数一致：跟随源可用，这一行只是提示"可以零损失"
+    if (compat && compat.uniform && state.sources.length > 1) {
+      box.innerHTML = '';
+      const d = document.createElement('div');
+      d.className = 'note-soft';
+      d.textContent = `素材参数一致（${compat.baseline?.width}×${compat.baseline?.height} @ ${compat.baseline?.fps}fps）——「跟随源」可全程流拷贝，零损失`;
+      box.appendChild(d);
+      box.classList.remove('hidden');
+    } else {
+      box.classList.add('hidden');
+    }
+    $('rowCodec')?.classList.remove('need');
+    $('rowContainer')?.classList.remove('need');
+    return;
+  }
+  if (!chosen) { showCodecRequired(compat); return; }
+  // 已选编码：说明哪些段会被重编码（有损，必须让用户知道）
+  const reN = (compat.perSource || []).filter((p) => p.reencode).length;
+  box.innerHTML = '';
+  const d = document.createElement('div');
+  d.className = 'note-soft';
+  const base = compat.baseline || {};
+  d.textContent = reN
+    ? `${reN} 份素材参数与其它不一致，导出时整段重编码为 ${chosen}（有损），统一到 ${base.width}×${base.height} @ ${base.fps}fps`
+    : `将统一编码为 ${chosen}（所有素材都需重编码）`;
+  box.appendChild(d);
+  box.classList.remove('hidden');
+  $('rowCodec')?.classList.remove('need');
+  $('rowContainer')?.classList.remove('need');
+}
+
 let planSeq = 0;              // 计划请求代序：勾选切模式时防旧响应覆盖新计划（乱序完成时后者胜）
 async function runPlan() {
   if (!state.src || !state.clips.length) return;
   const seq = ++planSeq;
   try {
     const plan = await window.fc.previewPlan({
-      file: state.src.file,
-      segments: state.clips.map((c) => (c.group == null
-        ? { start: c.start, end: c.end }
-        : { start: c.start, end: c.end, group: c.group })),
+      files: sourceFiles(),
+      segments: segmentsPayload(),
       container: containerChoice(),
+      // 多素材参数不一致时用户必须选编码；没选就发空，主进程会回 needsCodec=true
+      codec: $('outCodec') ? $('outCodec').value || '' : '',
       precise: isPreciseMode(),
       split: $('optSplit').checked,
     });
@@ -1089,6 +1315,8 @@ async function runPlan() {
   // 输出的"第几个文件"必须来自真实计划（组号 ≠ 文件号，见 fileNoOfGroup）
   tl.setGroupFileNos(state.plan && state.plan.fileNoOfGroup);
   renderClips();
+  // 多素材兼容性提示（参数不一致 → 红字要求选封装与编码）
+  updateCodecHint();
   updateEstimate();
   updateExportEnabled();
   updateToolButtons();
@@ -1385,14 +1613,27 @@ function updateExportEnabled() {
 
 async function runExport() {
   if (!state.src || state.busy) return;
-  const segments = state.clips.map((c) => (c.group == null
-    ? { start: c.start, end: c.end }
-    : { start: c.start, end: c.end, group: c.group }));
+  const segments = segmentsPayload();
   if (!segments.length) return;
 
+  /**
+   * 导出前的最后一道拦截（2026-10-18）。
+   *
+   * 多素材参数不一致却没选编码 → 直接拒绝，不把注定失败的导出送进主进程。
+   * 主进程里还有一层同样的检查（防脚本调用绕过界面），这里是为了给用户
+   * 一个**当场可见**的红字，而不是等到点完导出才弹错误。
+   */
+  const compat = state.plan && state.plan.compat;
+  if (compat && !compat.uniform && !$('outCodec').value) {
+    showCodecRequired(compat);
+    $('outCodec').focus();
+    return;
+  }
+
   const payload = {
-    file: state.src.file,
+    files: sourceFiles(),
     segments,
+    codec: $('outCodec') ? $('outCodec').value || '' : '',
     outDir: $('outDir').value,
     baseName: $('outName').value,
     split: $('optSplit').checked,
@@ -1565,7 +1806,7 @@ const KEYS = {
   undo: ['ctrl+z'], redo: ['ctrl+y', 'ctrl+shift+z'],
   zoomIn: ['+', '='], zoomOut: ['-', '_'], fit: ['ctrl+0'],
   toStart: ['home'], toEnd: ['end'], cancelExport: ['escape'],
-  importFile: ['ctrl+o'], exportNow: ['ctrl+e'], keysPanel: ['shift+?'],
+  importFile: ['ctrl+o'], appendFiles: ['ctrl+shift+o'], exportNow: ['ctrl+e'], keysPanel: ['shift+?'],
 };
 
 const KEY_LABELS = {
@@ -1577,12 +1818,12 @@ const KEY_LABELS = {
   prevEdge: '上一个分割点', nextEdge: '下一个分割点',
   undo: '撤销', redo: '重做', zoomIn: '放大时间轴', zoomOut: '缩小时间轴', fit: '整条适应',
   toStart: '跳到片头', toEnd: '跳到片尾', cancelExport: '取消导出',
-  importFile: '导入', exportNow: '导出', keysPanel: '打开本面板',
+  importFile: '导入', appendFiles: '追加导入', exportNow: '导出', keysPanel: '打开本面板',
 };
 
 const KEY_ORDER = ['rippleBefore', 'split', 'rippleAfter', 'deleteClip', 'rewind', 'slowRewind', 'pause', 'faster', 'slowFaster',
   'playPause', 'prevFrame', 'nextFrame', 'prevKeyframe', 'nextKeyframe', 'prevEdge', 'nextEdge',
-  'undo', 'redo', 'zoomIn', 'zoomOut', 'fit', 'toStart', 'toEnd', 'cancelExport', 'importFile', 'exportNow'];
+  'undo', 'redo', 'zoomIn', 'zoomOut', 'fit', 'toStart', 'toEnd', 'cancelExport', 'importFile', 'appendFiles', 'exportNow'];
 
 let customKeys = {};
 let capturing = null;
@@ -1747,6 +1988,7 @@ function runAction(action) {
     case 'toStart': return state.src && seekProgram(0);
     case 'toEnd': return state.src && seekProgram(programTotal());
     case 'importFile': return pickAndImport();
+    case 'appendFiles': return pickAndAppend();
     case 'exportNow': popShow('exportMask', true); if (!$('btnExport').disabled) runExport(); return undefined;
     case 'cancelExport':
       if (state.busy) return cancelExport();
@@ -1792,6 +2034,11 @@ function bindUi() {
   $('btnImportPick').addEventListener('click', async () => {
     popShow('importMask', false);
     await pickAndImport();
+  });
+  // 追加导入：不动现有片段，把新素材接到轨道末尾（2026-10-18）
+  $('btnImportAppend')?.addEventListener('click', async () => {
+    popShow('importMask', false);
+    await pickAndAppend();
   });
   $('btnMenu').addEventListener('click', (e) => { e.stopPropagation(); popToggle('menuPop'); });
   document.addEventListener('pointerdown', (e) => {
@@ -1857,6 +2104,8 @@ function bindUi() {
   });
 
   $('outContainer').addEventListener('change', refreshPlan);   // 换容器会改后缀，也可能装不下字幕
+  // 换编码会改变"哪些源需要重编码"，必须重算计划（代价标签、估时、红字都跟着变）
+  $('outCodec')?.addEventListener('change', () => { refreshPlan(); });
 
   $('btnExport').addEventListener('click', runExport);
   $('btnCancelExport').addEventListener('click', cancelExport);
@@ -1952,6 +2201,9 @@ window.__smoke = {
   state,
   get tl() { return tl; },
   importFile,
+  // 多素材（追加导入）：smoke 与联调脚本用它把第二份素材并进轨道
+  appendSources,
+  pickAndAppend,
   splitAtPlayhead,
   seekProgram,
   stepFrames,

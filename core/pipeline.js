@@ -178,62 +178,135 @@ async function makeTempDir(anchorPath, prefix = '.fast-cut-tmp-') {
  * 只做区间规整 + 切割计划推导，不跑 ffmpeg。
  * UI 要在导出前显示真实的入点/代价、主进程要查重名，都走这里，保证和真正导出同一套算法。
  */
-function planFor(loaded, segments, opts = {}) {
+/**
+ * 把"单源 loaded"与"多源 sources 数组"归一成统一的源列表。
+ *
+ * 单源（旧调用）→ `[{ id, file, media, bins, ...loaded }]`，行为与以前逐字节相同；
+ * 多源 → 原样返回。所有下游只认这个数组，不再直接摸 `loaded.file`。
+ */
+function asSourceList(loadedOrSources) {
+  if (!loadedOrSources) return [];
+  if (Array.isArray(loadedOrSources)) {
+    return loadedOrSources.map((s, i) => ({ ...s, id: s.id != null ? s.id : String(i) }));
+  }
+  return [{ ...loadedOrSources, id: loadedOrSources.id != null ? loadedOrSources.id : '0' }];
+}
+
+function planFor(loadedOrSources, segments, opts = {}) {
+  const sources = asSourceList(loadedOrSources);
+  if (!sources.length) throw new Error('没有可用的源');
   const splitOutput = !!opts.split;
   const keeps = opts.ordered
     ? orderPreserving(segments)
     // split（「每段一个文件」）必须保留首尾相接的边界：相邻两段各是用户切出来的一份素材，
     // 并成一段分组就没了（产物变成"一段包含所有片段的完整视频"，用户实测报的失效）
     : normalizeSegments(segments, { keepAdjacent: splitOutput });
-  const { plan, warnings } = buildPlan(keeps, {
-    keyframes: loaded.media.keyframes,
-    // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
-    // 实测 VFR 源改用 -t 限长时长根本收不住（要 2.27s 给出 4.83s，把删掉的内容又带回来）
-    fps: loaded.media.video?.fps,
-    gridOrigin: loaded.media.gridOrigin,
-    reorderDepth: loaded.media.video?.reorderDepth,
-    duration: loaded.media.duration,
-    ordered: !!opts.ordered,
-    sameCodec: keepsSourceCodec(loaded.media),
-    /**
-     * 开放 GOP 的源每个段内关键帧后跟 (深度+1) 个 RASL 画面（x265 实测）。
-     * RASL 剥除已整体移除（2026-10-17 定案，四轮实验，见 buildArgs 顶部定案注释与
-     * docs/exploration-as-rasl-fix.md）——段内 RASL 是真画面，保留；但它们按解码序
-     * 占 `-frames:v` 的包位，所以预算要**加回**它们的包数（cuttings.raslKfsIn）。
-     * 闭合 GOP（hasRasl=false）没有 RASL，传 0。
-     */
-    raslPerKf: loaded.media.video?.codec === 'hevc' && loaded.media.video?.reorderDepth >= 0
-      && loaded.media.hasRasl === true
-      ? loaded.media.video.reorderDepth + 1
-      : 0,
-    /**
-     * 多段纯拷贝拼接是否需要"接缝缓解"（非首个片段开头重编码，自带 IDR 重置 POC）。
-     *
-     * 判据两个来源取并集：
-     *  · `hasRasl === true`——源确实是 HEVC 开放 GOP（probeHasRasl 直接测流）。
-     *  · `seamSafe === false`——通用探针 probePureCopySeams 实测拼接解不开
-     *    （覆盖 H.264 开放 GOP 以及任何未知格式）。
-     */
-    seamNeedsIdr: loaded.media.hasRasl === true || loaded.media.seamSafe === false,
-    /**
-     * 更严重的一层：探针发现**单个拷贝段自己就解不开**（实测 x264 开放 GOP 的 K 帧
-     * NAL type 是 1 不是 5，根本不是 IDR）。此时"开头重编码一小段"也救不了——
-     * 拷贝尾段本身从非 IDR 起。唯一出路是每个片段整段重编码（有损，但可解码）。
-     */
-    forceWholeReencode: loaded.media.segmentsOk === false,
-    // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
-    precise: opts.precise !== false,
-    // 「每段一个文件」：dedupePlan 不得跨保留区间合并，否则两条相邻片段会被并成一组
-    splitOutput,
-  });
+
+  /**
+   * 一条保留区间属于哪个源：`seg.srcIndex`。
+   *
+   * **计划必须按源分别推导**（2026-10-18 多源改造）：关键帧表、帧率、网格原点、
+   * 重排深度、接缝探针结论全都绑定在各自的源上。混在一起算会把 A 源的关键帧
+   * 当成 B 源的，切点与帧数预算全错。所以这里按源分组调 buildPlan，再按全局
+   * keepIndex 合并回来——分组、字幕重排、界面映射仍然一一对应。
+   */
+  const srcOfKeep = (k) => {
+    const i = Number(k && k.srcIndex);
+    return Number.isInteger(i) && i >= 0 && i < sources.length ? i : 0;
+  };
+  const allWarnings = [];
+  const planByGi = new Map();
+  const warnsSeen = new Set();
+  // 跨源统一参数时，参数不一致的源要**整段重编码**（流拷贝拼不了，实测会静默丢帧）。
+  // 用函数传入，让每个源各自决定；单源导出恒为 false。
+  const forceFor = typeof opts.forceReencodeFor === 'function' ? opts.forceReencodeFor : () => false;
+
+  for (let si = 0; si < sources.length; si++) {
+    const src = sources[si];
+    const items = [];
+    keeps.forEach((k, gi) => { if (srcOfKeep(k) === si) items.push({ keep: k, gi }); });
+    if (!items.length) continue;
+    const forceThis = !!forceFor(si, src);
+    const { plan: subPlan, warnings: subWarn } = buildPlan(items.map((x) => x.keep), {
+      keyframes: src.media.keyframes,
+      // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
+      // 实测 VFR 源改用 -t 限长时长根本收不住（要 2.27s 给出 4.83s，把删掉的内容又带回来）
+      fps: src.media.video?.fps,
+      gridOrigin: src.media.gridOrigin,
+      reorderDepth: src.media.video?.reorderDepth,
+      duration: src.media.duration,
+      ordered: !!opts.ordered,
+      sameCodec: forceThis ? false : keepsSourceCodec(src.media),
+      /**
+       * 开放 GOP 的源每个段内关键帧后跟 (深度+1) 个 RASL 画面（x265 实测）。
+       * RASL 剥除已整体移除（2026-10-17 定案，四轮实验，见 buildArgs 顶部定案注释与
+       * docs/exploration-as-rasl-fix.md）——段内 RASL 是真画面，保留；但它们按解码序
+       * 占 `-frames:v` 的包位，所以预算要**加回**它们的包数（cuttings.raslKfsIn）。
+       * 闭合 GOP（hasRasl=false）没有 RASL，传 0。
+       */
+      raslPerKf: src.media.video?.codec === 'hevc' && src.media.video?.reorderDepth >= 0
+        && src.media.hasRasl === true
+        ? src.media.video.reorderDepth + 1
+        : 0,
+      /**
+       * 多段纯拷贝拼接是否需要"接缝缓解"（非首个片段开头重编码，自带 IDR 重置 POC）。
+       * 判据：`hasRasl === true`（HEVC 开放 GOP）或 `seamSafe === false`（通用探针实测拼不了）。
+       */
+      seamNeedsIdr: src.media.hasRasl === true || src.media.seamSafe === false,
+      /**
+       * 更严重的一层：探针发现**单个拷贝段自己就解不开**（x264 开放 GOP 的 K 帧不是 IDR）。
+       * 此时"开头重编码一小段"救不了，只能整段重编码。
+       */
+      forceWholeReencodeNative: src.media.segmentsOk === false,
+      /**
+       * 跨素材统一参数：这个源与基准不一致 → 每段都整段重编码并归一化。
+       * 这是"必须"而不是"可选"：实测流拷贝拼参数不同的素材会**静默丢帧**
+       * （273/300 帧、帧间隔塌到 0.0001s，解码却不报错）。
+       */
+      forceWholeReencode: forceThis,
+      // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
+      precise: opts.precise !== false,
+      // 「每段一个文件」：dedupePlan 不得跨保留区间合并，否则两条相邻片段会被并成一组
+      splitOutput,
+    });
+    // 组内 keepIndex → 全局 keepIndex；同时打上 srcIndex，导出时据此选对源文件。
+    // **一条区间可能产出多个计划项**（精确模式 = 重编码头 + 拷贝尾），必须按数组收集，
+    // 不能用 Map 以 keepIndex 为键——那样后一项会把前一项覆盖掉（实测重编码头整段丢失，
+    // 3 条区间 10s 变成 4s，只剩拷贝尾段）。
+    for (const p of subPlan) {
+      const gi = items[p.keepIndex] ? items[p.keepIndex].gi : p.keepIndex;
+      const arr = planByGi.get(gi);
+      const one = { ...p, keepIndex: gi, srcIndex: si, sourceId: src.id };
+      if (arr) arr.push(one);
+      else planByGi.set(gi, [one]);
+    }
+    for (const w of subWarn) {
+      if (warnsSeen.has(w)) continue;
+      warnsSeen.add(w);
+      allWarnings.push(w);
+    }
+  }
+
+  // 按全局顺序摊平（乱序时 keeps 的顺序就是导出顺序，plan 项必须跟着走）。
+  // 同一 keep 的多项（重编码头 + 拷贝尾）按原顺序全部保留。
+  const plan = [];
+  for (let gi = 0; gi < keeps.length; gi++) {
+    const arr = planByGi.get(gi);
+    if (arr) plan.push(...arr);
+  }
+
   const keepSecs = opts.ordered
     ? snap(keeps.reduce((acc, k) => acc + (k.end - k.start), 0))
     : totalDuration(keeps);
   /**
    * 每条保留区间**实际第一帧**的源时刻：入点不在帧网格上时画面从网格点起步。
    * 字幕按文本重新计时要拿它做减法，否则每条 cue 都比口型晚半帧（见 cuttings.frameStart）。
+   * 多源时按各自源的帧率与网格原点算。
    */
-  const keepAligns = keeps.map((k) => frameStart(k.start, loaded.media.video?.fps, loaded.media.gridOrigin));
+  const keepAligns = keeps.map((k) => {
+    const src = sources[srcOfKeep(k)] || sources[0];
+    return frameStart(k.start, src.media.video?.fps, src.media.gridOrigin);
+  });
   /**
    * 片段 → 保留区间的对应表（界面按**片段序号**取代价与吸附差，计划按 keepIndex 打标）。
    *
@@ -243,7 +316,7 @@ function planFor(loaded, segments, opts = {}) {
    * 所以这里按源区间把每个片段映射回它实际落进的那条 keep。
    */
   const clipToKeep = mapClipsToKeeps(segments, keeps, { ordered: !!opts.ordered });
-  return { keeps, plan, warnings, keepSecs, keepAligns, clipToKeep };
+  return { keeps, plan, warnings: allWarnings, keepSecs, keepAligns, clipToKeep };
 }
 
 /**
@@ -289,20 +362,43 @@ function orderPreserving(segments) {
 
 /**
  * 执行导出。
+ *
+ * 第一个参数既可以是单个 `loaded`（旧调用），也可以是**源数组**
+ * （多素材追加导入后为此形状）。第三个参数里的 `normalize` 决定跨源参数如何统一。
  */
-async function exportSegments(loaded, segments, opts) {
-  const { file, media, bins } = loaded;
+async function exportSegments(loadedOrSources, segments, opts) {
+  const sources = asSourceList(loadedOrSources);
+  if (!sources.length) throw new Error('没有可用的源');
+  // 单源语义全部沿用"第一个源"：file/media/bins 在多源下只代表"主源"，
+  // 逐段的源由 plan 项的 srcIndex 决定（见下方切割循环）。
+  const primary = sources[0];
+  const { file, media, bins } = primary;
   const {
     outPath, split = false, crf = 18, ordered = false,
     precise = true, dropSubtitles = false, container = null,
     onProgress = () => {}, token = createToken(),
+    /** 跨源统一参数：`{ width, height, fps, sar, codec, audio }`。单源导出不传。 */
+    normalizeTo = null,
+    /** 哪些源需要整段重编码（参数与基准不一致）。单源导出不传。 */
+    reencodeSources = null,
   } = opts;
 
   // 自检用的容器家族：调用方传容器 id（'mp4'）或扩展名（'.mp4'）都行，转成
   // containers 的家族对象（{family,label,ext}）；不传则 verify 退回"与源一致"判。
   const containerFamily = (typeof container === 'string' ? byId(container) || byExt(container) : container);
 
-  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, precise, dropSubtitles, split });
+  /**
+   * 多源时，被判定"参数不一致、必须统一"的源要整段重编码（流拷贝拼不了）。
+   * forceReencodeAll 只作用于这些源：同源导出、或参数一致的源之间，绝不因此多编一帧。
+   */
+  const forceAll = new Set(Array.isArray(reencodeSources) ? reencodeSources : []);
+  const needsForce = (srcIndex) => forceAll.has(sources[srcIndex]?.id) || forceAll.has(srcIndex);
+
+  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(sources, segments, {
+    ordered, precise, dropSubtitles, split,
+    // 按源决定是否强制整段重编码：planFor 内部逐源调 buildPlan，这里按源号判断
+    forceReencodeFor: (si, src) => needsForce(si) || needsForce(src.id),
+  });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
 
@@ -312,7 +408,14 @@ async function exportSegments(loaded, segments, opts) {
   const intendedCodec = allReencode && !keepsSourceCodec(media)
     ? (CODEC_OF_ENCODER[pickVideoCodec(media)] || null)
     : null;
-  const cutFps = media.video?.fps;
+  /**
+   * 切割用的帧率与"输出主体参数"。
+   *
+   * 跨源统一参数时必须用**基准参数**（normalizeTo），而不是第一个源的：
+   * 基准源可能不是第一个（实测基准是第二个源 640x360@24，产物却按下第一个源的
+   * 30fps/320x180 出，结果是"分辨率一致"自检失败、音画差 0.9s）。
+   */
+  const cutFps = normalizeTo?.fps || media.video?.fps;
 
   // 中间文件落在**输出盘**（见 makeTempDir 注释：以前写系统临时盘，大素材必爆）
   const tmpDir = await makeTempDir(outPath);
@@ -348,17 +451,36 @@ async function exportSegments(loaded, segments, opts) {
   onProgress({ phase: 'prepare', keepSecs: totalKeep, segments: keeps });
 
   try {
-    let src = { file, media };
-    if (normalize) {
-      onProgress({ phase: 'normalize', note: '先把源封装归一成 MP4（纯拷贝，不重编码）' });
+    /**
+     * 多源（2026-10-18）：每个源各自准备一份"切片用的源"。
+     *
+     * 单源时这就是以前那个 `src`，行为逐字节不变。多源时每个源独立判断要不要归一封装，
+     * 结果放进 srcPool[srcIndex]，切割循环按 `item.srcIndex` 取对应那份——拿错文件
+     * 会切出完全不相干的内容，而且自检只看时长/帧数，很可能照样"通过"。
+     */
+    const srcPool = await Promise.all(sources.map(async (s) => {
+      let one = { file: s.file, media: s.media };
+      if (!willNormalize(s.media, plan.filter((p) => p.srcIndex === sources.indexOf(s)).length, stripSubs)) {
+        return one;
+      }
       try {
-        src = await makeWorkingCopy(bins, file, media, tmpDir, token);
-        warnings.push('源不是 MP4 封装：多段拼接前已把它纯拷成 MP4 工作副本，否则按段归零时间戳会丢报文时间戳（实测 MKV 源直接切出的段 pts 为空，拼不了）');
+        const w = await makeWorkingCopy(bins, s.file, s.media, tmpDir, token);
+        if (sources.length > 1) {
+          warnings.push(`${path.basename(s.file)} 不是 MP4 封装：已把它纯拷成 MP4 工作副本再切（否则按段归零时间戳会丢报文时间戳，实测 MKV 源直接切出的段 pts 为空，拼不了）`);
+        } else {
+          warnings.push('源不是 MP4 封装：多段拼接前已把它纯拷成 MP4 工作副本，否则按段归零时间戳会丢报文时间戳（实测 MKV 源直接切出的段 pts 为空，拼不了）');
+        }
+        return w;
       } catch (err) {
         if (isCancelled(err)) throw err;
-        warnings.push(`封装归一失败（${String(err.message || err).split('\n')[0].slice(0, 90)}），改用源文件直接切割`);
+        const detail = String(err.message || err).split('\n')[0].slice(0, 90);
+        if (sources.length > 1) warnings.push(`${path.basename(s.file)} 封装归一失败（${detail}），改用源文件直接切割`);
+        else warnings.push(`封装归一失败（${detail}），改用源文件直接切割`);
+        return one;
       }
-    }
+    }));
+    if (sources.length === 1) onProgress({ phase: 'normalize', note: '先把源封装归一成 MP4（纯拷贝，不重编码）' });
+    const src = srcPool[0];
     // 中间段优先写 MP4（原因见 partsAsMp4）；只有必须把字幕带在段里时才沿用目标容器。
     const partExt = partsAsMp4(media, ext, carrySubsInParts) ? '.mp4' : ext;
     // 「读 mov 族 且 写 mov 族」才敢让拷贝段的时间戳不归零：
@@ -387,15 +509,53 @@ async function exportSegments(loaded, segments, opts) {
     for (let i = 0; i < plan.length; i++) {
       const item = plan[i];
       const partFile = path.join(tmpDir, `seg${String(i).padStart(3, '0')}${partExt}`);
-      const args = argsForSegment(item, { ...src.media, file: src.file }, partFile, {
+      /**
+       * 按 `srcIndex` 取该段自己的源（2026-10-18 多源）。
+       * 单源时恒为 srcPool[0]，与改造前完全一致。
+       * 拿错源的后果不是报错，而是"切出另一份素材却照样能通过自检"——必须按段严格对齐。
+       */
+      const srcOfItem = srcPool[item.srcIndex] || srcPool[0];
+      /**
+       * 跨源参数归一：这段的源参数与基准不一致时，重编码段必须显式把尺寸/帧率/SAR 统一过去。
+       * 被判为"要重编码"的段一定带有 forceReencode，所以这里只在不等于基准时才给 filter。
+       */
+      const needNorm = normalizeTo && needsForce(item.srcIndex) ? normalizeTo : null;
+      const args = argsForSegment(item, { ...srcOfItem.media, file: srcOfItem.file }, partFile, {
         crf, fps: cutFps, dropSubtitles: dropSubtitles || stripSubs, copyTs,
         dumpParams: mixedCodecs,
+        normalize: needNorm,
+        // 归一化时编码器必须由目标编码决定（否则 hevc 源会重编码成 hevc，与 h264 段拼不起来）
+        targetCodec: needNorm ? normalizeTo.codec : null,
       });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);
       partFiles.push(partFile);
     }
-    const cutMedia = src.media;
+    /**
+     * 拼接与自检用的"产物主体参数"。
+     *
+     * 单源：就是那个源。
+     * 多源统一参数：必须用**基准参数**重建一份——否则拼接仍按第一个源的时基/分辨率
+     * 去推，产物会是"第一个源的参数"（实测基准是第二个源时，产物出成 320x180@30，
+     * 而所有段其实都统一到了 640x360@24，于是时长 4.917 而不是 4.000）。
+     */
+    const cutMedia = normalizeTo
+      ? {
+        ...media,
+        video: {
+          ...media.video,
+          width: normalizeTo.width,
+          height: normalizeTo.height,
+          fps: normalizeTo.fps,
+          pixFmt: normalizeTo.pixFmt || media.video?.pixFmt,
+          sar: normalizeTo.sar || media.video?.sar,
+          codec: normalizeTo.codec || media.video?.codec,
+        },
+        audioTracks: normalizeTo.audio
+          ? [{ ...(media.audioTracks?.[0] || {}), ...normalizeTo.audio }]
+          : media.audioTracks,
+      }
+      : src.media;
     let outputs = [];
     const expectSecs = [];
     const expectFrames = [];
@@ -546,6 +706,13 @@ async function exportSegments(loaded, segments, opts) {
           dropSubtitles, codec: intendedCodec, vfr: !!media.video?.vfr, parts: plan.length,
           seams: seamsList[i],
           sourceFormat: media.format,
+          /**
+           * 多段素材统一参数时，产物应当长成"基准参数"的样子——不是第一个源的样子。
+           * 不传这个，自检会拿第一个源去比，把正确的产物判成故障（实测）。
+           */
+          target: normalizeTo
+            ? { ...normalizeTo, codec: normalizeTo.codec || cutMedia.video?.codec }
+            : null,
         });
       results.push({ file: outputs[i], ...r });
     }

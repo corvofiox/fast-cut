@@ -513,6 +513,24 @@ button.m-row:hover, label.m-row:hover { background: #23272e; }
 .m-label.dim { color: var(--fg-dim); }
 .m-sub { grid-column: 1 / -1; color: #626d7d; font-size: 11px; line-height: 1.5; }
 .m-row.on .m-sub { color: var(--warn); }
+/* 多素材参数不一致：需要用户去选的那两行标红（2026-10-18）。
+   红字只出现在"真的必须你动手"的项上——不选就导不出，所以用描边把它拎出来，
+   而不是在面板底部堆一段没人看的说明。 */
+.m-row.need { background: rgba(229, 83, 75, .1); box-shadow: inset 3px 0 0 var(--err); }
+.m-row.need .m-label { color: #f2b3ae; font-weight: 600; }
+.m-row.need select, .m-row.need .m-select {
+  border-color: rgba(229, 83, 75, .65) !important;
+  box-shadow: 0 0 0 2px rgba(229, 83, 75, .18);
+}
+/* 兼容性提示条：强提示（红）与普通说明（灰）两档 */
+.m-note {
+  margin: 6px 0 10px; padding: 7px 9px; border-radius: 6px;
+  font-size: 11px; line-height: 1.6;
+  background: #2b1817; border: 1px solid #6b3330; color: #f2b3ae;
+}
+.m-note:has(.note-soft) { background: #1b1e24; border-color: var(--line); color: var(--fg-dim); }
+.m-note .note-strong { color: #ff8b82; font-weight: 700; margin-bottom: 2px; }
+.m-note .note-soft { color: var(--fg-dim); }
 /* 键帽：快捷键的键位和导入提示用的是同一颗帽，只是能不能点 */
 .m-chip {
   font: 11px/1.5 "Cascadia Mono", Consolas, monospace; color: var(--fg-dim);

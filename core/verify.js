@@ -51,8 +51,27 @@ async function verifyExport(ffmpegPath, ffprobePath, srcFile, outFile, expect) {
 
   const sVideo = first(srcMeta.streams, 'video');
   const oVideo = first(outMeta.streams, 'video');
+  /**
+   * 跨素材统一参数时的比对基准（2026-10-18）。
+   *
+   * 多段素材参数不一致、被统一到"基准源"时，产物**本来就不该**等于第一个源：
+   * 实测基准是 640x360@24 的第二个源，产物 640x360@24 完全正确，而旧判据拿第一个源
+   * （320x180@30）去比，报"分辨率一致 ✗ / 帧率 ✗"——把正确产物判成故障。
+   * 所以这里把 `expect.target` 当作"应当长成什么样"，源只用来描述来源。
+   */
+  const target = expect.target || null;
   if (!sVideo || !oVideo) {
     add('视频轨存在', false, `源视频轨 ${!!sVideo}，导出 ${!!oVideo}`);
+  } else if (target) {
+    // 统一参数导出：逐项对照**基准参数**，而不是第一个源
+    add('编码为所选编码', oVideo.codec_name === target.codec,
+      `所选 ${target.codec} → 导出 ${oVideo.codec_name}（多段素材参数不一致，已统一重编码）`);
+    add('分辨率与基准一致', sameWH(target, oVideo),
+      `基准 ${target.width}x${target.height} → 导出 ${oVideo.width}x${oVideo.height}`);
+    if (target.pixFmt) {
+      add('像素格式与基准一致', oVideo.pix_fmt === target.pixFmt,
+        `基准 ${target.pixFmt} → 导出 ${oVideo.pix_fmt}`);
+    }
   } else if (expect.codec && expect.codec !== sVideo.codec_name) {
     // 源编码没有同编码的重编码器时整段重编码，编码必然改变：这是明说的设计而不是故障，
     // 拿"所选编码"比对，而不是拿源比对

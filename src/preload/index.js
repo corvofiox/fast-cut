@@ -17,7 +17,10 @@ function pathForFile(file) {
 
 contextBridge.exposeInMainWorld('fc', {
   env: () => ipcRenderer.invoke('fc:env'),
-  pickFile: () => ipcRenderer.invoke('fc:pickFile'),
+  // opts.multiple = 追加导入时一次选多个
+  pickFile: (opts) => ipcRenderer.invoke('fc:pickFile', opts),
+  /** 追加导入：多选素材并进当前轨道（只导入探流，不动时间轴） */
+  appendFiles: (files) => ipcRenderer.invoke('fc:append', files),
   load: (file) => ipcRenderer.invoke('fc:load', file),
   getThumbs: (file) => ipcRenderer.invoke('fc:thumbs:get', file),
   // 胶片条按缩放动态抽帧：报"哪一档、哪一段"，抽完主进程推回来

@@ -212,6 +212,12 @@ function normalizeProbe(raw, file = '(unknown)') {
       displayWidth: video.width,
       displayHeight: video.height,
       pixFmt: video.pix_fmt,
+      /**
+       * 样本宽高比（SAR）。跨素材拼接必须对齐它：实测两段同为 320x180 时若 SAR 不同
+       * （1:1 vs 非方形像素），concat 会报 "parameters do not match"，或者产物按错误
+       * 比例显示。界面不会让用户选 SAR，所以必须探出来由系统统一。
+       */
+      sar: normalizeSar(video.sample_aspect_ratio),
       fps,
       nominalFps,
       vfr,
@@ -235,6 +241,11 @@ function normalizeProbe(raw, file = '(unknown)') {
       codec: a.codec_name,
       channels: a.channels,
       sampleRate: a.sample_rate,
+      /**
+       * 采样格式（s16/fltp…）。ffmpeg 的 concat 只认"完全一致的音频参数"，
+       * 采样格式不同也会导致拼接失败或被当错误参数播放；界面上不可选，必须探出来。
+       */
+      sampleFmt: a.sample_fmt ?? null,
       /** 短段 MP4 导出音频转 aac 时按源码率走（缺失则按声道数折算，见 buildArgs）。 */
       bitRate: Number(a.bit_rate) || 0,
       language: a.tags?.language ?? null,
@@ -252,6 +263,32 @@ function safeRatio(r) {
   const [a, b] = String(r).split('/').map(Number);
   if (!a || !b) return null;
   return Math.round((a / b) * 1000) / 1000;
+}
+
+/**
+ * SAR 归一成 "N:D" 字符串。
+ *
+ * ffprobe 常常给 "1:1"、也常给 "0:1"（未标注）或 "N/A"。未标注一律当 1:1 处理
+ * （播放器默认行为），否则"没写 SAR 的 mp4"会跟"明确写了 1:1 的 mp4"被判成不兼容，
+ * 白白触发整段重编码。
+ */
+function normalizeSar(sar) {
+  const s = String(sar ?? '').trim();
+  if (!s || s === 'N/A' || s === '0:1' || s === '0/1') return '1:1';
+  const m = /^(\d+)[:/](\d+)$/.exec(s);
+  if (!m) return '1:1';
+  const a = Number(m[1]);
+  const b = Number(m[2]);
+  if (!a || !b) return '1:1';
+  const g = gcd(a, b);
+  return `${a / g}:${b / g}`;
+}
+
+function gcd(a, b) {
+  let x = Math.abs(a);
+  let y = Math.abs(b);
+  while (y) { const t = y; y = x % y; x = t; }
+  return x || 1;
 }
 
 /**

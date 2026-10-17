@@ -15,6 +15,7 @@ const { app, dialog, ipcMain, shell } = require('electron');
 const {
   probeSource, scanKeyframes, exportSegments, createToken, planFor, numbered, groupByKeep,
 } = require('../../core/pipeline');
+const { analyzeSources, withTargetCodec, planPerSource } = require('../../core/compat');
 const { snap } = require('../../core/segments');
 const { resolveBin } = require('../../core/ffmpegPath');
 const { run: spawnRun } = require('../../core/probe');
@@ -363,21 +364,63 @@ function needLoaded(file) {
 }
 
 /**
+ * 把渲染层传来的 `files` 列表解析成"源数组"（2026-10-18 多素材）。
+ *
+ * 渲染层现在维护的是"一份或几份素材"，用 `files: [路径…]` 表达。
+ * 为了向后兼容，仍然接受老的单个 `file` 字段。
+ * 每份都必须已经导入过（`state.loaded` 里有），否则报错让用户重新导入——
+ * 绝不在这里偷偷重新探流：探流+扫关键帧是重活，静默做会让导出莫名卡几十秒。
+ */
+function resolveSources(payload) {
+  const list = Array.isArray(payload && payload.files) && payload.files.length
+    ? payload.files
+    : (payload && payload.file ? [payload.file] : []);
+  if (!list.length) throw new Error('没有可用的素材');
+  return list.map((f, i) => {
+    const abs = path.resolve(String(f));
+    const loaded = state.loaded.get(abs);
+    if (!loaded) throw new Error(`素材未导入，请重新导入：${path.basename(abs)}`);
+    return { id: String(i), file: abs, media: loaded.media, bins: loaded.bins, loaded };
+  });
+}
+
+/**
  * 用导出的同一套纯函数算出切割计划：每条保留区间实际从哪一秒起、导出多少帧、
  * 入点那一小段要不要重编码。界面显示的那些代价必须来自这里，不能另算一套。
  */
 function previewPlan(payload) {
-  const loaded = needLoaded(payload.file);
+  const sources = resolveSources(payload);
+  const loaded = sources[0];
   const segments = sanitizeSegments(payload.segments);
   // 先定目标封装：字幕装不装得下会影响自检的比对口径
-  const target = targetFor(payload.container, loaded, path.resolve(String(payload.file)));
+  const target = targetFor(payload.container, loaded, path.resolve(String(loaded.file)));
   const split = !!payload.split;
-  const { plan, warnings, keeps, keepSecs, clipToKeep } = planFor(loaded, segments, {
+
+  /**
+   * 多素材兼容性判定 + "基准参数"选择（2026-10-18）。
+   *
+   * 参数全部一致 → 可以"跟随源"纯流拷贝；不一致 → 界面必须要求选封装与编码，
+   * 并由系统把不一致的源整段重编码到基准参数（实测：只选编码不统一参数会静默丢帧）。
+   */
+  const compat = analyzeSources(sources);
+  const targetCodec = String(payload.codec || '').trim().toLowerCase() || null;
+  const baseline = compat ? withTargetCodec(compat.baseline, targetCodec) : null;
+  const perSource = compat && baseline ? planPerSource(sources, compat.baseline, targetCodec) : null;
+  const needsCodec = !!compat && !compat.uniform && payload.container === 'source' && !targetCodec;
+
+  const { plan, warnings, keeps, keepSecs, clipToKeep } = planFor(sources, segments, {
     ordered: isReordered(segments),
     dropSubtitles: target.dropSubtitles,
     precise: payload.precise === undefined ? true : !!payload.precise,
     // 「每段一个文件」会改变分组边界（相邻片段不得被并成一组），预览必须和导出一致
     split,
+    // 参数不一致的源：整段重编码（预览就要如实显示成"整段重编码"，不能等导出才发现）
+    forceReencodeFor: perSource
+      ? (si, src) => {
+        const one = perSource.find((p) => p.id === src.id) || perSource[si];
+        return !!(one && one.reencode);
+      }
+      : () => false,
   });
   const groups = groupByKeep(plan);
   /**
@@ -399,6 +442,22 @@ function previewPlan(payload) {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
     // 片段 → 保留区间：合并组把几段并成一条 keep 后，界面必须按它查代价与吸附差
     clipToKeep,
+    /**
+     * 多素材兼容性（单素材时是 null）：
+     *  - `uniform`：参数是否完全一致（true 才能选"跟随源"纯流拷贝）
+     *  - `diffs`：逐项差异，界面红字要逐条列出
+     *  - `baseline`：基准参数（最强的源），界面显示"统一到 WxH@fps"
+     *  - `perSource`：每个源要不要重编码及原因
+     *  - `needsCodec`：参数不一致却还选着"跟随源" → 界面必须拦下并高亮封装/编码两项
+     */
+    compat: compat ? {
+      uniform: compat.uniform,
+      summary: compat.summary,
+      diffs: compat.diffs,
+      baseline,
+      perSource,
+      needsCodec,
+    } : null,
     // 分组 id → 输出文件序号（1 起）。界面写"组N → 第 M 个文件"用这个
     fileNoOfGroup,
     // 分组（「每段一个文件」按它出文件）：界面显示"N 个文件"必须用这个数。
@@ -451,6 +510,14 @@ function sanitizeSegments(segments) {
     // 分组号必须是整数：它只用来判"哪几段进同一个文件"，非整数一律当没分组
     const g = Number(seg && seg.group);
     if (Number.isInteger(g) && g >= 0) one.group = g;
+    /**
+     * 来源序号（多素材，2026-10-18）：**必须原样带下去**。
+     * 丢了它，不同素材的区间会被当成同一份素材的两段——实测两份 10s 素材
+     * 追加后 keeps 只剩 1 条、计划总时长 10s（第二份凭空消失），
+     * 而自检照样"通过"（计划本身就只有一段，怎么算都对）。
+     */
+    const si = Number(seg && seg.srcIndex);
+    if (Number.isInteger(si) && si >= 0) one.srcIndex = si;
     out.push(one);
   }
   if (out.length === 0) throw new Error('没有有效的保留区间');
@@ -495,8 +562,9 @@ function targetFor(requested, loaded, abs) {
 async function startExport(win, payload) {
   if (state.job) throw new Error('已有导出任务在进行中');
 
-  const loaded = needLoaded(payload.file);
-  const abs = path.resolve(String(payload.file));
+  const sources = resolveSources(payload);
+  const loaded = sources[0];
+  const abs = path.resolve(String(loaded.file));
   const segments = sanitizeSegments(payload.segments);
   const outDir = path.resolve(String(payload.outDir || ''));
   if (!fs.existsSync(outDir)) throw new Error(`输出目录不存在：${outDir}`);
@@ -504,14 +572,45 @@ async function startExport(win, payload) {
   const ext = target.ext;
   const outPath = path.join(outDir, sanitizeBaseName(payload.baseName) + ext);
 
-  if (!loaded.media.keyframes || !loaded.media.keyframes.length) {
-    throw new Error('关键帧还没扫完，稍等一下再导出');
+  // 每份素材的关键帧都得扫完才能切（多素材时逐份检查，报错要指名是哪一份）
+  for (const s of sources) {
+    if (!s.media.keyframes || !s.media.keyframes.length) {
+      throw new Error(`「${path.basename(s.file)}」的关键帧还没扫完，稍等一下再导出`);
+    }
   }
   const split = !!payload.split;
   // 吸附（precise=false，应用层默认）与精确（precise=true，本层与 core 的缺省）两种切割模式；
   // 行数按同一套计划算。渲染层每次都显式发 precise，这里的缺省只服务脚本/无 UI 调用。
   const precise = payload.precise === undefined ? true : !!payload.precise;
-  const targets = targetsFor(loaded, segments, outPath, ext, split, target.dropSubtitles, precise);
+
+  /**
+   * 多素材的参数统一决策（2026-10-18）。
+   *
+   * 参数全一致 → 不传 normalizeTo，全程流拷贝（零损失）。
+   * 不一致 → 必须：
+   *   a) 有明确的封装与编码选择（不选就拒绝导出，界面已用红字拦过一次，这里是兜底）；
+   *   b) 把不一致的源整段重编码到"基准参数"（最强的源，见 compat.pickBaseline）。
+   * 这条兜底很重要：实测只换编码不统一参数，产物会静默丢帧（273/300 帧而解码不报错）。
+   */
+  const compat = analyzeSources(sources);
+  const targetCodec = String(payload.codec || '').trim().toLowerCase() || (compat ? compat.baseline.codec : null);
+  let normalizeTo = null;
+  let reencodeSources = [];
+  if (compat && !compat.uniform) {
+    if (!payload.codec) {
+      throw new Error('这些素材的参数不一致（分辨率/帧率/编码/音频），无法直接流拷贝拼接：'
+        + '请在导出面板里选择**封装**与**编码格式**后重试。');
+    }
+    const base = withTargetCodec(compat.baseline, targetCodec);
+    normalizeTo = {
+      width: base.width, height: base.height, fps: base.fps,
+      sar: base.sar, pixFmt: base.pixFmt, codec: targetCodec, audio: base.audio,
+    };
+    reencodeSources = planPerSource(sources, compat.baseline, targetCodec)
+      .filter((p) => p.reencode).map((p) => p.id);
+  }
+
+  const targets = targetsFor(sources, segments, outPath, ext, split, target.dropSubtitles, precise);
   assertNotOverwrite(abs, targets);
 
   const token = createToken();
@@ -521,7 +620,7 @@ async function startExport(win, payload) {
   };
 
   try {
-    const result = await exportSegments(loaded, segments, {
+    const result = await exportSegments(sources, segments, {
       outPath,
       split,
       crf: 18,
@@ -529,6 +628,8 @@ async function startExport(win, payload) {
       precise,
       container: target.container,
       dropSubtitles: target.dropSubtitles,
+      normalizeTo,
+      reencodeSources,
       token,
       onProgress: send,
     });
@@ -550,10 +651,13 @@ async function startExport(win, payload) {
   }
 }
 
-/** 本次导出会写哪些文件：拼接模式 1 个，「每段一个文件」按保留区间各 1 个。 */
-function targetsFor(loaded, segments, outPath, ext, split, dropSubtitles, precise = true) {
+/**
+ * 本次导出会写哪些文件：拼接模式 1 个，「每段一个文件」按保留区间各 1 个。
+ * 多素材时按源数组算同一套计划（分组边界与导出完全一致，否则会漏建/多建目标文件）。
+ */
+function targetsFor(sources, segments, outPath, ext, split, dropSubtitles, precise = true) {
   if (!split) return [outPath];
-  const { plan } = planFor(loaded, segments, {
+  const { plan } = planFor(sources, segments, {
     ordered: isReordered(segments), dropSubtitles, precise, split,
   });
   return groupByKeep(plan).map((_, i) => numbered(outPath, i, ext));
@@ -594,16 +698,40 @@ function registerIpc(getWindow) {
     };
   });
 
-  ipcMain.handle('fc:pickFile', async () => {
+  ipcMain.handle('fc:pickFile', async (_e, opts) => {
+    // 追加导入（2026-10-18）需要一次选多个：传 { multiple: true } 就放开多选
+    const multiple = !!(opts && opts.multiple);
     const r = await dialog.showOpenDialog(getWindow(), {
-      title: '选择视频文件',
-      properties: ['openFile'],
+      title: multiple ? '追加素材（可多选）' : '选择视频文件',
+      properties: multiple ? ['openFile', 'multiSelections'] : ['openFile'],
       filters: [
         { name: '视频文件', extensions: VIDEO_EXTENSIONS },
         { name: '所有文件', extensions: ['*'] },
       ],
     });
-    return r.canceled ? null : r.filePaths[0];
+    if (r.canceled) return multiple ? [] : null;
+    // 多选返回数组、单选返回单个路径——调用方按自己的模式取值
+    return multiple ? r.filePaths : r.filePaths[0];
+  });
+
+  /**
+   * 追加导入：把新素材并进当前素材列表（2026-10-18）。
+   *
+   * 只负责"导入并探流/扫关键帧"，**不碰时间轴**——怎么插入片段是渲染层的决定
+   * （接在末尾、每条素材一条片段）。这样主进程不需要知道剪辑状态，
+   * 与导入单份素材走完全同一套 `doLoad`（缓存、探针、缩略图都复用）。
+   */
+  ipcMain.handle('fc:append', async (_e, files) => {
+    const list = (Array.isArray(files) ? files : [files]).filter(Boolean).slice(0, 20);
+    const out = [];
+    for (const f of list) {
+      try {
+        out.push(await doLoad(f));
+      } catch (err) {
+        out.push({ file: path.resolve(String(f)), error: String(err.message || err).split('\n')[0] });
+      }
+    }
+    return out;
   });
 
   ipcMain.handle('fc:load', async (_e, file) => doLoad(file));

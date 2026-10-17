@@ -1153,6 +1153,53 @@ async function main() {
   res = await runExport(win);
   check('HEVC 精确模式（入点在 GOP 中间、拷到源尾）通过自检', res.ok, res.detail);
 
+  // 15-multi) 追加导入 + 跨素材拼接（2026-10-18）
+  // 这一步覆盖的是"两份参数不同的素材拼成一个文件"，以及"参数不一致时先拦、选了编码才放行"。
+  await js(win, `__smoke.importFile(${JSON.stringify(SRC)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(SRC)}`, win);
+  await waitFor('__smoke.state.scanning === false', win, 30000);
+  await wait(400);
+  // 做成 3s 一段、两段并起来（避免长素材让 smoke 变慢）
+  await js(win, `(() => {
+    __smoke.seekProgram(3); __smoke.splitAtPlayhead(); __smoke.seekProgram(0); __smoke.rippleDeleteAfter();
+    return 'ok';
+  })()`);
+  await wait(400);
+  // 追加一份参数不同的素材（HEVC），期望：保住已有片段、并在导出前要求选编码
+  await js(win, `__smoke.appendSources([${JSON.stringify(hevcSrc)}]); 'ok'`);
+  await wait(1800);
+  const multi = JSON.parse(await js(win, `JSON.stringify({
+    sources: __smoke.state.sources.length,
+    clips: __smoke.state.clips.length,
+    srcIdx: __smoke.state.clips.map((c) => c.srcIndex),
+    compat: __smoke.state.plan && __smoke.state.plan.compat,
+    planLen: (__smoke.state.plan.plan || []).length,
+    planSecs: (__smoke.state.plan.plan || []).reduce((a, p) => a + p.duration, 0),
+    need: document.getElementById('rowCodec').classList.contains('need'),
+  })`));
+  check('追加导入不覆盖已有片段（源与片段数都增长）',
+    multi.sources === 2 && multi.clips >= 2 && multi.srcIdx.includes(1),
+    `${multi.sources} 份素材 / ${multi.clips} 段 / srcIndex ${JSON.stringify(multi.srcIdx)}`);
+  check('参数不一致时计划包含两个源，且要求选编码',
+    multi.compat && multi.compat.uniform === false && multi.need === true && multi.planLen >= 2,
+    `uniform=${multi.compat && multi.compat.uniform} · 计划 ${multi.planLen} 段/${multi.planSecs.toFixed(2)}s · 编码行标红=${multi.need}`);
+  // 选 h264 后导出：应当通过（参数被统一）
+  await js(win, `(() => {
+    const s = document.getElementById('outCodec'); s.value = 'h264';
+    s.dispatchEvent(new Event('change'));
+    __smoke.setOption('optPrecise', true);
+    __smoke.setContainer('mp4');
+    __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'multi-src');
+    return 'ok';
+  })()`);
+  await wait(1200);
+  res = await runExport(win);
+  check('跨素材拼接（编码不同、参数统一后）通过自检', res.ok && res.outputs.length === 1, res.detail);
+  // 收尾：把源恢复成单素材，免得影响后面的检查
+  await js(win, `__smoke.importFile(${JSON.stringify(SRC)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(SRC)}`, win);
+  await wait(600);
+
   await longFileCheck(win);
   finish(win);
 }
