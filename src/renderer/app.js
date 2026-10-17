@@ -1086,6 +1086,8 @@ async function runPlan() {
   // HUD 语义是"最近一次拖放的磁吸结果"，与切割计划刷新无关，保住它。
   tl.setClips(state.clips, state.sel, snapMap());
   tl.setSelection(selectedIndices(), state.sel);
+  // 输出的"第几个文件"必须来自真实计划（组号 ≠ 文件号，见 fileNoOfGroup）
+  tl.setGroupFileNos(state.plan && state.plan.fileNoOfGroup);
   renderClips();
   updateEstimate();
   updateExportEnabled();
@@ -1103,9 +1105,22 @@ function renderClips() {
   const ul = $('keepList');
   ul.innerHTML = '';
   const groupNo = groupNumbers();
+  const selNow = selectedIndices();
+  const multi = selNow.length > 1;
   state.clips.forEach((c, i) => {
     const li = document.createElement('li');
-    li.className = (i === state.sel ? 'sel' : '') + (selectedIndices().length > 1 && selectedIndices().includes(i) ? ' multi' : '');
+    li.className = (i === state.sel ? 'sel' : '') + (multi && selNow.includes(i) ? ' multi' : '');
+    // 组别：用颜色 + 徽章两套编码（只靠文字在长列表里要一行行读，太慢）
+    const gno = c.group == null ? null : groupNo.get(c.group);
+    if (gno != null) {
+      li.classList.add('grp');
+      li.style.setProperty('--grp', window.groupColorOf(gno));
+      li.style.setProperty('--grp-tint', window.groupTintOf(gno, 0.1));
+      li.dataset.group = String(c.group);
+    }
+    // 组内第一行加个"顶部分隔"：两组相邻时，光看颜色若刚好相近就不够，再来一道结构分隔
+    const prev = state.clips[i - 1];
+    if (gno != null && (!prev || prev.group !== c.group)) li.classList.add('grp-start');
     const idx = document.createElement('span');
     idx.className = 'idx';
     idx.textContent = String(i + 1);
@@ -1115,14 +1130,26 @@ function renderClips() {
     const len = document.createElement('span');
     len.className = 'len tc';
     len.textContent = `${(c.end - c.start).toFixed(3)}s`;
-    li.append(idx, time, len);
+    // 组徽章单独一列（不是塞进说明文字里）：扫一眼就能数清"这组几段、是第几个文件"
+    const badge = document.createElement('span');
+    badge.className = 'gchip';
+    if (gno != null) {
+      badge.textContent = `组${gno}`;
+      badge.style.color = window.groupColorOf(gno);
+      badge.style.borderColor = window.groupTintOf(gno, 0.55);
+      const fn = fileNoOfGroup(c.group);
+      badge.title = `这 ${groupSizes().get(c.group) || 1} 段会拼进第 ${fn} 个文件`;
+    } else {
+      badge.textContent = '';
+      badge.classList.add('none');
+    }
+    li.append(idx, time, len, badge);
 
     const cost = costMap()[i];
     const src = document.createElement('span');
     src.className = 'snap' + (cost && cost !== 'copy' ? ' lossy' : '');
     const label = { copy: '纯拷贝', head: '入点小段重编码', whole: '整段重编码', codec: '整段换编码' }[cost] || '待计划';
-    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`
-      + (c.group != null ? ` · 并入第 ${groupNo.get(c.group) || '?'} 个文件` : '');
+    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`;
     src.title = {
       copy: '整段流拷贝（不转码）',
       head: '入点那一小段有损重编码，其余仍流拷贝',
@@ -1145,7 +1172,7 @@ function renderClips() {
   $('keepCount').textContent = String(state.clips.length);
   $('keepTotal').textContent = `合计 ${keptSeconds().toFixed(3)} s`;
   // 分组工具条：多选时才能合并；有分组时才能拆开
-  const nSel = selectedIndices().length;
+  const nSel = selNow.length;
   const anyGroup = state.clips.some((c) => c.group != null);
   const btnMerge = $('btnMergeGroup');
   const btnUnmerge = $('btnUnmergeGroup');
@@ -1167,18 +1194,25 @@ function renderClips() {
     hints.appendChild(div);
   }
   // 有分组时把"哪几段拼进同一个文件"直接写出来：分组是用户自己做的编辑，
-  // 但导出前必须能一眼核对（分组跨了很远的两段时尤其容易记错）
-  const gmap = groupNumbers();
-  if (gmap.size) {
-    const parts = [];
-    for (const [gid, no] of gmap) {
+  // 但导出前必须能一眼核对（分组跨了很远的两段时尤其容易记错）。
+  // 每一组带自己的颜色小方块，和上面的徽章、时间轴的描边对得上。
+  if (groupNo.size) {
+    const wrap = document.createElement('div');
+    wrap.className = 'hint-group';
+    const sizes = groupSizes();
+    for (const [gid, no] of groupNo) {
       const idx = state.clips.map((c, i) => (c.group === gid ? i + 1 : 0)).filter(Boolean);
-      parts.push(`第 ${no} 个文件 ← 第 ${idx.join('、')} 段`);
+      const row = document.createElement('div');
+      row.className = 'hint-grow';
+      const dot = document.createElement('i');
+      dot.className = 'gdot';
+      dot.style.background = window.groupColorOf(no);
+      const txt = document.createElement('span');
+      txt.textContent = `组${no} · 第 ${fileNoOfGroup(gid)} 个文件 ← 第 ${idx.join('、')} 段（${sizes.get(gid) || 1} 段）`;
+      row.append(dot, txt);
+      wrap.appendChild(row);
     }
-    const div = document.createElement('div');
-    div.className = 'hint-group';
-    div.textContent = `· 合并导出：${parts.join('；')}`;
-    hints.appendChild(div);
+    hints.appendChild(wrap);
   }
 }
 
@@ -1193,6 +1227,32 @@ function groupNumbers() {
   return map;
 }
 
+/** 分组 id → 段数（右侧徽章与提示里要写"这组几段"）。 */
+function groupSizes() {
+  const map = new Map();
+  for (const c of state.clips) {
+    if (c.group == null) continue;
+    map.set(c.group, (map.get(c.group) || 0) + 1);
+  }
+  return map;
+}
+
+/**
+ * 分组 id → 它落在**第几个输出文件**。
+ *
+ * 必须用计划里算出来的真实序号，不能用组号：组号只是"第几次合并"，
+ * 实测 6 段、1+2 一组、4+5 一组时，实际文件是
+ * `文件1←组1 / 文件2←第3段 / 文件3←组2 / 文件4←第6段`——组2 是第 **3** 个文件。
+ * 写"组2 · 第 2 个文件"会让用户按提示去找一个不存在的文件。
+ * 计划还没回来时（无映射）退回组号，至少不会显示成空。
+ */
+function fileNoOfGroup(gid) {
+  const map = state.plan && state.plan.fileNoOfGroup;
+  if (map && map[gid] != null) return map[gid];
+  const own = groupNumbers().get(gid);
+  return own == null ? '?' : own;
+}
+
 /** 预估行是 innerHTML 拼的，凡是来自文件元数据/主进程的字样都先过这一道。 */
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
@@ -1203,12 +1263,13 @@ function outputFileCount() {
   if (state.plan && Number.isInteger(state.plan.groups)) return state.plan.groups;
   const seen = new Set();
   let n = 0;
-  for (const c of state.clips) {
-    const key = c.group == null ? `c${n}` : `g${c.group}`;
-    if (seen.has(key)) continue;
+  state.clips.forEach((c, i) => {
+    // 未分组的段各占一个文件，键必须带序号，否则两段会被当成同一个
+    const key = c.group == null ? `k${i}` : `g${c.group}`;
+    if (seen.has(key)) return;
     seen.add(key);
     n++;
-  }
+  });
   return n;
 }
 

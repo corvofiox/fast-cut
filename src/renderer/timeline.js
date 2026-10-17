@@ -63,6 +63,7 @@ function createTimeline(options) {
   let rulerInfo = { step: 0, labels: [] };   // 最近一次刻度尺画了什么，给自检用
   let reorder = null;              // { from, to } 正在拖哪一段、要插到哪
   let groupOrder = new Map();      // 分组 id → 显示序号（1 起，按首次出现编）
+  let fileNoMap = null;            // 分组 id → 第几个输出文件（主进程按真实分组顺序算）
 
   // ---------- 时间换算 ----------
   const width = () => root.clientWidth || 1;
@@ -345,37 +346,69 @@ function createTimeline(options) {
       el.classList.toggle('sel', i === selected);
       el.classList.toggle('multi', selSet.length > 1 && selSet.includes(i));
       el.classList.toggle('last', i === clips.length - 1);
-      // 分组（「并成一次导出」）：块上带个角标，同一组的块由下方括号连起来
+      // 分组（「并成一次导出」）：块上带个角标，同一组的块由下方括号连起来。
+      // 组号与颜色都必须来自**同一张表**（rebuildGroupOrder），否则两个组会拿到同一个号。
       const g = c.group == null ? null : groupNo(c.group);
       el.classList.toggle('grp', g != null);
+      if (g != null) {
+        // 每组一个颜色：描边 + 极淡底纹。底纹很浅，不压住胶片画面
+        el.style.setProperty('--grp', window.groupColorOf(g));
+        el.style.setProperty('--grp-tint', window.groupTintOf(g, 0.13));
+      } else {
+        el.style.removeProperty('--grp');
+        el.style.removeProperty('--grp-tint');
+      }
       el.querySelector('.idx').textContent = String(i + 1);
       const badge = el.querySelector('.grp-badge');
       badge.textContent = g == null ? '' : `组${g}`;
       el.querySelector('.drop').textContent = snapDelta(i) > 0.001 ? `+${snapDelta(i).toFixed(3)}s` : '';
       el.classList.toggle('moving', !!(reorder && reorder.from === i));
       el.title = `成片 ${fmtClock(c.ps)} → ${fmtClock(c.pe)}\n源 ${fmtClock(c.start)} → ${fmtClock(c.end)}`
-        + (g != null ? `\n并入导出第 ${g} 个文件` : '');
+        + (g != null ? `\n并入导出第 ${fileNoOf(c.group)} 个文件（同组 ${groupSize(c.group)} 段）` : '');
     }
+  }
+
+  /** 某个分组里有几段（悬停提示用：让用户确认"这一组是不是我要的那几段"）。 */
+  function groupSize(gid) {
+    return clips.filter((c) => c.group === gid).length;
+  }
+
+  /**
+   * 分组 id → 第几个输出文件。同样不能用组号：组号只是"第几次合并"，
+   * 中间夹着未分组的段时，组2 完全可能是第 3 个文件（实测 6 段、1+2 一组、4+5 一组）。
+   * 映射由主进程按真实分组顺序算好（previewPlan 的 fileNoOfGroup），时间轴只负责用。
+   */
+  function fileNoOf(gid) {
+    const mapped = fileNoMap ? fileNoMap[gid] : null;
+    if (mapped != null) return mapped;
+    const own = groupNo(gid);
+    return own == null ? '?' : own;
   }
 
   /**
    * 分组号 → 显示序号（1 起，按首次出现的顺序编）。
-   * 分组号本身是内部 id（用户撤销/拆分后可能不连续），显示要连续，否则会出现"组3、组7"。
+   *
+   * **必须一次性建表**（2026-10-18 修）：旧实现每次调用都 `let n = 0` 从头数，
+   * 已经登记过的组不占号，于是"第 4、5 段并成的第二组"也拿到 1 ——
+   * 两组都显示"组1"，用户根本分不出哪几段是一伙的。
    */
-  function groupNo(id) {
+  function rebuildGroupOrder() {
+    groupOrder = new Map();
     let n = 0;
     for (const c of clips) {
-      if (c.group == null) continue;
-      if (!groupOrder.has(c.group)) groupOrder.set(c.group, ++n);
-      if (c.group === id) return groupOrder.get(id);
+      if (c.group == null || groupOrder.has(c.group)) continue;
+      groupOrder.set(c.group, ++n);
     }
+  }
+  function groupNo(id) {
     return groupOrder.get(id) || null;
   }
 
   /**
-   * 分组括号：同一组连续的几块下面画一条连线 + 一个"组N"，直观表达
-   * "这几段会拼进同一个文件"。组的成员被拖散成两截时，两截各画一次、标同一个号
-   * ——那正好说明它们仍然进同一个文件。
+   * 分组括号：同一组连续的几块下面画一条连线 + 一个"组N"。
+   * 连线用**该组自己的颜色**（与块描边、右侧片段栏同一套），
+   * 这样"哪几段是一伙的"在缩得很小时也靠颜色分得开，不必去读字。
+   * 组的成员被拖散成两截时，两截各画一次、标同一个号——那正好说明它们仍进同一个文件。
    */
   function drawGroupBrackets() {
     const y = LANE_TOP + LANE_H - 2;
@@ -387,7 +420,8 @@ function createTimeline(options) {
       while (j + 1 < clips.length && clips[j + 1].group === gid) j++;
       const x0 = tToX(clips[i].ps);
       const x1 = tToX(clips[j].pe);
-      ctx.fillStyle = 'rgba(127, 211, 163, 0.9)';
+      const no = groupNo(gid);
+      ctx.fillStyle = window.groupColorOf(no);
       ctx.fillRect(Math.round(x0), y, Math.max(2, Math.round(x1 - x0)), 2);
       i = j + 1;
     }
@@ -846,14 +880,20 @@ function createTimeline(options) {
       total = Math.max(0.001, clips.length ? clips[clips.length - 1].pe : 0.001);
       selected = sel == null ? selected : sel;
       snapInfo = snapMap || null;
-      // 分组显示序号按"当前出现顺序"重排：删掉一段后组号不该留空洞
-      groupOrder = new Map();
+      // 分组显示序号按"当前出现顺序"重排：删掉一段后组号不该留空洞。
+      // 必须一次性建完表（见 rebuildGroupOrder 的注释），不能边画边补。
+      rebuildGroupOrder();
       // 内容变了就把视口收进 [0, total]；用户自己放大过（span < total）则保留缩放
       if (!fitted || view.t1 > total || view.t1 - view.t0 >= total) { view.t0 = 0; view.t1 = total; }
       fitted = true;
       render();
     },
     setSelected(i) { selected = i; render(); },
+    /** 分组 id → 输出文件序号（1 起）。计划刷新时由上层推进来，悬停提示要用它。 */
+    setGroupFileNos(map) {
+      fileNoMap = map && typeof map === 'object' ? { ...map } : null;
+      render();
+    },
     /** 多选集合：`[2,3,4]`。传空数组或省略 = 单选（只有 selected 高亮）。 */
     setSelection(list, primary) {
       selSet = Array.isArray(list) ? list.slice() : [];

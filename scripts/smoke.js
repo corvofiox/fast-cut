@@ -894,6 +894,48 @@ async function main() {
     merged.groups === 2 && res.ok && res.outputs.length === 2,
     `计划 ${merged.groups} 组 · 导出 ${res.outputs.length} 个（期望 2）· ${res.detail}`);
 
+  // 9-gnum) 两组并存时组号必须唯一、且界面显示的是**真实文件序号**。
+  // 用户实测的坑：两个都显示"组1"（编号表每次从头重数）；以及组号被当成文件号写，
+  // 组2 实际是第 3 个文件却提示"第 2 个"。
+  // 用 6 段来造：1+2 一组、4+5 一组，中间各夹一段未分组的——
+  // 这样"组2 → 第 3 个文件"才是真的（组号恰好等于文件号的形状验不出这个 bug）。
+  await js(win, `(() => {
+    const d = __smoke.state.src.media.duration;
+    const w = d / 6;
+    __smoke.state.clips = Array.from({ length: 6 }, (_, i) => ({ start: i * w, end: (i + 1) * w }));
+    __smoke.state.clips[0].group = 1;
+    __smoke.state.clips[1].group = 1;
+    __smoke.state.clips[3].group = 2;
+    __smoke.state.clips[4].group = 2;
+    __smoke.relayout(); __smoke.syncTimeline();
+    return 'ok';
+  })()`);
+  await wait(500);
+  const gnum = JSON.parse(await js(win, `JSON.stringify({
+    badges: [...document.querySelectorAll('.seg .grp-badge')].map((e) => e.textContent),
+    segColors: [...document.querySelectorAll('.seg')].map((e) => e.style.getPropertyValue('--grp')),
+    listChips: [...document.querySelectorAll('#keepList li .gchip')].map((e) => e.textContent),
+    listColors: [...document.querySelectorAll('#keepList li')].map((e) => e.style.getPropertyValue('--grp')),
+    listStarts: [...document.querySelectorAll('#keepList li')].map((e) => e.classList.contains('grp-start')),
+    hint: [...document.querySelectorAll('#planHints .hint-grow')].map((e) => e.textContent),
+    map: __smoke.state.plan.fileNoOfGroup,
+  })`));
+  const shownNos = [...new Set(gnum.badges.filter(Boolean))];
+  check('两组并存时组号唯一（不许都叫"组1"）',
+    shownNos.length === 2 && shownNos.includes('组1') && shownNos.includes('组2'),
+    `时间轴角标 ${JSON.stringify(gnum.badges)} · 片段栏徽章 ${JSON.stringify(gnum.listChips)}`);
+  check('时间轴与片段栏共用同一套组颜色',
+    gnum.segColors[0] && gnum.segColors[0] === gnum.listColors[0]
+    && gnum.segColors[3] && gnum.segColors[3] === gnum.listColors[3]
+    && gnum.segColors[0] !== gnum.segColors[3],
+    `时间轴 ${JSON.stringify(gnum.segColors)} · 片段栏 ${JSON.stringify(gnum.listColors)}`);
+  check('提示里的文件序号是真的（组2 夹在中间时段应是第 3 个文件）',
+    gnum.map && gnum.map['2'] === 3 && gnum.hint.some((t) => /组2 · 第 3 个文件/.test(t)),
+    `映射 ${JSON.stringify(gnum.map)} · 提示 ${JSON.stringify(gnum.hint)}`);
+  check('两组相邻时片段栏有组间分隔（不只靠颜色）',
+    gnum.listStarts[0] === true && gnum.listStarts[3] === true,
+    JSON.stringify(gnum.listStarts));
+
   // 还原：clips 回到本段检查开始时的状态（去掉 group），后面的检查都依赖它
   await js(win, `(() => {
     __smoke.state.clips = ${JSON.stringify(savedClips)};

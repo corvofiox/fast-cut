@@ -380,10 +380,27 @@ function previewPlan(payload) {
     split,
   });
   const groups = groupByKeep(plan);
+  /**
+   * 分组 id → 它落在**第几个输出文件**（1 起）。
+   *
+   * 界面以前拿"组号"当文件号写（"组2 · 第 2 个文件"），但那只是分组出现顺序：
+   * 实测 6 段、1+2 并一组、4+5 并一组时，实际文件是
+   * `文件1←组1 / 文件2←第3段 / 文件3←组2 / 文件4←第6段`——组2 是第 **3** 个文件。
+   * 组号只用来认"哪几段一伙"，文件号必须来自真实分组顺序，否则用户按提示找文件会找错。
+   */
+  const fileNoOfGroup = {};
+  for (let i = 0; i < groups.length; i++) {
+    const key = plan[groups[i][0]] && plan[groups[i][0]].outGroup;
+    if (key == null) continue;
+    const gid = groupIdOfOutGroup(key);
+    if (gid != null && fileNoOfGroup[gid] === undefined) fileNoOfGroup[gid] = i + 1;
+  }
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
     // 片段 → 保留区间：合并组把几段并成一条 keep 后，界面必须按它查代价与吸附差
     clipToKeep,
+    // 分组 id → 输出文件序号（1 起）。界面写"组N → 第 M 个文件"用这个
+    fileNoOfGroup,
     // 分组（「每段一个文件」按它出文件）：界面显示"N 个文件"必须用这个数。
     // 拼接模式下产物恒为一个文件，所以这里回 1 —— 分组只在 split 时才有意义，
     // 别让界面在拼接模式显示"2 个文件"却只写出一个。
@@ -411,6 +428,15 @@ function isReordered(segments) {
     if (segments[i].start < segments[i - 1].start - 1e-6) return true;
   }
   return false;
+}
+
+/**
+ * `outGroup` 键（`g<id>` / `k<keepIndex>`）→ 用户分组 id。
+ * 没分组的 `k…` 返回 null：它们各成一个文件，界面不需要"组号"。
+ */
+function groupIdOfOutGroup(key) {
+  const m = /^g(\d+)$/.exec(String(key || ''));
+  return m ? Number(m[1]) : null;
 }
 
 /** 区间清洗：只接受有限非负数字，最多 200 段。`group` 是「并成一次导出」的分组号（可选）。 */

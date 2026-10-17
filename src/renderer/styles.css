@@ -205,19 +205,32 @@ html, body {
 }
 #tlPlayhead.dragging .ph-bubble, #tlPlayhead .knob:hover + .ph-bubble { opacity: 1; }
 
-/* 整块胶片都是拖拽改顺序的把手，所以光标直接给"可抓"的指示 */
+/* 整块胶片都是拖拽改顺序的把手，所以光标直接给"可抓"的指示。
+   **默认必须安静**（2026-10-18 改）：以前未选中也挂一圈绿色描边 + 内高光，
+   一条时间轴上每块都在喊，选中态只多一圈更浅的绿，等于没有对比。
+   现在未选中只有极淡的暗边 + 轻微压暗（聚光灯），选中态才用白描边 + 顶部亮条 + 提亮。 */
 .seg {
   position: absolute; top: 0; height: 100%;
-  background: linear-gradient(180deg, rgba(20, 24, 28, .08), rgba(20, 24, 28, .55));
-  border: 1px solid rgba(87, 185, 129, .75); border-radius: 5px; cursor: grab; overflow: hidden;
-  box-shadow: inset 0 1px 0 rgba(255, 255, 255, .18), 0 1px 3px rgba(0, 0, 0, .45);
+  background: linear-gradient(180deg, rgba(20, 24, 28, .10), rgba(20, 24, 28, .62));
+  border: 1px solid rgba(255, 255, 255, .07); border-radius: 5px; cursor: grab; overflow: hidden;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
+  filter: brightness(.92);
   transition: border-color .1s, box-shadow .1s, filter .1s;
 }
 .seg:active { cursor: grabbing; }
-.seg:hover { border-color: #7fd3a3; filter: brightness(1.1); }
+.seg:hover { border-color: rgba(255, 255, 255, .3); filter: brightness(1.04); }
+
+/* 选中：唯一"亮起来"的块。白描边 + 顶部亮条 + 双层外发光 + 恢复亮度。
+   三处同时变（边框/顶部条/亮度），任何底色、任何缩放下都跳得出来。 */
 .seg.sel {
-  border-color: #eaf7ef;
-  box-shadow: inset 0 0 0 1px #8ee0af, 0 0 0 1px rgba(142, 224, 175, .4), 0 2px 10px rgba(0, 0, 0, .5);
+  border-color: #ffffff;
+  box-shadow: 0 0 0 1px #ffffff, 0 0 12px 2px rgba(255, 255, 255, .38), 0 2px 10px rgba(0, 0, 0, .6);
+  filter: brightness(1.16) saturate(1.08);
+  z-index: 3;
+}
+.seg.sel::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px;
+  background: #ffffff; box-shadow: 0 0 8px rgba(255, 255, 255, .85); pointer-events: none;
 }
 .seg.moving { opacity: .35; border-style: dashed; }
 .seg .label {
@@ -225,24 +238,38 @@ html, body {
   white-space: nowrap; overflow: hidden; pointer-events: none; text-shadow: 0 1px 2px #000;
   display: flex; justify-content: space-between; gap: 6px;
 }
-/* 并入同一组的块：描边换成青色，一眼看出"这几段进同一个文件" */
-.seg.grp { border-color: rgba(103, 199, 214, .85); }
-.seg.grp.sel {
-  border-color: #d8f5fb;
-  box-shadow: inset 0 0 0 1px #67c7d6, 0 0 0 1px rgba(103, 199, 214, .4), 0 2px 10px rgba(0, 0, 0, .5);
+/* 并入同一组的块：用**该组自己的颜色**描边 + 极淡底纹（--grp / --grp-tint 由 JS 按组号给）。
+   底纹很浅，不压住胶片画面；组与组的颜色不同，缩小时也能靠颜色分组。 */
+.seg.grp {
+  border-color: var(--grp, #4fc3d9);
+  background-image: linear-gradient(var(--grp-tint, rgba(79, 195, 217, .13)), var(--grp-tint, rgba(79, 195, 217, .13)));
 }
-/* 多选：Ctrl/Shift 点出来的那几段。要能一眼数清"这次要并几段" */
+.seg.grp.sel {
+  border-color: #ffffff;
+  box-shadow: 0 0 0 1px #ffffff, 0 0 12px 2px rgba(255, 255, 255, .38), 0 2px 10px rgba(0, 0, 0, .6);
+}
+/* 多选：Ctrl/Shift 点出来的那几段。要能一眼数清"这次要并几段"——
+   用虚线白框 + 顶部虚线条，与"单选实心白框"区分开，两者同时出现也不混淆 */
 .seg.multi {
-  border-color: #eaf7ef;
-  box-shadow: inset 0 0 0 1px #8ee0af, 0 0 0 1px rgba(142, 224, 175, .35);
-  filter: brightness(1.06);
+  border-color: rgba(255, 255, 255, .85);
+  border-style: dashed;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .28), 0 0 8px 1px rgba(255, 255, 255, .2);
+  filter: brightness(1.12);
+}
+.seg.multi::before {
+  content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px;
+  background: repeating-linear-gradient(90deg, #fff 0 5px, transparent 5px 10px);
+  pointer-events: none;
 }
 .seg .grp-badge {
-  position: absolute; right: 5px; top: 2px; font-size: 10px; color: #9fe6f2;
-  pointer-events: none; text-shadow: 0 1px 2px #000; opacity: 0;
+  position: absolute; right: 5px; top: 2px; font-size: 10px; font-weight: 700;
+  color: var(--grp, #9fe6f2);
+  pointer-events: none; text-shadow: 0 1px 3px #000, 0 0 6px rgba(0, 0, 0, .9); opacity: 0;
 }
 .seg.grp .grp-badge { opacity: 1; }
+.seg.sel .grp-badge, .seg.multi .grp-badge { top: 5px; }
 .seg.grp .label { right: 36px; }
+.seg.sel .label, .seg.multi .label { top: 5px; }
 
 .seg .drop { position: absolute; bottom: 3px; left: 5px; font-size: 10px; color: var(--accent-2); pointer-events: none; }
 .seg .handle { position: absolute; top: 0; bottom: 0; width: 11px; cursor: col-resize; z-index: 2; }
@@ -316,24 +343,56 @@ html, body {
   display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 6px;
   align-items: center; padding: 5px 6px; border-radius: 5px;
   border: 1px solid transparent; cursor: pointer; font-size: 12px;
+  position: relative;
 }
 .keeps li:hover { background: var(--bg-2); }
-.keeps li.sel { background: #23301f; border-color: #3d7a58; }
+/* 选中：白描边 + 提亮，与时间轴同一套语言（未选中要安静，选中才跳出来） */
+.keeps li.sel {
+  background: #26332c; border-color: #ffffff;
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, .5), 0 0 10px rgba(255, 255, 255, .12);
+}
+/* 多选：虚线白框，与"单选实心白框"区分 */
+.keeps li.multi { border-color: rgba(255, 255, 255, .7); border-style: dashed; background: #232c27; }
+
+/* 分组行：左侧一条该组颜色的竖条 + 极淡底纹，扫一眼就能分出"这几行是一伙的"。
+   竖条用 ::before 画在行的左缘，不占布局宽度，也不和网格列打架。 */
+.keeps li.grp { background: linear-gradient(90deg, var(--grp-tint, rgba(79, 195, 217, .1)), transparent 60%); }
+.keeps li.grp::before {
+  content: ""; position: absolute; left: 0; top: 3px; bottom: 3px; width: 3px;
+  border-radius: 2px; background: var(--grp, #4fc3d9);
+}
+/* 组的第一行：上面来一道分隔，两组挨着时结构上就断开（不只靠颜色） */
+.keeps li.grp-start { margin-top: 5px; }
+.keeps li.grp-start::after {
+  content: ""; position: absolute; left: 3px; right: 3px; top: -4px; height: 1px;
+  background: var(--line);
+}
 
 .keeps li .idx { color: var(--fg-dim); }
 .keeps li .tc { white-space: nowrap; }
 .keeps li .len { color: var(--fg-dim); }
+/* 组徽章：小药丸，颜色 = 该组颜色。没分组的行留空（不画"无"这种噪音） */
+.keeps li .gchip {
+  font-size: 10px; font-weight: 700; line-height: 1.5; padding: 0 6px;
+  border: 1px solid var(--line); border-radius: 9px; white-space: nowrap;
+}
+.keeps li .gchip.none { border: 0; padding: 0; width: 0; }
 .keeps li .snap { grid-column: 1 / -1; color: var(--fg-dim); font-size: 11px; }
 /* 入点不在关键帧上就要重编码一小段：这是有损的，得跟"纯拷贝"区分开 */
 .keeps li .snap.lossy { color: var(--warn); }
 .keeps li .x { color: var(--fg-dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
 .keeps li .x:hover { color: var(--err); border-color: #6b3330; }
-.keeps li.multi { background: #22302b; border-color: #3d7a58; }
 .keeps .empty-row { display: block; color: var(--fg-dim); padding: 8px 6px; font-size: 12px; }
 
 .hints { font-size: 11px; color: var(--warn); margin-top: 6px; }
-/* 合并导出的说明不是警告，用中性色，别和上面的 ⚠ 混成一片 */
-.hints .hint-group { color: var(--accent-2); margin-top: 3px; }
+/* 合并导出的说明不是警告，用中性色，别和上面的 ⚠ 混成一片。
+   每行前面一个小色块 = 该组的颜色，和徽章/时间轴描边对得上 */
+.hints .hint-group { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
+.hints .hint-grow { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); }
+.hints .gdot {
+  flex: 0 0 auto; width: 8px; height: 8px; border-radius: 2px;
+  box-shadow: 0 0 0 1px rgba(0, 0, 0, .4);
+}
 .keep-tools { display: flex; align-items: center; gap: 8px; }
 
 .progress { margin: 8px 10px; }
