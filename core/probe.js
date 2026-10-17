@@ -22,6 +22,7 @@ function includesOffset(formatName) {
 
 /** 构造 ffmpeg 参数：把 run({args, ...}) 展开成数组，便于测试注入假执行器。 */
 function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000, binary = false } = {}) {
+  if (process.env.FASTCUT_TRACE) console.log(`[trace] ${bin} ${args.join(' ')}`);
   return new Promise((resolve, reject) => {
     const child = spawn(bin, args, { windowsHide: true });
     let stderr = '';

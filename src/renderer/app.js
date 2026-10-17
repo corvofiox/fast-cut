@@ -974,10 +974,17 @@ async function runPlan() {
     return;
   }
   // 新计划必须推进时间轴：snapMap 变了（吸附差/自动降级角标都随模式变），
-  // 只刷列表 DOM 的话 tl 的 snapInfo 还是旧计划的——多带可视化与角标全踩旧数据
-  syncTimeline(false);
+  // 只刷列表 DOM 的话 tl 的 snapInfo 还是旧计划的——多带可视化与角标全踩旧数据。
+  // **不清 lastSnap**（2026-10-17 修）：计划刷新是异步的（previewPlan IPC + 120ms
+  // 防抖），它完成的时机可能落在用户拖放**之后**——把刚显示的"磁吸·分割点"抹掉，
+  // HUD 凭空变空（smoke"磁吸关掉后片段边界仍然吸附"正是这么被打赢竞态的）。
+  // HUD 语义是"最近一次拖放的磁吸结果"，与切割计划刷新无关，保住它。
+  tl.setClips(state.clips, state.sel, snapMap());
+  renderClips();
   updateEstimate();
   updateExportEnabled();
+  updateToolButtons();
+  updateHud();
 }
 
 /** 导出模态的「精确模式」勾选：默认不勾 = 吸附关键帧整段流拷贝。 */

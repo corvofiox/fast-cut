@@ -26,15 +26,30 @@ test('拷贝段命令：有 fps 时用 -frames:v 控制长度（避免帧数与�
   assert.ok(args.includes('-dn'));
 });
 
-test('HEVC 流拷贝段剔掉 RASL 前导帧：开放 GOP 多段拼接报 "Could not find ref with POC n" 的根因', () => {
+/**
+ * 回归（2026-10-17 定案，四轮实验）：HEVC 流拷贝段**不得**再下发剔 RASL 过滤器。
+ *
+ * 旧做法 `filter_units=remove_types=8|9` 全局剥除段内每个关键帧后的 RASL，依据是
+ * "前导帧在接入点本来就该被丢"。实测推翻：
+ *  · 段起点那簇 RASL 的显示时刻在入点之前（选区外），解封装 -ss、make_zero 后的
+ *    负 PTS 丢弃、解码器 NoRaslOutputFlag 三层天然去处消化，无需剥；
+ *  · 段内中间关键帧的 RASL 是**真画面**（PTS 在窗内、参考帧在同段内），全局剥
+ *    白丢内容（用户实测 287 帧 ≈ 4.8s）；
+ *  · 剥离从未修好接缝（「剥+无缓解」照样 Duplicate POC），接缝由 seamNeedsIdr 负责。
+ * 详见 buildArgs 顶部定案注释与 docs/exploration-as-rasl-fix.md。
+ */
+test('HEVC 流拷贝段不再下发剔 RASL 过滤器（全局剥除丢真画面，且修不了接缝）', () => {
   const hevc = { ...MEDIA, video: { codec: 'hevc', profile: 'Main', pixFmt: 'yuv420p', fps: 30 } };
-  const args = argsForSegment({ kind: 'copy', start: 0, duration: 2 }, hevc, 'out.mp4', { fps: 30 });
-  const i = args.indexOf('-bsf:v');
-  assert.ok(i >= 0);
-  assert.strictEqual(args[i + 1], 'filter_units=remove_types=8|9');
+  for (const hasRasl of [undefined, true, false]) {
+    const args = argsForSegment({ kind: 'copy', start: 0, duration: 2 }, { ...hevc, hasRasl }, 'out.mp4', { fps: 30 });
+    assert.ok(!args.some((a) => /remove_types/.test(String(a))), `hasRasl=${hasRasl} 也不得剔`);
+  }
+  // 非混拼时 HEVC 拷贝段连 -bsf:v 都不需要（dumpParams 缺省为 false）
+  const plain = argsForSegment({ kind: 'copy', start: 0, duration: 2 }, hevc, 'out.mp4', { fps: 30 });
+  assert.ok(!plain.includes('-bsf:v'), '非混拷新拷贝段无需 bsf');
 });
 
-test('H.264 纯拷贝段不下发该过滤器（NAL 编号不同）；重编码段默认也不下发', () => {
+test('H.264 纯拷贝段不下发过滤器；重编码段默认也不下发', () => {
   assert.ok(!argsForSegment({ kind: 'copy', start: 0, duration: 2 }, MEDIA, 'out.mp4', { fps: 30 }).includes('-bsf:v'));
   const hevc = { ...MEDIA, video: { codec: 'hevc', fps: 30 } };
   assert.ok(!argsForSegment({ kind: 'reencode', start: 0, duration: 2 }, hevc, 'out.mp4').includes('-bsf:v'));

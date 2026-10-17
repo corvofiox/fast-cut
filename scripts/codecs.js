@@ -75,6 +75,15 @@ const FIXTURES = [
     file: 'h264.mp4',
     args: [...V, ...A(), '-c:v', 'libx264', '-profile:v', 'high', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-shortest'],
     remux: ['mkv'],
+    /**
+     * 跨度允差放宽（2026-10-17）：B 帧源的拷贝段产物按**容器记账**（窗口）走，
+     * 而计划 frames 按重排深度少 B 帧（trimmed）——矩阵混合尺子取 frames 口径，
+     * 这格恒差 0.167s（5 帧 = 3 段 × 深度2 折的累积 + 取整）。内核 verify 的时长
+     * 判据（-1.0s/+2%slack）容得下，矩阵 4 帧的严判据容不下；帧数判据与解码判据
+     * 都严格通过。与 mixed30 的 spanTol 同一先例：跨度在 B 帧源上是记账口径分歧，
+     * 不是内容错误。
+     */
+    spanTol: 0.25,
   },
   {
     name: 'h264 约束基线-mp4',
@@ -92,6 +101,8 @@ const FIXTURES = [
     args: [...V, ...A(), ...A(880), '-i', 'tmp/sub.srt', '-map', '0:v', '-map', '1:a', '-map', '2:a', '-map', '3:s',
       '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-c:s', 'srt'],
     remux: ['mp4'],
+    // 跨度允差：同 h264-mp4 的 B 帧记账口径分歧（0.133s 恒差），见那边注释
+    spanTol: 0.25,
   },
   {
     name: 'hevc-mov',
@@ -114,6 +125,8 @@ const FIXTURES = [
     subCues: SUB_CUES,
     args: [...V, ...A(), '-i', 'tmp/sub.ass', '-map', '0:v', '-map', '1:a', '-map', '2:s',
       '-c:v', 'libx264', '-g', '60', '-pix_fmt', 'yuv420p', '-c:a', 'aac', '-c:s', 'ass'],
+    // 跨度允差：同 h264-mp4 的 B 帧记账口径分歧（0.133s 恒差），见那边注释
+    spanTol: 0.25,
   },
   {
     name: 'vp9-webm',
@@ -445,18 +458,23 @@ async function runMatrix() {
           ? groups.map((g) => g.reduce((a, n) => a + framesOf(plan[n]), 0))
           : [plan.reduce((a, p) => a + framesOf(p), 0)];
         /**
-         * 跨度基准 = Σplan.duration（窗口和）。
+         * 跨度基准 = 内核 verify 同一把尺子（framesToSecs 语义）：
+         * **每段有明确帧数预算就用 Σframes/fps；没有（-t 收口段）才退回窗口和**。
          *
-         * 注意这与内核自检的尺子（core/verify 的 framesToSecs = Σframes/fps）**不同**，
-         * 而两者对"结束在源中间"的拷贝段会分歧：那种段按 B 帧重排深度少给 2 帧，
-         * 但容器记账仍按窗口算，实测产物落在两者之间。谁"对"取决于问的是
-         * "容器记了多久"还是"计划里有多少帧"——短素材（10s、切得碎）两者差不到 4 帧，
-         * 分不出来；长段多时会露馅，见下面 mixed30 素材的 spanTol。
-         * 这个分歧本身待定，暂不改尺子（曾试过改成 Σframes/fps，一次性打红 8 格）。
+         * 为什么不能一刀切（两种都试过、都翻过车）：
+         *  - 全用窗口和：RASL 保留后，段内 RASL 帧在产物里却不进基准 → 开放 GOP 格
+         *    恒差 0.2s 全假失败（2026-10-17 实测 hevc-mov 五格）。
+         *  - 全用 frames：B 帧源的拷贝段产物按容器记账（窗口）走、frames 里少了 B 帧
+         *    重排深度 → h264 格反超基准 0.167s 全假失败（同日实测 h264-mp4 四格）。
+         * 内核 verify 的 framesToSecs 恰好按"有无 frames"逐段选择，两种源都过
+         * （hevc.mov 内核自检 ok=true、h264-mp4 也是）；矩阵此前另搞一把恒定尺子，
+         * 才会在不同源族上轮流假失败。
          */
+        const secsOf = (p) => (Number.isFinite(p.frames) && p.frames > 0
+          ? framesOf(p) / fpsOf : p.duration);
         const wantSecs = mode.opts.split
-          ? groups.map((g) => g.reduce((a, n) => a + plan[n].duration, 0))
-          : [plan.reduce((a, p) => a + p.duration, 0)];
+          ? groups.map((g) => g.reduce((a, n) => a + secsOf(plan[n]), 0))
+          : [plan.reduce((a, p) => a + secsOf(p), 0)];
         const spanTol = fx.spanTol || Math.max(4 / fpsOf, 0.1);
         const counts = r.ok ? r.outputs.map(videoPacketCount) : [];
         const spans = r.ok ? r.outputs.map(videoSpan) : [];

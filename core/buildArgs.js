@@ -10,18 +10,25 @@ const { snap } = require('./segments');
 const { familyOfExt } = require('./containers');
 
 /**
- * HEVC 开放 GOP 的多段拼接救法：剔掉 RASL（NAL 类型 8=RASL_N、9=RASL_R）。
+ * HEVC 开放 GOP：拷贝段**不再剥 RASL**（2026-10-17 定案，四轮实验）。
  *
- * x265 默认 open-gop=1，IDR 之后会跟着若干"引用了 IDR 之前画面"的前导帧。整段播放时
- * 解码器在随机接入点本来就要丢弃它们，所以单段没问题；可一旦把两段首尾相接，接缝不再是
- * 解码器认可的接入点，那些参考就找不到了 —— 报 "Could not find ref with POC n"，画面在
- * 接缝处坏几帧。既然规范上这些帧在接入点就该被丢，**在封装层把它们剔掉是等价且合法的**：
- * 不重编码、不丢任何会显示的画面，拼接后全量解码零报错（实测 mov 与 mkv 两种目标都成立）。
+ * 旧做法是对拷贝段下发 `filter_units=remove_types=8|9` 全局剥掉 NAL 8/9，依据是
+ * "这些前导帧在接入点本来就该被丢"。**那个依据是错的**：
+ *  · 只有**段起点**那一簇 RASL 无法解码——它引用的画面在段外。而它的显示时刻
+ *    在段起点**之前**（本来就在用户选区之外），解封装按 PTS 就会丢掉（-ss 起点）、
+ *    make_zero 之后 muxer 丢弃负 PTS 包、解码器还有 NoRaslOutputFlag 规范保底
+ *    ——三层天然去处，无需任何 NAL 级操作（实测 mp4/mov/mkv/ts 四容器）。
+ *  · 段内**中间**关键帧的 RASL：参考帧在同段内、显示时刻在选区内——**是真画面**。
+ *    全局剥把它们一并丢了（用户实测被白丢 287 帧 ≈ 4.8s）。
  *
- * 别顺手把 RADL（6/7）也剔了：实测照样报错（说明坏的不是 RADL），而 RADL 是真会显示的帧。
- * 也别对 H.264 下发：那是另一套 NAL 编号，且 h264 路径本来就没有这个问题。
+ * 而且**剥离从未修好过接缝**：实测「剥 + 无接缝缓解」照样报 `Duplicate POC`。
+ * 接缝由接缝缓解负责（非首片段开头重编码自带 IDR），与剥离无关。
+ * 剥离真正的作用只有"让帧数记账和包数对上"——正确做法是把记账**加**回包预算
+ * （见 cuttings.js），而不是把帧**扣**掉。
+ *
+ * 别顺手把 RADL（6/7）也剥（若将来有人想恢复剥除）：实测照样报错，且 RADL 是真画面。
+ * 也别对 H.264 下发：另一套 NAL 编号。
  */
-const HEVC_DROP_RASL = 'filter_units=remove_types=8|9';
 
 /**
  * 混拼（计划里同时有重编码段和流拷贝段）时的参数集内嵌。
@@ -66,19 +73,12 @@ function streamBsfFor(item, media, opts = {}) {
     if (!opts.dumpParams || !codec) return [];
     return MIXED_PARAM_BSF[codec] ? ['-bsf:v', MIXED_PARAM_BSF[codec]] : [];
   }
+  /**
+   * HEVC 拷贝段：只留参数集内嵌（混拼时），**不下发剔 RASL**——见文件顶部定案注释。
+   * （闭合 GOP 本来就没有 NAL 8/9 可删，字段缺失的老调用方也一样，无需再区分 hasRasl。）
+   */
   if (codec === 'hevc') {
-    /**
-     * 只在源**确实含 RASL**时才剔。闭合 GOP 的 HEVC（x265 `open-gop=0`）每个关键帧都是
-     * IDR、一个 RASL 都没有（实测 NAL 8/9 计数为 0），此时下发 `remove_types=8|9` 是空操作，
-     * 但配套的"每段内关键帧扣 raslPerKf 帧"记账会**白扣掉真实内容**（实测 1.03 秒）。
-     * 所以剥除与记账必须同进同退：都看 `media.hasRasl`（由 probeHasRasl 实测）。
-     * 字段缺失（老调用方/单测）时按 true 走保守路径，行为与本修改前一致。
-     */
-    const stripRasl = media?.hasRasl !== false;
-    if (opts.dumpParams) {
-      return ['-bsf:v', stripRasl ? `${HEVC_DROP_RASL},${MIXED_PARAM_BSF.hevc}` : MIXED_PARAM_BSF.hevc];
-    }
-    return stripRasl ? ['-bsf:v', HEVC_DROP_RASL] : [];
+    return opts.dumpParams ? ['-bsf:v', MIXED_PARAM_BSF.hevc] : [];
   }
   if (codec === 'h264' && opts.dumpParams) return ['-bsf:v', MIXED_PARAM_BSF.h264];
   return [];

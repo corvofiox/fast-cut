@@ -78,7 +78,6 @@ function buildPlan(keeps, opts) {
   const plan = [];
   let warnedVfr = false;
   let warnedSeamBroken = false;
-  let raslCounted = 0;              // RASL 剥除帧数：copyPart（源尾分支）与收尾循环共同累计，去重后给警告
 
   /**
    * [from, to) 之间有多少帧 = 会被导出的帧数。
@@ -109,53 +108,36 @@ function buildPlan(keeps, opts) {
    */
   const atEnd = (to) => Number.isFinite(duration) && to >= duration - EPS;
   /**
-   * [from, to) 里有多少个关键帧（不含 from 本身、含 to 吗？不含——区间端点约定与 span 一致，左闭右开）。
-   * HEVC 开放 GOP 的 RASL 剥除按「每个关键帧剥 raslPerKf 帧」记账用：filter_units 按解码序
-   * 把每个 IDR/CRA 之后的 RASL 包整个剥掉，无法区分"引用段内还是段外"，段内有几个
-   * 关键帧（不含起点——起点关键帧之后的 RASL 才会被切进段里）就剥几组。
+   * [from, to) 内有多少个"会产生 RASL 的关键帧"（不含 from——起点那簇的显示时刻
+   * 在窗口之前；左开右闭，to 上的关键帧不计）。开放 GOP 源里段内每个这样的关键帧
+   * 后面跟 raslPerKf 个 RASL 画面；不再剥除后，它们是**真画面**且**按解码序
+   * 跟在关键帧后面进入 `-frames:v` 的包序列**——预算必须把它们的包位加回来，
+   * 否则 -frames:v 会把窗口末尾的真画面掐掉（实测 hevc.mov 短段：+2/簇 正好差这么多）。
+   * 闭合 GOP / 非 HEVC 源 raslPerKf=0，此函数不产生任何影响。
    */
-  const kfCountIn = (from, to) => {
+  const raslKfsIn = (from, to) => {
+    if (!(raslPerKf > 0)) return 0;
     let n = 0;
     for (const k of keyframes) {
       if (k <= from + KEY_TOL) continue;
       if (k >= to - KEY_TOL) break;
       n++;
     }
-    return n;
+    return n * raslPerKf;
   };
   const copyPart = (from, to) => {
     const window = span(from, to);
     if (!fpsNum || !bdepth || atEnd(to)) {
-      // 源尾不加防吞余量（后面本来没有帧），但 **HEVC 的 RASL 剥除照剥**——
-      // filter_units 不管段尾是不是源尾，段内每个关键帧后的 RASL 都会消失，
-      // 所以哪怕到源尾也要给出明确的 frames 预期（null = 按 -t 收口，剥完就少帧、自检挂）
-      if (raslPerKf > 0 && fpsNum) {
-        const n = kfCountIn(from, to);
-        if (n > 0) {
-          const frames = Math.round(window * fpsNum) - n * raslPerKf;
-          if (frames > 0) {
-            raslCounted += n * raslPerKf;
-            return { duration: window, frames, trimmed: 0, raslTrimmed: true };
-          }
-        }
-      }
+      // 源尾不加防吞余量（后面本来没有帧），按 -t 收口到自然长度。
+      // RASL 包位同样计入：-t 收口按 PTS 判界，窗内 RASL 不会被切掉，无需 frames 预算。
       return { duration: window, frames: null, trimmed: 0 };
     }
-    const frames = Math.round(window * fpsNum) - bdepth;
+    // 按解码序数包：窗口显示帧数 − B帧重排深度 + 段内 RASL 画面数（它们的包也在序列里）
+    const frames = Math.round(window * fpsNum) - bdepth + raslKfsIn(from, to);
     return frames > 0
       ? { duration: window, frames, trimmed: bdepth }
       : { duration: 0, frames: null, trimmed: 0 };
   };
-
-  /**
-   * HEVC 开放 GOP 的 RASL 记账：拷贝段里的每个关键帧（**不含段起点**——起点关键帧之后的
-   * RASL 才会被切进段里）后面都跟着 raslPerKf 个 RASL 帧，`filter_units remove_types=8|9`
-   * 会把这些包整个剥掉（NAL 级无法区分"引用段内还是段外"）。剥掉的帧不会出现在产物里，
-   * 帧数预期必须同步扣掉，否则"帧数符合切割计划"自检必挂。
-   *
-   * 实测（x265 open-gop，has_b_frames=2）：每个关键帧跟 3 个 RASL（= 深度 + 1），由上层折算传入。
-   * 只影响 frames 记账，duration 不动（RASL 显示时刻本就在段外或被后续帧补位）。
-   */
 
   for (let ki = 0; ki < keeps.length; ki++) {
     const keep = keeps[ki];
@@ -309,7 +291,6 @@ function buildPlan(keeps, opts) {
               plan.push({
                 kind: 'copy', role: 'whole', start: clamped, duration: part.duration, frames: part.frames,
                 snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
-                raslTrimmed: part.raslTrimmed || undefined,
                 autoPrecise: true,
                 note: `吸附避开重叠：从关键帧 ${clamped.toFixed(3)}s 起（少 ${(clamped - keep.start).toFixed(3)}s 片段开头）`,
               });
@@ -341,7 +322,6 @@ function buildPlan(keeps, opts) {
               plan.push({
                 kind: 'copy', role: 'whole', start: snapStart, duration: part.duration, frames: part.frames,
                 snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
-                raslTrimmed: part.raslTrimmed || undefined,
                 note: kfStart === null
                   ? `入点之前没有关键帧，从 0 开始（多 ${keep.start.toFixed(3)}s 内容）`
                   : snapStart < keep.start - EPS
@@ -365,12 +345,64 @@ function buildPlan(keeps, opts) {
 
     // 入点落在 GOP 中间：需要重编码入点那一小段才能从任意时刻起；其余仍流拷贝。
     if (hasKeyframeAt(start, keyframes)) {
+      /**
+       * 接缝缓解（精确模式版，2026-10-17 实测补的洞）：
+       *
+       * 入点正好落在关键帧上时，精确模式会产出**纯拷贝段**（没有重编码头）。
+       * 若它前面还有别的拷贝段（上一条区间的尾段），就构成 C→C 接缝——实测
+       * `Could not find ref with POC`（hevc.mov 矩阵格：r c r c c → 前 4 段干净、
+       * 到第 5 段 rcrcc 即报错）。规律与吸附模式实测一致：**段内 RASL 跟在
+       * 重编码段后能容忍（RASL 引用的参考在新 POC 序列里恰有匹配），跟在
+       * 拷贝段后必炸**（拷贝段延续源流 POC，连续解码时解码器真去解 RASL，
+       * 它引用的参考帧不在产物里）。
+       *
+       * 修法与吸附模式的 needIdrSeam 同构：非首个拷贝段改局部精确（入点那一小段
+       * 重编码，自带 IDR 重置 POC），代价 ≤ 一个 GOP，换来接缝必然可解码。
+       * 判据用 seamNeedsIdr（通用探针 + hasRasl 并集），与吸附模式同一来源。
+       */
+      const priorCopy = plan.some((p) => p.kind === 'copy');
+      const needIdr = seamNeedsIdr && priorCopy;
+      if (needIdr && sameCodec) {
+        const kfNext = firstKeyframeAtLeast(start + minHead, keyframes);
+        if (kfNext !== null && kfNext < end - EPS) {
+          const head = span(start, kfNext);
+          const tailPart = copyPart(kfNext, end);
+          if (tailPart.duration > EPS) {
+            warnings.push(
+              `入点在关键帧上、但前面还有别的片段：开放 GOP 的拷贝段接拷贝段会在接缝处报 `
+              + `"Could not find ref"（实测）。这一段改为局部精确——入点一小段（≤ 一个关键帧间隔）`
+              + `重编码以重置参考序号，其余仍流拷贝`,
+            );
+            plan.push({
+              kind: 'reencode', role: 'head', start, duration: head,
+              snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, autoPrecise: true,
+              note: '接缝缓解（精确模式）：入点小段重编码',
+            });
+            plan.push({
+              kind: 'copy', role: 'tail', start: kfNext, duration: tailPart.duration, frames: tailPart.frames,
+              snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: tailPart.trimmed,
+              autoPrecise: true,
+              note: '接缝缓解（精确模式）：其余流拷贝',
+            });
+            continue;
+          }
+        }
+        // 拆不出头尾（区间太短/后面没有关键帧）：落下去整段重编码，同样自带 IDR
+        warnings.push(
+          `入点在关键帧上、但前面还有别的片段，且这段太短拆不出"重编码头+拷贝尾"：整段重编码保证接缝可解码`,
+        );
+        plan.push({
+          kind: 'reencode', role: 'whole', start, duration: wholeDur,
+          snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, autoPrecise: true,
+          note: '接缝缓解（精确模式）：区间太短，整段重编码（有损）',
+        });
+        continue;
+      }
       const part = copyPart(start, end);
       if (part.duration > EPS) {
         plan.push({
           kind: 'copy', role: 'whole', start, duration: part.duration, frames: part.frames,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
-          raslTrimmed: part.raslTrimmed || undefined,
           note: '整段流拷贝（不转码）',
         });
       } else {
@@ -447,7 +479,6 @@ function buildPlan(keeps, opts) {
     plan.push({
       kind: 'copy', role: 'tail', start: kfHead, duration: tailPart.duration, frames: tailPart.frames,
       snapFrom: keep.start, keepEnd: keep.end, actualEnd: keep.end, trimmed: tailPart.trimmed,
-      raslTrimmed: tailPart.raslTrimmed || undefined,
       autoPrecise: autoDegrade || undefined,
       note: autoDegrade ? `${autoNote} · 其余流拷贝` : `入点重编码 ${head.toFixed(3)}s，其余流拷贝`,
     });
@@ -467,50 +498,23 @@ function buildPlan(keeps, opts) {
   }
 
   /**
-   * HEVC 开放 GOP：把 RASL 剥除的帧数从拷贝段预期里扣掉。
-   * `filter_units remove_types=8|9` 按**解码序**剥掉每个 IDR/CRA 之后的 RASL 包，
-   * 无法区分"这一条 RASL 引用的画面在段内还是段外"，所以段内几个关键帧（不含段起点——
-   * 起点关键帧的 RASL 显示序在起点之前，本来就不在拷贝窗口里）就剥几组。
-   * 剥掉的帧确实不出现在产物里，帧数预期不同步扣，"帧数符合切割计划"自检必挂
-   * （实测 HEVC 源入点在 GOP 中间、拷贝到源尾：期望 300 实际 297，差 3 = 1 个段内关键帧 × 3）。
+   * 这里曾经有「按段内关键帧数把被剥 RASL 从帧数预期里扣掉」的记账（2026-10-17 删除）。
    *
-   * `copyPart` 的"切到源尾"分支已经扣过（见 raslTrimmed 标记），这里只补
-   * 走了 bdepth 路径的普通拷贝段，别两头重复扣。
+   * 删除原因：前提是错的（四轮实验定案，见 buildArgs 顶部定案注释与
+   * docs/exploration-as-rasl-fix.md）：
+   *  · 段内**中间**关键帧的 RASL 是真画面（PTS 在选区内、参考帧在同段内），保留之后
+   *    它们本来就从窗口的显示帧数里占位——包预算就是普通的 W − B帧深度，
+   *    **不需要为它们加减任何东西**。
+   *  · 段**起点**那一簇 RASL（显示时刻在入点之前）由解封装/负 PTS 丢弃/解码器
+   *    三层天然去处消化，也不占产物帧数。
+   * 旧记账"每段内关键帧扣 (深度+1) 帧"因此是在**白扣真内容**——用户实测被白丢 287 帧。
    */
-  if (raslPerKf > 0 && fpsNum) {
-    for (const p of plan) {
-      if (p.kind !== 'copy' || !Number.isFinite(p.frames) || p.frames <= 0) continue;
-      if (p.raslTrimmed) continue;
-      const n = kfCountIn(p.start, p.start + p.duration);
-      if (n > 0) {
-        p.frames = Math.max(1, p.frames - n * raslPerKf);
-        // 记在段上：上层算"产物该多长"时要把这些帧的显示时长加回去（见返回值的 raslStripped）
-        p.raslStripped = n * raslPerKf;
-        raslCounted += n * raslPerKf;
-      }
-    }
-    if (raslCounted > 0) {
-      warnings.push(
-        `源是 HEVC 开放 GOP：拼接用的参数集修正要求剥掉关键帧后的 RASL 前导帧，`
-        + `本次导出共剥 ${raslCounted} 帧（约 ${(raslCounted / (fpsNum || 30) * 1000).toFixed(0)}ms，分散在各关键帧处）——`
-        + '这是流拷贝拼接的固有代价',
-      );
-    }
-  }
 
   // 乱序（用户拖动改过顺序）时必须跳过 dedupePlan：它按"时间递增"假设合并相邻段，
   // 遇到 [5-10, 0-5] 这种会把后一段整个吞掉，导出就少了一半内容。
   return {
     plan: ordered ? plan.filter((p) => p.duration > EPS) : dedupePlan(plan),
     warnings,
-    /**
-     * 本次计划因剥 RASL 一共少了多少帧。上层算"产物该多长"时必须把它加回去：
-     * `filter_units` 剥掉的是包，**剩下的帧仍保留原 PTS**，所以时间轴上留下空洞、
-     * 容器时长并不随之缩短。实测（30s 开放 GOP 源、精确模式）：Σframes/fps = 16.967s，
-     * 而产物视频轨 17.733s —— 差的 0.766s 就是被剥掉的 23 帧（23/30 ≈ 0.767s）。
-     * 拿 Σframes/fps 当基准会把这个固有代价判成"接缝被拉长"。
-     */
-    raslStripped: raslCounted,
   };
 }
 

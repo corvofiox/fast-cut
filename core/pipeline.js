@@ -124,7 +124,7 @@ async function precheckSpace(outPath, media, keepSecs) {
  */
 function planFor(loaded, segments, opts = {}) {
   const keeps = opts.ordered ? orderPreserving(segments) : normalizeSegments(segments);
-  const { plan, warnings, raslStripped = 0 } = buildPlan(keeps, {
+  const { plan, warnings } = buildPlan(keeps, {
     keyframes: loaded.media.keyframes,
     // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
     // 实测 VFR 源改用 -t 限长时长根本收不住（要 2.27s 给出 4.83s，把删掉的内容又带回来）
@@ -134,25 +134,26 @@ function planFor(loaded, segments, opts = {}) {
     duration: loaded.media.duration,
     ordered: !!opts.ordered,
     sameCodec: keepsSourceCodec(loaded.media),
-    // VFR 源帧长不均匀，按帧数切出来的时长与音频对不上：只能整段重编码成定帧率
-    forceReencode: !!loaded.media.video?.vfr,
-    // HEVC 开放 GOP：剥 RASL 时每个段内关键帧剥 (深度+1) 帧（x265 实测），
-    // 拷贝段的帧数预期要同步扣，见 cuttings.buildPlan 末尾的记账。
-    // **闭合 GOP 的 HEVC 没有 RASL**，一律扣会白丢内容（实测 1.03s），
-    // 所以 media.hasRasl 必须由 probeHasRasl 实测得到；未知时按"有"走保守路径。
+    /**
+     * 开放 GOP 的源每个段内关键帧后跟 (深度+1) 个 RASL 画面（x265 实测）。
+     * RASL 剥除已整体移除（2026-10-17 定案，四轮实验，见 buildArgs 顶部定案注释与
+     * docs/exploration-as-rasl-fix.md）——段内 RASL 是真画面，保留；但它们按解码序
+     * 占 `-frames:v` 的包位，所以预算要**加回**它们的包数（cuttings.raslKfsIn）。
+     * 闭合 GOP（hasRasl=false）没有 RASL，传 0。
+     */
     raslPerKf: loaded.media.video?.codec === 'hevc' && loaded.media.video?.reorderDepth >= 0
-      && loaded.media.hasRasl !== false
+      && loaded.media.hasRasl === true
       ? loaded.media.video.reorderDepth + 1
       : 0,
     /**
      * 多段纯拷贝拼接是否需要"接缝缓解"（非首个片段开头重编码，自带 IDR 重置 POC）。
      *
-     * 判据来自**通用探针的实测结果**（scanKeyframes 里跑的 probePureCopySeams），
-     * 而不是按编码写死规则。这样 H.264 开放 GOP、以及将来任何未知格式一并覆盖。
-     * 探针没跑（关键帧太少）时退回"有 RASL 就要缓解"，保守但不会漏。
+     * 判据两个来源取并集：
+     *  · `hasRasl === true`——源确实是 HEVC 开放 GOP（probeHasRasl 直接测流）。
+     *  · `seamSafe === false`——通用探针 probePureCopySeams 实测拼接解不开
+     *    （覆盖 H.264 开放 GOP 以及任何未知格式）。
      */
-    seamNeedsIdr: loaded.media.seamSafe === false
-      || (loaded.media.seamSafe === undefined && loaded.media.hasRasl === true),
+    seamNeedsIdr: loaded.media.hasRasl === true || loaded.media.seamSafe === false,
     /**
      * 更严重的一层：探针发现**单个拷贝段自己就解不开**（实测 x264 开放 GOP 的 K 帧
      * NAL type 是 1 不是 5，根本不是 IDR）。此时"开头重编码一小段"也救不了——
@@ -170,7 +171,7 @@ function planFor(loaded, segments, opts = {}) {
    * 字幕按文本重新计时要拿它做减法，否则每条 cue 都比口型晚半帧（见 cuttings.frameStart）。
    */
   const keepAligns = keeps.map((k) => frameStart(k.start, loaded.media.video?.fps, loaded.media.gridOrigin));
-  return { keeps, plan, warnings, keepSecs, keepAligns, raslStripped };
+  return { keeps, plan, warnings, keepSecs, keepAligns };
 }
 
 /**
@@ -258,11 +259,19 @@ async function exportSegments(loaded, segments, opts) {
     const partExt = partsAsMp4(media, ext, carrySubsInParts) ? '.mp4' : ext;
     // 「读 mov 族 且 写 mov 族」才敢让拷贝段的时间戳不归零：
     // 不归零才不会每个接缝多一帧（见 buildArgs），但读 MKV/TS 或写 MKV 时会丢报文时间戳。
-    const zeroFree = familyOfFormat(src.media.format) === 'mov' && familyOfExt(partExt) === 'mov';
+    // **VFR 源除外**（2026-10-17 实测）：VFR 输入侧 -ss 后音频包天然带大负偏移
+    // （实测首包 pts=-44885 样本 ≈ -1.02s），`disabled` 让这个负偏移原样进段文件；
+    // concat 拼接按"最大流偏移"补齐时把它整段推后——2.68s 的视频配出 3.04s 音频
+    // （多 0.36s 静音，自检"音画一致"必挂）。`make_zero` 把音频也拉回 0，
+    // 拼接后逐包贴合（2.6279 vs 2.6800）。VFR 段本来就全部重编码，不用顾虑
+    // disabled 那点"接缝多一帧"的小账。
+    const zeroFree = familyOfFormat(src.media.format) === 'mov' && familyOfExt(partExt) === 'mov'
+      && !media.video?.vfr;
     const copyTs = zeroFree ? 'disabled' : 'make_zero';
     if (!zeroFree && plan.some((p) => p.kind === 'copy')) {
-      warnings.push('这次导出无法让拷贝段的时间戳严格按帧对齐（源或目标容器不允许），'
-        + '接缝处可能多带 1~2 帧画面——产物内容仍是按你选的区间切的');
+      warnings.push('这次导出无法让拷贝段的时间戳严格按帧对齐（源或目标容器不允许）'
+        + (media.video?.vfr ? '，或源是可变帧率' : '')
+        + '——接缝处可能多带 1~2 帧画面：产物内容仍是按你选的区间切的');
     }
 
     // 混拼（重编码段与流拷贝段并存）时，拷贝段要把源参数集内嵌进关键帧包：
@@ -313,23 +322,16 @@ async function exportSegments(loaded, segments, opts) {
       return trimmed / frames;
     };
     /**
-     * 时长自检的基准：**Σframes/fps + 被剥掉的 RASL 帧的显示时长**。
+     * 时长自检的基准：**Σframes/fps**。
      *
-     * 为什么不直接用 Σframes/fps（c13a55f 的写法）：`filter_units` 剥掉的是**包**，
-     * 剩下的帧仍保留原 PTS，所以时间轴上留下空洞、**容器时长不随帧数缩短**。
-     * 实测（30s 开放 GOP、精确模式）：Σframes/fps = 16.967s，产物视频轨 17.733s ——
-     * 差的 0.766s 正是被剥的 23 帧（23/30）。不加回去就会把固有代价误判成"接缝被拉长"。
-     *
-     * 为什么不退回 Σ窗口（更早的写法）：B 帧收尾（trimmed）确实会让产物比窗口短，
-     * 且那段**没有**空洞（帧是被真删掉的）。两种成分方向相反，必须分开算：
-     *   基准 = frames/fps + raslStripped/fps。
+     * RASL 剥除已整体移除（2026-10-17），不再有"帧被剥掉但 PTS 空洞还在"的成分
+     * ——保留的 RASL 的显示时刻本就在窗口内，既占 frames 也占时长，两边自洽。
+     * B 帧收尾（trimmed）会让产物比窗口短，那段是真删掉的帧，属正常折让。
      * fps 缺失（折不出帧数）时回退窗口和，允差交给 verify 的 -1.0s 下界兜底。
      */
     const framesToSecs = (idxList) => {
       const f = framesSum(idxList);
-      if (f == null || !cutFps) return idxList.reduce((a, n) => a + plan[n].duration, 0);
-      const stripped = idxList.reduce((a, n) => a + (plan[n].raslStripped || 0), 0);
-      return (f + stripped) / cutFps;
+      return f != null && cutFps ? f / cutFps : idxList.reduce((a, n) => a + plan[n].duration, 0);
     };
     const expectSlack = [];
     // 每条保留区间在成片里的起点（拼接模式按全部区间累加）
