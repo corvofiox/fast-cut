@@ -43,6 +43,7 @@ function createTimeline(options) {
   let keyframes = [];             // 源时间
   let clips = [];                 // [{start,end,ps,pe}]
   let selected = -1;
+  let selSet = [];                 // 多选集合（含 selected）：把几段并成一次导出时用
   let programTime = 0;
   let drag = null;
   let pointer = { x: 0 };
@@ -61,6 +62,7 @@ function createTimeline(options) {
   let filmStats = { step: null, cells: 0, minCell: 0, maxCell: 0, maxScale: 0 };
   let rulerInfo = { step: 0, labels: [] };   // 最近一次刻度尺画了什么，给自检用
   let reorder = null;              // { from, to } 正在拖哪一段、要插到哪
+  let groupOrder = new Map();      // 分组 id → 显示序号（1 起，按首次出现编）
 
   // ---------- 时间换算 ----------
   const width = () => root.clientWidth || 1;
@@ -219,6 +221,7 @@ function createTimeline(options) {
     drawKeyframeTicks();      // tick 现在画在胶片底边上，必须压在胶片之上
     drawSnapExtra();          // 吸附多带的区间：半透明延伸块，压在胶片上、片段块之下
     drawBlocks();
+    drawGroupBrackets();      // 分组连线：画在块之上，表达"这几段进同一个文件"
     drawCaret();
     drawPlayhead();
     drawScrollbar();
@@ -340,11 +343,53 @@ function createTimeline(options) {
       el.style.left = `${x0}px`;
       el.style.width = `${Math.max(3, x1 - x0)}px`;
       el.classList.toggle('sel', i === selected);
+      el.classList.toggle('multi', selSet.length > 1 && selSet.includes(i));
       el.classList.toggle('last', i === clips.length - 1);
+      // 分组（「并成一次导出」）：块上带个角标，同一组的块由下方括号连起来
+      const g = c.group == null ? null : groupNo(c.group);
+      el.classList.toggle('grp', g != null);
       el.querySelector('.idx').textContent = String(i + 1);
+      const badge = el.querySelector('.grp-badge');
+      badge.textContent = g == null ? '' : `组${g}`;
       el.querySelector('.drop').textContent = snapDelta(i) > 0.001 ? `+${snapDelta(i).toFixed(3)}s` : '';
       el.classList.toggle('moving', !!(reorder && reorder.from === i));
-      el.title = `成片 ${fmtClock(c.ps)} → ${fmtClock(c.pe)}\n源 ${fmtClock(c.start)} → ${fmtClock(c.end)}`;
+      el.title = `成片 ${fmtClock(c.ps)} → ${fmtClock(c.pe)}\n源 ${fmtClock(c.start)} → ${fmtClock(c.end)}`
+        + (g != null ? `\n并入导出第 ${g} 个文件` : '');
+    }
+  }
+
+  /**
+   * 分组号 → 显示序号（1 起，按首次出现的顺序编）。
+   * 分组号本身是内部 id（用户撤销/拆分后可能不连续），显示要连续，否则会出现"组3、组7"。
+   */
+  function groupNo(id) {
+    let n = 0;
+    for (const c of clips) {
+      if (c.group == null) continue;
+      if (!groupOrder.has(c.group)) groupOrder.set(c.group, ++n);
+      if (c.group === id) return groupOrder.get(id);
+    }
+    return groupOrder.get(id) || null;
+  }
+
+  /**
+   * 分组括号：同一组连续的几块下面画一条连线 + 一个"组N"，直观表达
+   * "这几段会拼进同一个文件"。组的成员被拖散成两截时，两截各画一次、标同一个号
+   * ——那正好说明它们仍然进同一个文件。
+   */
+  function drawGroupBrackets() {
+    const y = LANE_TOP + LANE_H - 2;
+    let i = 0;
+    while (i < clips.length) {
+      const gid = clips[i].group;
+      if (gid == null) { i++; continue; }
+      let j = i;
+      while (j + 1 < clips.length && clips[j + 1].group === gid) j++;
+      const x0 = tToX(clips[i].ps);
+      const x1 = tToX(clips[j].pe);
+      ctx.fillStyle = 'rgba(127, 211, 163, 0.9)';
+      ctx.fillRect(Math.round(x0), y, Math.max(2, Math.round(x1 - x0)), 2);
+      i = j + 1;
     }
   }
 
@@ -357,14 +402,16 @@ function createTimeline(options) {
     const el = document.createElement('div');
     el.className = 'seg';
     el.innerHTML = '<div class="handle l"></div><div class="label"><span class="idx"></span></div>' +
-      '<div class="drop"></div><div class="handle r"></div>';
+      '<div class="grp-badge"></div><div class="drop"></div><div class="handle r"></div>';
     return el;
   }
 
   function drawPlayhead() {
     playheadEl.classList.toggle('hidden', !clips.length);
     const x = tToX(Math.min(total, Math.max(0, programTime)));
-    playheadEl.style.left = `${x}px`;
+    // 强制取整到设备像素：消除跨设备的子像素抖动（dpr≠1 时）
+    const intX = Math.round(x * window.devicePixelRatio) / window.devicePixelRatio;
+    playheadEl.style.left = `${intX}px`;
     if (knobEl) knobEl.style.left = `${-KNOB_HALF}px`;   // 胶囊永远正中线：绘图区已经收出 PAD 的余量
     if (bubbleEl) bubbleEl.textContent = fmtClock(programTime);
   }
@@ -506,10 +553,16 @@ function createTimeline(options) {
   }
 
   // ---------- 播放头定位 ----------
-  function selectClip(i) {
-    if (i < 0 || i === selected) return;
+  function selectClip(i, additive) {
+    if (i < 0) return;
+    if (additive) {
+      // Ctrl/⌘ 单击 = 加选/减选（用来把几段并成一次导出）；Shift 单击 = 从当前段扩选到目标段
+      if (cb.onSelect) cb.onSelect(i, additive);
+      return;
+    }
+    if (i === selected) return;
     selected = i;
-    if (cb.onSelect) cb.onSelect(i);
+    if (cb.onSelect) cb.onSelect(i, false);
   }
 
   /** 把成片时间落到一个可编辑的位置（含磁吸），并回调上层。 */
@@ -557,9 +610,15 @@ function createTimeline(options) {
       // 不能让它落到"拖动改顺序"，否则抓片段边缘那一下会把整段拎起来。
     } else if (index >= 0) {
       // 胶片本身：按下就是抓住这段素材，拖动改顺序；单击只选中，绝不动播放头
-      drag = { mode: 'reorder', from: index, x0: x, moved: 0 };
-      reorder = { from: index, to: index };
-      selectClip(index);
+      // Ctrl/⌘ 或 Shift 按下 = 多选（把几段并成一次导出），此时不进入拖动改顺序
+      const multi = e.ctrlKey || e.metaKey || e.shiftKey;
+      if (multi) {
+        selectClip(index, true);
+      } else {
+        drag = { mode: 'reorder', from: index, x0: x, moved: 0 };
+        reorder = { from: index, to: index };
+        selectClip(index);
+      }
     }
     try { root.setPointerCapture(e.pointerId); } catch { /* 合成事件没有真实指针 */ }
     e.preventDefault();
@@ -787,12 +846,20 @@ function createTimeline(options) {
       total = Math.max(0.001, clips.length ? clips[clips.length - 1].pe : 0.001);
       selected = sel == null ? selected : sel;
       snapInfo = snapMap || null;
+      // 分组显示序号按"当前出现顺序"重排：删掉一段后组号不该留空洞
+      groupOrder = new Map();
       // 内容变了就把视口收进 [0, total]；用户自己放大过（span < total）则保留缩放
       if (!fitted || view.t1 > total || view.t1 - view.t0 >= total) { view.t0 = 0; view.t1 = total; }
       fitted = true;
       render();
     },
     setSelected(i) { selected = i; render(); },
+    /** 多选集合：`[2,3,4]`。传空数组或省略 = 单选（只有 selected 高亮）。 */
+    setSelection(list, primary) {
+      selSet = Array.isArray(list) ? list.slice() : [];
+      if (primary != null) selected = primary;
+      render();
+    },
     /**
      * 换素材、或主进程边抽边推进度时调用。同目录下张数只会增长，
      * 所以只补新增的那几张，别把已经加载好的图重建一遍。

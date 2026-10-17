@@ -307,6 +307,11 @@ test('吸附防吞钳制：回溯会吞已排段的内容时，该段整段重�
   // 整片只有一个关键帧（12s GOP 的形状）：每条非首段的吸附都会回溯到 0，与已排拷贝段重叠。
   // 语义修正（2026-10-14）：这种情况只降级"局部精确"不够——精确路径的拷贝尾段仍与
   // 已排拷贝段重叠（copy[6,8] ⊂ copy[6,10] 实测），所以重叠侧必须整段重编码。
+  //
+  // 2026-10-18 补：这里"回溯到 0"与首段拷贝段的**起点完全重合**（都是关键帧 0），
+  // 那属于"起点重合"而不是"落进内部"——判据已单独拆出（coincide），
+  // 结论仍是不能吸附：有同编码重编码器就走局部精确，没有就整段重编码。
+  // 计划结果与旧版一致，只是警告把病根说准了。
   const { plan, warnings } = buildPlan(
     [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8, end: 9.5 }],
     { keyframes: [0], duration: 10, fps: 30, precise: false },
@@ -322,7 +327,9 @@ test('吸附防吞钳制：回溯会吞已排段的内容时，该段整段重�
     const ov = Math.min(cp[i].start + cp[i].duration, cp[j].start + cp[j].duration) - Math.max(cp[i].start, cp[j].start);
     assert.ok(ov <= 1e-6, `拷贝段 ${i}/${j} 重叠 ${ov}s`);
   }
-  assert.ok(warnings.some((w) => /整段重编码/.test(w) && /交叠/.test(w)), warnings.join('、'));
+  // 不管走"起点重合"还是"落进内部"，警告都必须说明"不能吸附"且给出代价
+  assert.ok(warnings.some((w) => /同一个关键帧|重合|交叠/.test(w) && /整段重编码|局部精确/.test(w)),
+    warnings.join('、'));
 });
 
 test('吸附防重叠：乱序下吸附拷贝段与已排拷贝段重叠时整段重编码，重叠归零', () => {

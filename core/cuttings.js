@@ -65,7 +65,7 @@ function frameIndex(t, fps, origin = 0) {
  * @returns {{plan:Array, warnings:string[]}}
  */
 function buildPlan(keeps, opts) {
-  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0, seamNeedsIdr = false, forceWholeReencode = false } = opts;
+  const { keyframes = [], duration, fps, ordered = false, sameCodec = true, gridOrigin = 0, reorderDepth = 0, forceReencode = false, precise = true, raslPerKf = 0, seamNeedsIdr = false, forceWholeReencode = false, splitOutput = false } = opts;
   const fpsNum = Number(fps) > 0 ? Number(fps) : null;
   const bdepth = Math.max(0, Number(reorderDepth) || 0);
   // 帧网格原点：源首帧 pts 不一定落在 0（实测 HEVC 的 .mp4/.mkv 首帧 pts = 0.023，
@@ -244,6 +244,35 @@ function buildPlan(keeps, opts) {
       // 防吞：吸附起点落进某条已排拷贝段的内部（真回溯吃内容，关键帧对齐时无代价无所谓）
       const swallow = placedCopy.find((p) => snapStart > p.start + EPS && snapStart < p.start + p.duration - EPS);
       const crosses = swallow != null && snapStart < start - EPS;
+      /**
+       * 起点**恰好重合**（2026-10-18 补）：用户在播放头处连切几刀时，第二段的吸附起点
+       * 与前一段拷贝段的起点是同一个关键帧（如关键帧 [0,4,8]、两段 [0,3][3,6]，
+       * 两段的 lastKeyframeAtMost 都是 0）。这种"起点重合"不是吞已删内容，而是
+       * **重复导出同一段**；旧代码把它交给下面的防重叠分支去钳起点，而钳到下一个关键帧
+       * （4）就**把用户要的 [3,4] 整段跳掉了**——两段各自的自检都对，合起来少一秒查不出来。
+       * 正确做法与防吞一致：不能吸附，就走局部精确（入点小段重编码），内容一秒不少。
+       */
+      const coincide = placedCopy.find((p) => Math.abs(snapStart - p.start) <= EPS && snapStart < start - EPS);
+      if (coincide && sameCodec) {
+        warnings.push(
+          `这一段的吸附起点（${snapStart.toFixed(3)}s）与上一段拷贝段的起点是同一个关键帧：`
+          + '直接吸附会把同一段画面重复导出两遍，所以这一段改为局部精确——入点那一小段重编码，其余仍流拷贝',
+        );
+        autoDegrade = true;
+        autoNote = '吸附起点与上一段重合，自动局部精确';
+      } else if (coincide) {
+        // 换编码源不能混拼：吸附会把整段已删的间隙带回来，只能整段重编码
+        warnings.push(
+          `这一段的吸附起点（${snapStart.toFixed(3)}s）与上一段拷贝段的起点是同一个关键帧，`
+          + `而源编码没有同编码重编码器（不能混拼）：这一段整段重编码`,
+        );
+        plan.push({
+          kind: 'reencode', role: 'whole', start, duration: wholeDur,
+          snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, codecChange: true, autoPrecise: true,
+          note: '吸附起点与上一段重合，且不能混拼：整段重编码（编码改变）',
+        });
+        continue;
+      }
       // 开放 GOP 的非首个拷贝段：接缝必须由 IDR 重置 POC，走局部精确（见上方 needIdrSeam 注释）
       if (needIdrSeam && sameCodec && !crosses) {
         warnings.push(
@@ -275,10 +304,9 @@ function buildPlan(keeps, opts) {
       } else {
         // 防重叠：吸附拷贝段 [snapStart, end) 与已排拷贝段真重叠（相接不算）——
         // concat 会把同一画面导出两遍，且"帧数符合计划"的自检拦不住（计划自身就含重复）。
-        // 处理：吸附起点**钳到已排重叠段右界之后的第一个关键帧**——既保住流拷贝，又无重叠；
-        // 钳完已越过出点、或没有更晚的关键帧（或换编码源不能混拼）时才整段重编码。
-        // （只降级"局部精确"不够：精确路径的拷贝尾段仍会与已排段重叠，实测 copy[6,8] ⊂ copy[6,10]。）
-        const overlap = placedCopy.find((p) => Math.min(p.start + p.duration, end) - Math.max(p.start, snapStart) > EPS);
+        // **起点重合的情形不在这里处理**（coincide 已在上面判过并降级为局部精确）：
+        // 那种"重叠"整段都重合，钳起点只会把用户要的内容跳掉。
+        const overlap = !coincide && placedCopy.find((p) => Math.min(p.start + p.duration, end) - Math.max(p.start, snapStart) > EPS);
         if (overlap) {
           const right = overlap.start + overlap.duration;
           const clamped = sameCodec ? firstKeyframeAtLeast(right + EPS, keyframes) : null;
@@ -512,10 +540,33 @@ function buildPlan(keeps, opts) {
 
   // 乱序（用户拖动改过顺序）时必须跳过 dedupePlan：它按"时间递增"假设合并相邻段，
   // 遇到 [5-10, 0-5] 这种会把后一段整个吞掉，导出就少了一半内容。
-  return {
-    plan: ordered ? plan.filter((p) => p.duration > EPS) : dedupePlan(plan),
-    warnings,
-  };
+  // splitOutput（「每段一个文件」）同理要保留分组边界：只允许**同一个输出文件内**合并。
+  // 分组键要先打好再 dedupe：合并与否取决于"是否进同一个文件"，而不是 keepIndex。
+  const tagged = tagOutputGroups(plan, keeps);
+  const finalPlan = ordered
+    ? tagged.filter((p) => p.duration > EPS)
+    : dedupePlan(tagged, { preserveGroups: splitOutput });
+  return { plan: finalPlan, warnings };
+}
+
+/**
+ * 给每个计划项打上"导出分组"（`outGroup`）。
+ *
+ * 默认一条保留区间 = 一个文件（outGroup = keepIndex）。用户在时间轴上把连续多段
+ * 并成"同一次导出"时，这些 keep 带同一个 `group`，它们的计划项就共享一个 outGroup，
+ * 于是 concat 之后只写一个文件——这就是「多段合并导出」的全部机制：
+ * 不额外写拼接逻辑，只是把分组键从"区间"换成"区间组"。
+ *
+ * 键用字符串前缀区分两种来源（`k3` / `g1`），避免用户分组 id 与 keepIndex 撞号。
+ */
+function tagOutputGroups(plan, keeps) {
+  let any = false;
+  for (const k of keeps) if (k && k.group != null) { any = true; break; }
+  for (const p of plan) {
+    const k = keeps[p.keepIndex];
+    p.outGroup = !any || !k || k.group == null ? `k${p.keepIndex}` : `g${k.group}`;
+  }
+  return plan;
 }
 
 /** t 处正好是关键帧吗？ */
@@ -573,8 +624,17 @@ function lastKeyframeAtMost(t, keyframes) {
  *    ffmpeg 流拷贝会直接跳到下一个关键帧，中间整段 GOP 全空（实测少几十秒内容，
  *    而总时长被 `-t` 补回来，自检照样看不出来）。所以重叠时改截前一段。
  *  - 重编码段起点随便挪（它能从任意时刻起），所以后段是重编码时仍按老办法对齐到前段末尾。
+ *
+ * `opts.preserveGroups`（2026-10-18，「每段一个文件」）：**绝不跨保留区间合并**。
+ * 同类型吸收的本意是消除重复/零长段，但它只看"时间上相邻"，不看"属于哪条保留区间"——
+ * 两条用户切开的相邻片段（各带自己的 keepIndex）一旦被吸收成一段，分组就少一组，
+ * 产物变成"一段包含所有片段的完整视频"。所以分组导出时只允许**同一组内**合并。
  */
-function dedupePlan(plan) {
+function dedupePlan(plan, opts = {}) {
+  const preserveGroups = !!opts.preserveGroups;
+  // 合并边界 = 输出分组：默认一条区间一组；「多段合并导出」时同组几段可以互相吸收。
+  // 用 outGroup（已打好）而不是 keepIndex——分组是用户意图，keepIndex 只是内部编号。
+  const sameGroup = (a, b) => !preserveGroups || a.outGroup === b.outGroup;
   const out = [];
   for (const raw of plan) {
     let prev = out[out.length - 1];
@@ -585,7 +645,7 @@ function dedupePlan(plan) {
     const prevEnd = prev.start + prev.duration;
     const itemEnd = raw.start + raw.duration;
 
-    if (prev.kind === raw.kind && raw.start <= prevEnd + EPS) {
+    if (prev.kind === raw.kind && raw.start <= prevEnd + EPS && sameGroup(prev, raw)) {
       // 同类型：吸收后段新增的部分（可能重叠，不重复计算时长）
       prev.duration = Math.max(prev.duration, itemEnd - prev.start);
       prev.keepEnd = Math.max(prev.keepEnd, raw.keepEnd);
@@ -594,7 +654,7 @@ function dedupePlan(plan) {
       continue;
     }
 
-    if (raw.start < prevEnd - EPS && raw.kind === 'copy' && raw.start > prev.start + EPS) {
+    if (raw.start < prevEnd - EPS && raw.kind === 'copy' && raw.start > prev.start + EPS && sameGroup(prev, raw)) {
       // 后段是拷贝段：把它起点保住，反过来把前一段截断到关键帧处
       prev.duration = snap(raw.start - prev.start);
       prev.frames = null;
@@ -609,7 +669,7 @@ function dedupePlan(plan) {
       continue;
     }
 
-    if (raw.start < prevEnd - EPS) {
+    if (raw.start < prevEnd - EPS && sameGroup(prev, raw)) {
       // 不同类型且重叠：后段起点对齐到前段结束时刻
       const newStart = Math.min(prevEnd, itemEnd);
       if (itemEnd - newStart <= EPS) continue; // 整段被前段覆盖，丢弃

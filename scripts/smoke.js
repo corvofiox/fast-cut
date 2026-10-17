@@ -837,11 +837,71 @@ async function main() {
       names.some((t) => t.includes('帧数符合切割计划')), names.join('、').slice(0, 200));
   }
 
-  const groups = await js(win, 'new Set(__smoke.state.plan.plan.map((p) => p.keepIndex)).size');
+  // 「每段一个文件」的分组数必须来自**预览计划**（和导出一致），不能拿 keepIndex 数凑。
+  // 注意：分组数取决于 optSplit（split 时相邻区间才不被并掉），所以必须先切勾选、等计划回来再读。
   await js(win, `__smoke.setOption('optSplit', true); __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'split'); 'ok'`);
+  await wait(400);
+  const splitInfo = JSON.parse(await js(win, `JSON.stringify({
+    groups: __smoke.state.plan.groups,
+    clips: __smoke.state.clips.length,
+    split: __smoke.state.plan.split,
+  })`));
+  const groups = splitInfo.groups;
+  res = await runExport(win);
+  check('每段一个文件通过自检', res.ok && res.outputs.length === groups,
+    `${res.detail}（计划 ${groups} 组 / ${splitInfo.clips} 段）`);
+
+  // 后面的相邻/合并专项会替换 clips，先记下来，做完还原，免得污染后面的检查
+  const savedClips = JSON.parse(await js(win, 'JSON.stringify(__smoke.state.clips)'));
+
+  // 9-split-adjacent) 只分割不删除时（相邻区间）也必须一段一个文件。
+  // 这正是用户报的失效：相邻区间被并成一条，产物只剩一段完整视频。
+  await js(win, `(() => {
+    const dur = __smoke.state.src.media.duration;
+    __smoke.state.clips = [
+      { start: 0, end: dur / 3 },
+      { start: dur / 3, end: (dur / 3) * 2 },
+      { start: (dur / 3) * 2, end: dur },
+    ];
+    __smoke.relayout(); __smoke.syncTimeline();
+    return 'ok';
+  })()`);
+  await wait(400);
+  const adj = JSON.parse(await js(win, `JSON.stringify({
+    groups: __smoke.state.plan.groups, clips: __smoke.state.clips.length,
+    kept: __smoke.state.plan.keeps.length,
+  })`));
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'adj'); 'ok'`);
   await wait(250);
   res = await runExport(win);
-  check('每段一个文件通过自检', res.ok && res.outputs.length === groups, `${res.detail}（计划 ${groups} 组）`);
+  check('相邻片段（只分割不删除）也一段一个文件',
+    adj.groups === adj.clips && adj.kept === adj.clips && res.ok && res.outputs.length === adj.clips,
+    `计划 ${adj.groups} 组 / keeps ${adj.kept} / 导出 ${res.outputs.length} 个（期望 ${adj.clips}）· ${res.detail}`);
+
+  // 9-merge) 多段合并导出：把第 1、2 段并成一组，应只出 2 个文件（而不是 3 个）
+  await js(win, `(() => {
+    __smoke.state.clips[0].group = 1;
+    __smoke.state.clips[1].group = 1;
+    __smoke.syncTimeline();
+    return 'ok';
+  })()`);
+  await wait(400);
+  const merged = JSON.parse(await js(win, `JSON.stringify({ groups: __smoke.state.plan.groups })`));
+  await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'merged'); 'ok'`);
+  await wait(250);
+  res = await runExport(win);
+  check('多段合并导出：并成一组的两段拼进同一个文件',
+    merged.groups === 2 && res.ok && res.outputs.length === 2,
+    `计划 ${merged.groups} 组 · 导出 ${res.outputs.length} 个（期望 2）· ${res.detail}`);
+
+  // 还原：clips 回到本段检查开始时的状态（去掉 group），后面的检查都依赖它
+  await js(win, `(() => {
+    __smoke.state.clips = ${JSON.stringify(savedClips)};
+    for (const c of __smoke.state.clips) delete c.group;
+    __smoke.relayout(); __smoke.syncTimeline();
+    return 'ok';
+  })()`);
+  await wait(350);
   await js(win, `__smoke.setOption('optSplit', false); 'ok'`);
   await wait(250);
 

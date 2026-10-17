@@ -179,7 +179,12 @@ async function makeTempDir(anchorPath, prefix = '.fast-cut-tmp-') {
  * UI 要在导出前显示真实的入点/代价、主进程要查重名，都走这里，保证和真正导出同一套算法。
  */
 function planFor(loaded, segments, opts = {}) {
-  const keeps = opts.ordered ? orderPreserving(segments) : normalizeSegments(segments);
+  const splitOutput = !!opts.split;
+  const keeps = opts.ordered
+    ? orderPreserving(segments)
+    // split（「每段一个文件」）必须保留首尾相接的边界：相邻两段各是用户切出来的一份素材，
+    // 并成一段分组就没了（产物变成"一段包含所有片段的完整视频"，用户实测报的失效）
+    : normalizeSegments(segments, { keepAdjacent: splitOutput });
   const { plan, warnings } = buildPlan(keeps, {
     keyframes: loaded.media.keyframes,
     // media.video.fps 是 avg_frame_rate（实测帧数/时长），VFR 源也得用它折帧数：
@@ -218,6 +223,8 @@ function planFor(loaded, segments, opts = {}) {
     forceWholeReencode: loaded.media.segmentsOk === false,
     // precise=false → 吸附模式：入点前移到关键帧整段流拷贝（防吞钳制在 buildPlan 里）
     precise: opts.precise !== false,
+    // 「每段一个文件」：dedupePlan 不得跨保留区间合并，否则两条相邻片段会被并成一组
+    splitOutput,
   });
   const keepSecs = opts.ordered
     ? snap(keeps.reduce((acc, k) => acc + (k.end - k.start), 0))
@@ -227,7 +234,44 @@ function planFor(loaded, segments, opts = {}) {
    * 字幕按文本重新计时要拿它做减法，否则每条 cue 都比口型晚半帧（见 cuttings.frameStart）。
    */
   const keepAligns = keeps.map((k) => frameStart(k.start, loaded.media.video?.fps, loaded.media.gridOrigin));
-  return { keeps, plan, warnings, keepSecs, keepAligns };
+  /**
+   * 片段 → 保留区间的对应表（界面按**片段序号**取代价与吸附差，计划按 keepIndex 打标）。
+   *
+   * 平时两者一一对应（clips[i] ↔ keeps[i]），但「多段合并导出」会把同组的相邻片段
+   * 在规整阶段并成一条 keep，keeps 就比 clips 短了；这时仍按序号硬对会让后面的片段
+   * 全部错位（实测第 3 段显示"待计划"，因为它去查 keepIndex=2 而计划里只有 0/1）。
+   * 所以这里按源区间把每个片段映射回它实际落进的那条 keep。
+   */
+  const clipToKeep = mapClipsToKeeps(segments, keeps, { ordered: !!opts.ordered });
+  return { keeps, plan, warnings, keepSecs, keepAligns, clipToKeep };
+}
+
+/**
+ * 片段 → keepIndex 的映射。
+ *
+ * 判据是"片段的源起点落在哪条 keep 里"（同组相邻片段被并成一条 keep 时，
+ * 组内每段都指向那一条）。找不到（片段被源尾裁剪掉等）就给 null，界面显示"待计划"。
+ *
+ * `ordered`（用户拖过顺序）时不能按源时刻找：keeps 的顺序就是数组顺序、内容可能任意重叠，
+ * 只能按序号一一对应——规整阶段是逐条保序的（orderPreserving），所以序号恒定可靠。
+ */
+function mapClipsToKeeps(segments, keeps, opts = {}) {
+  const list = segments || [];
+  if (opts.ordered) return list.map((_, i) => (i < keeps.length ? i : null));
+  return list.map((raw) => {
+    const start = Number(raw && raw.start);
+    if (!Number.isFinite(start)) return null;
+    let best = null;
+    for (let i = 0; i < keeps.length; i++) {
+      const k = keeps[i];
+      if (start >= k.start - 1e-3 && start < k.end - 1e-6) return i;
+      // 起点正好等于某条 keep 的终点（相邻边界）：归后一条
+      if (Math.abs(start - k.start) <= 1e-3) return i;
+      if (start < k.start) break;
+      best = i;
+    }
+    return best;
+  });
 }
 
 /**
@@ -258,7 +302,7 @@ async function exportSegments(loaded, segments, opts) {
   // containers 的家族对象（{family,label,ext}）；不传则 verify 退回"与源一致"判。
   const containerFamily = (typeof container === 'string' ? byId(container) || byExt(container) : container);
 
-  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, precise, dropSubtitles });
+  const { keeps, plan, warnings, keepSecs: totalKeep, keepAligns } = planFor(loaded, segments, { ordered, precise, dropSubtitles, split });
   if (keeps.length === 0) throw new Error('没有有效的保留区间');
   if (plan.length === 0) throw new Error(`所有保留区间都落在源尾之后或不足一帧：${warnings.join('；') || '无计划段'}`);
 
@@ -394,24 +438,50 @@ async function exportSegments(loaded, segments, opts) {
       return f != null && cutFps ? f / cutFps : idxList.reduce((a, n) => a + plan[n].duration, 0);
     };
     const expectSlack = [];
-    // 每条保留区间在成片里的起点（拼接模式按全部区间累加）
+    /**
+     * 每条保留区间在**成片**里的起点（拼接模式按全部区间累加）。
+     *
+     * 必须逐**计划项**累加、给每个出现的 keepIndex 都记一次，不能按输出分组记
+     * （2026-10-18 修）：分组以前恒等于"一条区间"，按组记没错；但「多段合并导出」
+     * 让一个组里装了好几条区间，按组记就只给每组第一条记了位置，
+     * 后面几条的 progOfKeep 是 undefined → 字幕重排全挤到 0（非 split 路径会用到它）。
+     */
     const progOfKeep = {};
-    let cursor = 0;
-    for (const g of groups) {
-      const k = plan[g[0]].keepIndex;
-      if (k != null && progOfKeep[k] === undefined) progOfKeep[k] = cursor;
-      cursor += g.reduce((a, n) => a + plan[n].duration, 0);
+    {
+      let cursor = 0;
+      for (const p of plan) {
+        if (p.keepIndex != null && progOfKeep[p.keepIndex] === undefined) progOfKeep[p.keepIndex] = cursor;
+        cursor += p.duration;
+      }
     }
     const keepsOf = (idxList) => [...new Set(idxList.map((n) => plan[n].keepIndex).filter((k) => k != null))];
-    /** 重排字幕 sidecar：split 时每片只装自己那条区间的字幕，起点归零。 */
+    /**
+     * 某一组计划项里，每条保留区间在该组**自己那个文件**里的起点（成片时间，从 0 起）。
+     * 一条区间一组时就是 0；「多段合并导出」时后几段要接在前几段之后，
+     * 字幕重排与自检基准都靠这张表。
+     */
+    function groupKeepStarts(idxList) {
+      const ks = keepsOf(idxList);
+      const start = {};
+      let acc = 0;
+      for (const n of idxList) {
+        const k = plan[n].keepIndex;
+        if (k == null) { acc += plan[n].duration; continue; }
+        if (start[k] === undefined) start[k] = acc;
+        acc += plan[n].duration;
+      }
+      return { ks, start };
+    }
+    /** 重排字幕 sidecar：split 时每片只装自己那组区间的字幕，起点按组内位置。 */
     async function sidecarsFor(idxList, tag) {
       if (!subDocs) return { files: [], cues: null };
-      const ks = keepsOf(idxList);
       const files = [];
       const cues = [];
+      const { ks, start } = groupKeepStarts(idxList);
       for (const entry of subDocs) {
         const one = split
-          ? await writeRetimeSidecar(entry, ks.map((k) => keeps[k]), ks.map(() => 0), ks.map((k) => keepAligns[k]), tmpDir, tag)
+          ? await writeRetimeSidecar(entry, ks.map((k) => keeps[k]), ks.map((k) => start[k] || 0),
+            ks.map((k) => keepAligns[k]), tmpDir, tag)
           : await writeRetimeSidecar(entry, keeps, keeps.map((_, i) => progOfKeep[i] || 0), keepAligns, tmpDir, tag);
         if (one) { files.push(one.file); cues.push(one.cues); }
       }
@@ -419,7 +489,8 @@ async function exportSegments(loaded, segments, opts) {
     }
 
     if (split) {
-      // 需求文档 §4.3：「每段一个文件」= 每条保留区间一个文件。
+      // 需求文档 §4.3：「每段一个文件」= 一个导出分组一个文件。
+      // 默认一条保留区间一组；用户在时间轴上把几段并成一组时，那几段拼进同一个文件。
       // 入点不在关键帧上时一条区间会被切成"重编码小段 + 流拷贝段"，这里再把它们拼回同一个文件。
       for (let i = 0; i < groups.length; i++) {
         const files = groups[i].map((n) => partFiles[n]);
@@ -437,8 +508,9 @@ async function exportSegments(loaded, segments, opts) {
         wantCues.push(subs.cues);
         if (subs.cues) subTracks.push(subs.cues.length);
         seamsList.push(seamsOf(groups[i]));
-        const ki = plan[groups[i][0]].keepIndex;
-        userSecs.push(ki != null && keeps[ki] ? snap(keeps[ki].end - keeps[ki].start) : undefined);
+        // 该组的用户选区总长：合并组要把组内每条区间都算上
+        const ks = keepsOf(groups[i]);
+        userSecs.push(ks.length ? snap(ks.reduce((a, k) => a + (keeps[k] ? keeps[k].end - keeps[k].start : 0), 0)) : undefined);
       }
     } else {
       const subs = await sidecarsFor(plan.map((_, n) => n), 'all');
@@ -491,11 +563,22 @@ async function exportSegments(loaded, segments, opts) {
   }
 }
 
-/** 按保留区间给切割计划分组：plan 项的 keepIndex 由 cuttings.buildPlan 打标。 */
+/**
+ * 按**导出分组**给切割计划分组。
+ *
+ * 以前按 `keepIndex` 分组（一条保留区间一个文件）。现在计划项带 `outGroup`
+ * （cuttings.tagOutputGroups）：默认仍是"一条区间一组"，用户在时间轴上把几段
+ * 并成一组时，那几段共享同一个 outGroup —— 于是它们 concat 成一个文件，
+ * 这就是「多段合并导出」的实现方式（不新增拼接逻辑，只换分组键）。
+ *
+ * 兼容旧计划项（没有 outGroup）：退回 keepIndex。
+ */
 function groupByKeep(plan) {
   const groups = [];
   for (let i = 0; i < plan.length; i++) {
-    const key = plan[i].keepIndex == null ? groups.length : plan[i].keepIndex;
+    const p = plan[i];
+    const key = p.outGroup != null ? p.outGroup
+      : (p.keepIndex == null ? groups.length : p.keepIndex);
     let g = groups.find((x) => x.key === key);
     if (!g) { g = { key, items: [] }; groups.push(g); }
     g.items.push(i);
@@ -627,13 +710,28 @@ async function expectedCuesFromSource(bins, file, media, keeps, plan, groups, pr
     const ks = split
       ? [...new Set(groups[outIndex].map((n) => plan[n].keepIndex).filter((k) => k != null))]
       : keeps.map((_, k) => k);
+    /**
+     * 每条区间在该文件里的起点。split 下以前恒为 0（一条区间一个文件），
+     * 「多段合并导出」后一个文件里有好几条区间，必须按组内位置依次累加，
+     * 否则后几段的 cue 会全部挤到 0 附近、自检必然误报。
+     */
+    const baseOf = {};
+    if (split) {
+      let acc = 0;
+      for (const n of groups[outIndex]) {
+        const k = plan[n].keepIndex;
+        if (k == null) { acc += plan[n].duration; continue; }
+        if (baseOf[k] === undefined) baseOf[k] = acc;
+        acc += plan[n].duration;
+      }
+    }
     return cueLists.map((list) => {
       const out = [];
       for (const t of list) {
         const k = ks.find((ki) => t >= keeps[ki].start - 0.001 && t < keeps[ki].end);
         if (k === undefined) continue;
         const align = (aligns && Number.isFinite(aligns[k])) ? aligns[k] : keeps[k].start;
-        out.push(split ? t - align : (progOfKeep[k] || 0) + (t - align));
+        out.push(split ? (baseOf[k] || 0) + (t - align) : (progOfKeep[k] || 0) + (t - align));
       }
       return out.sort((a, b) => a - b);
     });

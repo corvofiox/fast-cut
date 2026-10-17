@@ -103,6 +103,8 @@
         <ul id="keepList" class="keeps"></ul>
         <div id="planHints" class="hints"></div>
         <div class="keep-tools">
+          <button id="btnMergeGroup" class="btn tiny" disabled title="按住 Ctrl 点选至少两段，就能把这几段并成一次导出">并成一段导出</button>
+          <button id="btnUnmergeGroup" class="btn tiny" disabled title="拆开选中片段所在的分组">拆开</button>
           <span class="grow"></span>
           <span id="keepTotal" class="tc dim"></span>
         </div>
@@ -134,7 +136,7 @@
     <label class="m-row">
       <span class="m-label">每段一个文件</span>
       <input type="checkbox" id="optSplit" />
-      <span class="m-sub">默认按顺序拼接成一个文件；勾选后依次命名 part01 / part02 / …</span>
+      <span class="m-sub">默认按顺序拼接成一个文件；勾选后每段一个文件（<code>-01</code> / <code>-02</code> / …）。在右侧把几段「并成一段导出」后，那一组算一个文件</span>
     </label>
     <div class="m-row">
       <span class="m-label">输出目录</span>

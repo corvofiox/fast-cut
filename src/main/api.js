@@ -371,13 +371,23 @@ function previewPlan(payload) {
   const segments = sanitizeSegments(payload.segments);
   // 先定目标封装：字幕装不装得下会影响自检的比对口径
   const target = targetFor(payload.container, loaded, path.resolve(String(payload.file)));
-  const { plan, warnings, keeps, keepSecs } = planFor(loaded, segments, {
+  const split = !!payload.split;
+  const { plan, warnings, keeps, keepSecs, clipToKeep } = planFor(loaded, segments, {
     ordered: isReordered(segments),
     dropSubtitles: target.dropSubtitles,
     precise: payload.precise === undefined ? true : !!payload.precise,
+    // 「每段一个文件」会改变分组边界（相邻片段不得被并成一组），预览必须和导出一致
+    split,
   });
+  const groups = groupByKeep(plan);
   return {
     plan, warnings, keeps, keepSecs, ordered: isReordered(segments),
+    // 片段 → 保留区间：合并组把几段并成一条 keep 后，界面必须按它查代价与吸附差
+    clipToKeep,
+    // 分组（「每段一个文件」按它出文件）：界面显示"N 个文件"必须用这个数。
+    // 拼接模式下产物恒为一个文件，所以这里回 1 —— 分组只在 split 时才有意义，
+    // 别让界面在拼接模式显示"2 个文件"却只写出一个。
+    split, groups: split ? groups.length : 1,
     // 回显本次计划用的切割模式：smoke 等它一致后再读时间轴的绘制统计，避免读到旧渲染
     precise: payload.precise === undefined ? true : !!payload.precise,
     // 字幕怎么办，界面要提前说：SRT/ASS 这类文本字幕重新计时；其余（位图、mov_text 等）重排不了（自检会拦）
@@ -403,7 +413,7 @@ function isReordered(segments) {
   return false;
 }
 
-/** 区间清洗：只接受有限非负数字，最多 200 段。 */
+/** 区间清洗：只接受有限非负数字，最多 200 段。`group` 是「并成一次导出」的分组号（可选）。 */
 function sanitizeSegments(segments) {
   if (!Array.isArray(segments)) throw new Error('区间参数格式错误');
   const out = [];
@@ -411,7 +421,11 @@ function sanitizeSegments(segments) {
     const start = Number(seg && seg.start);
     const end = Number(seg && seg.end);
     if (!Number.isFinite(start) || !Number.isFinite(end) || start < 0 || end <= 0) continue;
-    out.push({ start, end });
+    const one = { start, end };
+    // 分组号必须是整数：它只用来判"哪几段进同一个文件"，非整数一律当没分组
+    const g = Number(seg && seg.group);
+    if (Number.isInteger(g) && g >= 0) one.group = g;
+    out.push(one);
   }
   if (out.length === 0) throw new Error('没有有效的保留区间');
   return out;
@@ -513,7 +527,9 @@ async function startExport(win, payload) {
 /** 本次导出会写哪些文件：拼接模式 1 个，「每段一个文件」按保留区间各 1 个。 */
 function targetsFor(loaded, segments, outPath, ext, split, dropSubtitles, precise = true) {
   if (!split) return [outPath];
-  const { plan } = planFor(loaded, segments, { ordered: isReordered(segments), dropSubtitles, precise });
+  const { plan } = planFor(loaded, segments, {
+    ordered: isReordered(segments), dropSubtitles, precise, split,
+  });
   return groupByKeep(plan).map((_, i) => numbered(outPath, i, ext));
 }
 

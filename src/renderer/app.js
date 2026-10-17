@@ -16,8 +16,10 @@ const EPS = 1e-6;
 const state = {
   env: null,
   src: null,            // { file, media }
-  clips: [],            // [{start,end,ps,pe}] 源时间 + 成片时间，顺序即时间顺序
+  clips: [],            // [{start,end,ps,pe,group?}] 源时间 + 成片时间，顺序即时间顺序
   sel: -1,
+  selSet: [],           // 多选（含 sel）：把几段"并成一次导出"时用
+  groupSeq: 0,          // 分组号发号器（只增不减，撤销后复用也不会撞）
   rate: 1,              // 走带速率：正 = 正放，负 = 倒带（<video> 不接受负值，倒带走 seek 循环）
   plan: null,
   busy: false,
@@ -149,6 +151,19 @@ function keptSeconds() {
 }
 
 /**
+ * 片段序号 → 计划里的 keepIndex。
+ *
+ * 平时就是它自己；「多段合并导出」把同组相邻片段并成一条 keep 之后，
+ * keeps 比 clips 短，必须用主进程给的 clipToKeep 映射，否则后面的片段全部错位
+ * （实测第 3 段显示"待计划"：它去查 keepIndex=2，而计划里只有 0/1）。
+ */
+function keepIndexOf(clipIndex) {
+  const map = state.plan && state.plan.clipToKeep;
+  if (Array.isArray(map) && map.length > clipIndex && map[clipIndex] != null) return map[clipIndex];
+  return clipIndex;
+}
+
+/**
  * 每条保留段"实际从哪儿开始切"。剪辑位置是硬性要求，入点永不回溯，
  * 所以这张表只可能来自真实切割计划；计划还没回来时就是空的（界面显示"源 X–Y"，不加任何角标）。
  */
@@ -162,7 +177,19 @@ function snapMap() {
     // timeline 的多带可视化按"实际导出起点 < 片段源起点"判定，直接给 start 即可。
     map[p.keepIndex] = p.start;
   }
-  return map;
+  // 时间轴按**片段序号**取这张表，所以把 keepIndex 换成片段序号。
+  // 只映射"该 keep 的第一个片段"：多条片段并成一条 keep 时，只有第一条的起点是真正的
+  // 导出起点；后面的片段若也拿到同一个起点，`start - 导出起点` 就是它们之间的整段长度，
+  // 时间轴会画出一条假"多带"延伸块（实测精确模式下凭空多出 1 块 241px）。
+  const out = {};
+  const used = new Set();
+  for (let i = 0; i < state.clips.length; i++) {
+    const k = keepIndexOf(i);
+    if (k == null || used.has(k) || map[k] == null) continue;
+    used.add(k);
+    out[i] = map[k];
+  }
+  return out;
 }
 
 /**
@@ -188,7 +215,13 @@ function costMap() {
     // 换编码最严重，其次是"整段都在重编码"，再次是"只重编码入点那一小段"，最轻是纯拷贝
     map[ki] = f.codec ? 'codec' : f.reencode && !f.copy ? 'whole' : f.head ? 'head' : 'copy';
   }
-  return map;
+  // 同上：界面按片段序号取，换过来
+  const out = {};
+  for (let i = 0; i < state.clips.length; i++) {
+    const k = keepIndexOf(i);
+    if (map[k] != null) out[i] = map[k];
+  }
+  return out;
 }
 
 function countCost(cost) {
@@ -208,7 +241,7 @@ async function boot() {
     thumbEl: $('tlThumb'),
     callbacks: {
       onScrub: (srcT, progT, snap) => { onScrub(srcT, progT, snap); },
-      onSelect: (i) => { state.sel = i; renderClips(); },
+      onSelect: (i, additive) => { selectClip(i, additive); },
       onBoundary: (i, srcT) => trimBoundary(i, srcT),
       onBoundaryCommit: () => { pushHistory(); refreshPlan(); },
       onMergeBoundary: (i) => mergeBoundary(i),
@@ -912,10 +945,77 @@ function resetClips() {
 
 /** 删除入点→出点之间的素材：先切成三段，再删中间那段。 */
 
+// ---------------------------------------------------------------- 选择与分组
+
+/**
+ * 点选/多选片段。
+ *
+ * - 普通单击：单选，清空多选
+ * - Ctrl/⌘ 单击：加选/减选（把几段并成一次导出就靠它）
+ * - Shift 单击：从当前段扩选到目标段（连续几段一次选完）
+ */
+function selectClip(i, additive) {
+  if (i < 0 || i >= state.clips.length) return;
+  if (!additive) {
+    state.sel = i;
+    state.selSet = [i];
+  } else {
+    const set = new Set(state.selSet.length ? state.selSet : (state.sel >= 0 ? [state.sel] : []));
+    if (set.has(i)) {
+      // 再点一次取消。至少留一段被选，否则界面会出现"没选中任何段"的空状态
+      if (set.size > 1) set.delete(i);
+    } else {
+      set.add(i);
+    }
+    state.selSet = [...set].sort((a, b) => a - b);
+    state.sel = i;
+  }
+  tl.setSelection(state.selSet, state.sel);
+  renderClips();
+}
+
+/** 当前选中的片段序号（升序）。永远至少含 `state.sel`。 */
+function selectedIndices() {
+  const list = state.selSet.length ? state.selSet.slice() : (state.sel >= 0 ? [state.sel] : []);
+  return list.filter((i) => i >= 0 && i < state.clips.length).sort((a, b) => a - b);
+}
+
+/**
+ * 把选中的几段"并成一次导出"（或拆开）。
+ *
+ * 机制：给这些片段打同一个 `group` 号，导出时它们共享一个输出分组 ——
+ * concat 之后只写一个文件，这就是用户要的"多段合并成一段导出"。
+ * 拆开 = 清掉 group（回到"每段一个文件"）。
+ */
+function mergeSelected() {
+  const idx = selectedIndices();
+  if (idx.length < 2) { toast('先按住 Ctrl 点选至少两段，再合并成一段导出', 'warn'); return; }
+  // 分组号取这些片段里已有的最大号 +1，避免和别的组撞号
+  const gid = ++state.groupSeq;
+  for (const i of idx) state.clips[i].group = gid;
+  pushHistory();
+  syncTimeline();
+  toast(`已把 ${idx.length} 段并成一组：导出时会拼进同一个文件`);
+}
+
+/** 拆开选中片段所在的分组（清掉 group）。 */
+function unmergeSelected() {
+  const idx = selectedIndices();
+  const groups = new Set(idx.map((i) => state.clips[i].group).filter((g) => g != null));
+  if (!groups.size) { toast('选中的片段没有并入任何分组', 'warn'); return; }
+  for (const c of state.clips) if (c.group != null && groups.has(c.group)) delete c.group;
+  pushHistory();
+  syncTimeline();
+  toast('已拆开分组：这几段重新各出一个文件');
+}
+
 // ---------------------------------------------------------------- 撤销 / 重做
 
 function snapshot() {
-  return state.clips.map((c) => ({ start: c.start, end: c.end }));
+  // group 也要进快照：分组是用户的一次编辑动作，撤销必须能把它撤回
+  return state.clips.map((c) => (c.group == null
+    ? { start: c.start, end: c.end }
+    : { start: c.start, end: c.end, group: c.group }));
 }
 
 function pushHistory() {
@@ -932,6 +1032,7 @@ function stepHistory(delta, label) {
   state.clips = history.stack[next].map((c) => ({ ...c }));
   relayout();
   state.sel = clamp(state.sel, 0, state.clips.length - 1);
+  state.selSet = state.sel >= 0 ? [state.sel] : [];
   pb.index = state.sel;
   syncTimeline();
   toast(label === '撤销' ? '已撤销' : '已重做');
@@ -941,6 +1042,7 @@ function stepHistory(delta, label) {
 
 function syncTimeline(withPlan = true) {
   tl.setClips(state.clips, state.sel, snapMap());
+  tl.setSelection(selectedIndices(), state.sel);
   renderClips();
   updateEstimate();
   updateExportEnabled();
@@ -963,9 +1065,12 @@ async function runPlan() {
   try {
     const plan = await window.fc.previewPlan({
       file: state.src.file,
-      segments: state.clips.map((c) => ({ start: c.start, end: c.end })),
+      segments: state.clips.map((c) => (c.group == null
+        ? { start: c.start, end: c.end }
+        : { start: c.start, end: c.end, group: c.group })),
       container: containerChoice(),
       precise: isPreciseMode(),
+      split: $('optSplit').checked,
     });
     if (seq !== planSeq) return;   // 已有更新的请求在路上，这份过期了
     state.plan = plan;
@@ -980,6 +1085,7 @@ async function runPlan() {
   // HUD 凭空变空（smoke"磁吸关掉后片段边界仍然吸附"正是这么被打赢竞态的）。
   // HUD 语义是"最近一次拖放的磁吸结果"，与切割计划刷新无关，保住它。
   tl.setClips(state.clips, state.sel, snapMap());
+  tl.setSelection(selectedIndices(), state.sel);
   renderClips();
   updateEstimate();
   updateExportEnabled();
@@ -996,9 +1102,10 @@ function isPreciseMode() {
 function renderClips() {
   const ul = $('keepList');
   ul.innerHTML = '';
+  const groupNo = groupNumbers();
   state.clips.forEach((c, i) => {
     const li = document.createElement('li');
-    li.className = i === state.sel ? 'sel' : '';
+    li.className = (i === state.sel ? 'sel' : '') + (selectedIndices().length > 1 && selectedIndices().includes(i) ? ' multi' : '');
     const idx = document.createElement('span');
     idx.className = 'idx';
     idx.textContent = String(i + 1);
@@ -1014,7 +1121,8 @@ function renderClips() {
     const src = document.createElement('span');
     src.className = 'snap' + (cost && cost !== 'copy' ? ' lossy' : '');
     const label = { copy: '纯拷贝', head: '入点小段重编码', whole: '整段重编码', codec: '整段换编码' }[cost] || '待计划';
-    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`;
+    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`
+      + (c.group != null ? ` · 并入第 ${groupNo.get(c.group) || '?'} 个文件` : '');
     src.title = {
       copy: '整段流拷贝（不转码）',
       head: '入点那一小段有损重编码，其余仍流拷贝',
@@ -1023,11 +1131,34 @@ function renderClips() {
     }[cost] || '';
     li.appendChild(src);
 
-    li.addEventListener('click', () => { state.sel = i; tl.setSelected(i); seekProgram(c.ps); renderClips(); });
+    li.addEventListener('click', (e) => {
+      if (e.ctrlKey || e.metaKey || e.shiftKey) { selectClip(i, true); return; }
+      state.sel = i;
+      state.selSet = [i];
+      tl.setSelected(i);
+      tl.setSelection(state.selSet, i);
+      seekProgram(c.ps);
+      renderClips();
+    });
     ul.appendChild(li);
   });
   $('keepCount').textContent = String(state.clips.length);
   $('keepTotal').textContent = `合计 ${keptSeconds().toFixed(3)} s`;
+  // 分组工具条：多选时才能合并；有分组时才能拆开
+  const nSel = selectedIndices().length;
+  const anyGroup = state.clips.some((c) => c.group != null);
+  const btnMerge = $('btnMergeGroup');
+  const btnUnmerge = $('btnUnmergeGroup');
+  if (btnMerge) {
+    btnMerge.disabled = nSel < 2;
+    btnMerge.title = nSel < 2
+      ? '按住 Ctrl 点选至少两段，就能把这几段并成一次导出'
+      : `把选中的 ${nSel} 段并成一次导出（拼进同一个文件）`;
+  }
+  if (btnUnmerge) {
+    btnUnmerge.disabled = !anyGroup;
+    btnUnmerge.title = anyGroup ? '拆开选中片段所在的分组' : '当前没有合并的分组';
+  }
   const hints = $('planHints');
   hints.innerHTML = '';
   for (const w of (state.plan && state.plan.warnings) || []) {
@@ -1035,11 +1166,50 @@ function renderClips() {
     div.textContent = `⚠ ${w}`;
     hints.appendChild(div);
   }
+  // 有分组时把"哪几段拼进同一个文件"直接写出来：分组是用户自己做的编辑，
+  // 但导出前必须能一眼核对（分组跨了很远的两段时尤其容易记错）
+  const gmap = groupNumbers();
+  if (gmap.size) {
+    const parts = [];
+    for (const [gid, no] of gmap) {
+      const idx = state.clips.map((c, i) => (c.group === gid ? i + 1 : 0)).filter(Boolean);
+      parts.push(`第 ${no} 个文件 ← 第 ${idx.join('、')} 段`);
+    }
+    const div = document.createElement('div');
+    div.className = 'hint-group';
+    div.textContent = `· 合并导出：${parts.join('；')}`;
+    hints.appendChild(div);
+  }
+}
+
+/** 分组 id → 显示序号（1 起，按首次出现顺序），与时间轴上的"组N"一致。 */
+function groupNumbers() {
+  const map = new Map();
+  let n = 0;
+  for (const c of state.clips) {
+    if (c.group == null || map.has(c.group)) continue;
+    map.set(c.group, ++n);
+  }
+  return map;
 }
 
 /** 预估行是 innerHTML 拼的，凡是来自文件元数据/主进程的字样都先过这一道。 */
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[ch]));
+}
+
+/** 「每段一个文件」会写出几个文件 = 分组数（计划还没回来时按片段自身的 group 数）。 */
+function outputFileCount() {
+  if (state.plan && Number.isInteger(state.plan.groups)) return state.plan.groups;
+  const seen = new Set();
+  let n = 0;
+  for (const c of state.clips) {
+    const key = c.group == null ? `c${n}` : `g${c.group}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    n++;
+  }
+  return n;
 }
 
 function updateEstimate() {
@@ -1056,7 +1226,7 @@ function updateEstimate() {
   const rate = state.src.media.bitRate || 8e6;
   const bytes = rate / 8 * estSecs * 1.05;
   const lines = [
-    `<b>${split ? state.clips.length : 1} 个文件</b> · 成片 <b>${tc(estSecs)}</b> · <b>${fmtBytes(bytes)}</b>`,
+    `<b>${split ? outputFileCount() : 1} 个文件</b> · 成片 <b>${tc(estSecs)}</b> · <b>${fmtBytes(bytes)}</b>`,
   ];
   const headN = countCost('head');
   const wholeN = countCost('whole');
@@ -1134,7 +1304,9 @@ function updateExportEnabled() {
 
 async function runExport() {
   if (!state.src || state.busy) return;
-  const segments = state.clips.map((c) => ({ start: c.start, end: c.end }));
+  const segments = state.clips.map((c) => (c.group == null
+    ? { start: c.start, end: c.end }
+    : { start: c.start, end: c.end, group: c.group }));
   if (!segments.length) return;
 
   const payload = {
@@ -1549,6 +1721,8 @@ function bindUi() {
   $('btnUndo').addEventListener('click', () => stepHistory(-1, '撤销'));
   $('btnRedo').addEventListener('click', () => stepHistory(1, '重做'));
   $('btnReset').addEventListener('click', resetClips);
+  $('btnMergeGroup').addEventListener('click', mergeSelected);
+  $('btnUnmergeGroup').addEventListener('click', unmergeSelected);
   $('btnSnapKf').addEventListener('click', toggleKeyframeSnap);
   $('btnFit').addEventListener('click', () => tl.fit());
   $('btnKeys').addEventListener('click', openKeys);
@@ -1681,6 +1855,13 @@ window.__smoke = {
   bindingFor,
   openKeys,
   resetClips,
+  // 分组（多段合并导出）与重排：smoke 用它把几段并成一组再验导出文件数
+  relayout,
+  syncTimeline,
+  selectClip,
+  mergeSelected,
+  unmergeSelected,
+  selectedIndices,
   undo: () => stepHistory(-1, '撤销'),
   redo: () => stepHistory(1, '重做'),
   programTotal,
