@@ -919,6 +919,12 @@ async function main() {
     listStarts: [...document.querySelectorAll('#keepList li')].map((e) => e.classList.contains('grp-start')),
     hint: [...document.querySelectorAll('#planHints .hint-grow')].map((e) => e.textContent),
     map: __smoke.state.plan.fileNoOfGroup,
+    // 文本瘦身（2026-10-18 用户反馈"文本太多"）：一行一段、代价短标签、警告条目可折叠
+    rowKids: [...document.querySelectorAll('#keepList li')].map((e) => e.children.length),
+    costs: [...document.querySelectorAll('#keepList li .cost')].map((e) => e.textContent),
+    warnRows: [...document.querySelectorAll('.hint-warns .wrow')].map((e) => e.className),
+    warnTexts: [...document.querySelectorAll('.hint-warns .wtxt')].map((e) => e.textContent),
+    warnCount: (__smoke.state.plan.warnings || []).length,
   })`));
   const shownNos = [...new Set(gnum.badges.filter(Boolean))];
   check('两组并存时组号唯一（不许都叫"组1"）',
@@ -935,6 +941,17 @@ async function main() {
   check('两组相邻时片段栏有组间分隔（不只靠颜色）',
     gnum.listStarts[0] === true && gnum.listStarts[3] === true,
     JSON.stringify(gnum.listStarts));
+  // 文本瘦身：曾把"源区间 + 代价"整行铺开，11 段就是 22 行时间码，代价标签还被右栏裁掉
+  check('片段栏一行一段（不再有整行的时间码第二行）',
+    gnum.rowKids.length > 0 && gnum.rowKids.every((n) => n === 5),
+    `每行子元素 ${JSON.stringify(gnum.rowKids)}（期望 5：序号/起点/时长/代价/组徽章）`);
+  check('代价是短标签且都渲染出来了',
+    gnum.costs.length === gnum.rowKids.length && gnum.costs.every((t) => t && t.length <= 6),
+    JSON.stringify(gnum.costs));
+  // 警告聚合：11 段同因不许铺成一堵墙（这里 6 段也应聚合成很少几条）
+  check('警告按原因聚合，不是一段一条',
+    gnum.warnCount <= 3 && gnum.warnRows.length === gnum.warnCount,
+    `计划 ${gnum.warnCount} 条 · 渲染 ${gnum.warnRows.length} 条\n${gnum.warnTexts.join('\n')}`);
 
   // 还原：clips 回到本段检查开始时的状态（去掉 group），后面的检查都依赖它
   await js(win, `(() => {

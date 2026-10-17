@@ -80,6 +80,42 @@ function buildPlan(keeps, opts) {
   let warnedSeamBroken = false;
 
   /**
+   * 警告收集器（2026-10-18 改）：同一类原因按**段**聚合，不再每段推一条几乎相同的长句。
+   *
+   * 起因：用户切了 11 段，其中 8 段的入点都不在关键帧上，右侧就出现 8 条
+   * "关键帧间隔比剪辑粒度粗（入点回溯到 …，会吃掉已删的 …）：这一段已自动改为局部精确…"
+   * ——说的是同一件事，只有秒数不同，读起来是一堵墙，反而盖住了真正需要注意的差异。
+   *
+   * 做法：`warnOnce(key, text, segs)` 按 key 归并；同类只在**第一次**写完整说明，
+   * 后续段只累加"哪几段"，最后统一把段号附在句尾。段号按 1 起（与界面一致）。
+   *
+   * 这样既不丢信息（哪几段受影响一目了然），也不再有 N 条同义长句。
+   */
+  const warnGroups = new Map();
+  const warnOnce = (key, text, segIdx) => {
+    let g = warnGroups.get(key);
+    if (!g) {
+      g = { text, segs: [] };
+      warnGroups.set(key, g);
+    }
+    // 允许传单个段号，也允许一次传一批（如"所有被裁末端的段"），统一摊平进列表
+    if (Array.isArray(segIdx)) {
+      for (const s of segIdx) if (s != null) g.segs.push(s);
+    } else if (segIdx != null) {
+      g.segs.push(segIdx);
+    }
+  };
+  /** 收尾：把归并结果摊平成字符串数组（保持首次出现顺序），同时留下结构化副本。 */
+  const warnItems = [];
+  const flushWarnings = () => {
+    for (const [key, g] of warnGroups) {
+      const segs = [...new Set(g.segs)].sort((a, b) => a - b);
+      const text = segs.length ? `${g.text}（第 ${segs.join('、')} 段）` : g.text;
+      warnings.push(text);
+      warnItems.push({ key, text, base: g.text, segs });
+    }
+  };
+  /**
    * [from, to) 之间有多少帧 = 会被导出的帧数。
    * 两头都按"第 N 帧的时刻 = N/fps"算，规则只有一条：**帧必须严格早于 to**。
    * 四舍五入有一半概率把 to 那一帧也算进来，接缝上就把同一帧导出两遍（head 的 to 是
@@ -144,12 +180,12 @@ function buildPlan(keeps, opts) {
     const start = snap(keep.start);
     const end = Math.min(snap(keep.end), Number.isFinite(duration) ? duration : keep.end);
     if (end - start <= EPS) {
-      warnings.push(`区间 ${keep.start.toFixed(3)}s–${keep.end.toFixed(3)}s 超出源尾，已忽略`);
+      warnOnce('over-tail', `有区间整段落在源尾之后，已忽略`, ki + 1);
       continue;
     }
     const wholeDur = span(start, end);
     if (wholeDur <= EPS) {
-      warnings.push(`区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 不足一帧，已忽略`);
+      warnOnce('too-short', '有区间不足一帧，已忽略', ki + 1);
       continue;
     }
     // 吸附模式跨界自动降级标记：本条保留区间走了"局部精确"兜底时置位，
@@ -171,12 +207,10 @@ function buildPlan(keeps, opts) {
     if (forceWholeReencode && sameCodec) {
       if (!warnedSeamBroken) {
         warnedSeamBroken = true;
-        warnings.push(
+        warnOnce('seam-broken',
           '源的关键帧不是自包含随机接入点（实测：从它流拷贝出来的片段自己就解不开，'
           + '报 "Missing reference picture" / "mmco: unref short failure"）——'
-          + '这类源的每个片段都改为整段重编码（有损，但可解码、切点精确）。'
-          + '常见于 x264 的开放 GOP（open-gop=1）编码',
-        );
+          + '每个片段都改为整段重编码（有损，但可解码、切点精确）。常见于 x264 开放 GOP（open-gop=1）');
       }
       plan.push({
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
@@ -185,7 +219,6 @@ function buildPlan(keeps, opts) {
       });
       continue;
     }
-
     /**
      * 可变帧率源：帧长本身就不均匀，"按帧数切"出来的时长和音频对不上
      * （实测 VFR 源每条区间视频比音频短 0.3~0.5s，自检判音画不一致）。
@@ -194,7 +227,7 @@ function buildPlan(keeps, opts) {
     if (forceReencode) {
       if (!warnedVfr) {
         warnedVfr = true;
-        warnings.push('源是可变帧率（VFR）：帧长不均匀，流拷贝按帧数切会对不准时长——这段改为整段重编码（有损，输出为定帧率）');
+        warnOnce('vfr', '源是可变帧率（VFR）：帧长不均匀，流拷贝按帧数切会对不准时长——这些段整段重编码为定帧率（有损）');
       }
       plan.push({
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
@@ -254,18 +287,16 @@ function buildPlan(keeps, opts) {
        */
       const coincide = placedCopy.find((p) => Math.abs(snapStart - p.start) <= EPS && snapStart < start - EPS);
       if (coincide && sameCodec) {
-        warnings.push(
-          `这一段的吸附起点（${snapStart.toFixed(3)}s）与上一段拷贝段的起点是同一个关键帧：`
-          + '直接吸附会把同一段画面重复导出两遍，所以这一段改为局部精确——入点那一小段重编码，其余仍流拷贝',
-        );
+        warnOnce('snap-coincide',
+          '有片段的吸附起点与上一段拷贝段落在同一个关键帧上：直接吸附会把同一段画面导出两遍，'
+          + '这些段改为局部精确（入点那一小段重编码，其余仍流拷贝）', ki + 1);
         autoDegrade = true;
         autoNote = '吸附起点与上一段重合，自动局部精确';
       } else if (coincide) {
         // 换编码源不能混拼：吸附会把整段已删的间隙带回来，只能整段重编码
-        warnings.push(
-          `这一段的吸附起点（${snapStart.toFixed(3)}s）与上一段拷贝段的起点是同一个关键帧，`
-          + `而源编码没有同编码重编码器（不能混拼）：这一段整段重编码`,
-        );
+        warnOnce('snap-coincide-nocodec',
+          '有片段的吸附起点与上一段拷贝段落在同一个关键帧上，而源编码没有同编码重编码器（不能混拼）：'
+          + '这些段整段重编码', ki + 1);
         plan.push({
           kind: 'reencode', role: 'whole', start, duration: wholeDur,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, codecChange: true, autoPrecise: true,
@@ -275,26 +306,24 @@ function buildPlan(keeps, opts) {
       }
       // 开放 GOP 的非首个拷贝段：接缝必须由 IDR 重置 POC，走局部精确（见上方 needIdrSeam 注释）
       if (needIdrSeam && sameCodec && !crosses) {
-        warnings.push(
-          `源是 HEVC 开放 GOP（全片只有一个 IDR，其余是 CRA）：第二个及以后的片段若也整段流拷贝，`
-          + `接缝处 POC 不重置、解码报 "Duplicate POC"（实测接缝后会出现源里不存在的坏帧）。`
-          + `这一段已自动改为局部精确——入点那一小段（≤ 一个关键帧间隔）重编码以重置 POC，其余仍流拷贝`,
-        );
+        warnOnce('snap-opengop',
+          '源是开放 GOP（全片只有一个 IDR，其余是 CRA）：第二个及以后的片段若整段流拷贝，'
+          + '接缝处 POC 不重置、解码报 "Duplicate POC"（实测会解出源里不存在的坏帧）。'
+          + '这些段改为局部精确——入点那一小段（≤ 一个关键帧间隔）重编码以重置 POC，其余仍流拷贝', ki + 1);
         autoDegrade = true;
         autoNote = '开放 GOP 接缝需重置 POC，自动局部精确';
       }
       if (crosses && sameCodec) {
-        warnings.push(
-          `关键帧间隔比剪辑粒度粗（入点回溯到 ${snapStart.toFixed(3)}s，会吃掉已删的 ${(swallow.start + swallow.duration - snapStart).toFixed(3)}s）：这一段已自动改为局部精确（入点一小段重编码，其余仍流拷贝）`,
-        );
+        warnOnce('snap-swallow',
+          '关键帧间隔比剪辑粒度粗：有片段的入点回溯会吃掉已删的间隙，'
+          + '这些段改为局部精确（入点一小段重编码，其余仍流拷贝）', ki + 1);
         // 落下去走下面的局部精确分支，并打上自动降级标记
         autoDegrade = true;
         autoNote = '关键帧比剪辑粒度粗，自动局部精确';
       } else if (crosses) {
-        warnings.push(
-          `关键帧间隔比剪辑粒度粗：入点回溯到 ${snapStart.toFixed(3)}s 会带回已删的 ${(swallow.start + swallow.duration - snapStart).toFixed(3)}s；`
-          + '源编码没有同编码重编码器，这一段整段重编码（不混拼）',
-        );
+        warnOnce('snap-swallow-nocodec',
+          '关键帧间隔比剪辑粒度粗：有片段的入点回溯会把已删的间隙带回来，'
+          + '而源编码没有同编码重编码器（不混拼）：这些段整段重编码', ki + 1);
         plan.push({
           kind: 'reencode', role: 'whole', start, duration: wholeDur,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, codecChange: true,
@@ -313,9 +342,9 @@ function buildPlan(keeps, opts) {
           if (clamped !== null && clamped < end - EPS) {
             const part = copyPart(clamped, end);
             if (part.duration > EPS) {
-              warnings.push(
-                `吸附会与另一段的拷贝段在源上重叠（原回溯到 ${snapStart.toFixed(3)}s，与 [${overlap.start.toFixed(3)}–${right.toFixed(3)}] 交叠）：本段吸附起点钳到关键帧 ${clamped.toFixed(3)}s（少 ${(clamped - keep.start).toFixed(3)}s 片段开头）`,
-              );
+              warnOnce('snap-overlap-clamp',
+                '有片段的吸附区间与已排拷贝段在源上重叠：这些段的吸附起点已钳到重叠段之后的关键帧'
+                + '（代价是各自少一点片段开头，内容不会重复导出）', ki + 1);
               plan.push({
                 kind: 'copy', role: 'whole', start: clamped, duration: part.duration, frames: part.frames,
                 snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, trimmed: part.trimmed,
@@ -325,10 +354,9 @@ function buildPlan(keeps, opts) {
               continue;
             }
           }
-          warnings.push(
-            `吸附会让拷贝段在源上重叠（回溯到 ${snapStart.toFixed(3)}s 与 [${overlap.start.toFixed(3)}–${right.toFixed(3)}] 交叠），且无法避开`
-              + (sameCodec ? '：这一段整段重编码' : '；源编码没有同编码重编码器，整段重编码（不混拼）'),
-          );
+          warnOnce('snap-overlap-whole',
+            '有片段的吸附区间与已排拷贝段在源上重叠且避不开：这些段整段重编码'
+            + (sameCodec ? '（同编码）' : '（源编码没有同编码重编码器，不混拼）'), ki + 1);
           plan.push({
             kind: 'reencode', role: 'whole', start, duration: wholeDur,
             snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, autoPrecise: true,
@@ -365,7 +393,7 @@ function buildPlan(keeps, opts) {
             }
             continue;
           }
-          warnings.push(`区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 与关键帧对齐后为空，已忽略`);
+          warnOnce('snap-empty', '有区间与关键帧对齐后为空，已忽略', ki + 1);
           continue;
         }
       }
@@ -396,11 +424,10 @@ function buildPlan(keeps, opts) {
           const head = span(start, kfNext);
           const tailPart = copyPart(kfNext, end);
           if (tailPart.duration > EPS) {
-            warnings.push(
-              `入点在关键帧上、但前面还有别的片段：开放 GOP 的拷贝段接拷贝段会在接缝处报 `
-              + `"Could not find ref"（实测）。这一段改为局部精确——入点一小段（≤ 一个关键帧间隔）`
-              + `重编码以重置参考序号，其余仍流拷贝`,
-            );
+            warnOnce('precise-seam',
+              '有片段的入点在关键帧上、但前面还有别的片段：开放 GOP 的拷贝段接拷贝段会在接缝处报 '
+              + '"Could not find ref"（实测）。这些段改为局部精确——入点一小段（≤ 一个关键帧间隔）'
+              + '重编码以重置参考序号，其余仍流拷贝', ki + 1);
             plan.push({
               kind: 'reencode', role: 'head', start, duration: head,
               snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, autoPrecise: true,
@@ -416,9 +443,9 @@ function buildPlan(keeps, opts) {
           }
         }
         // 拆不出头尾（区间太短/后面没有关键帧）：落下去整段重编码，同样自带 IDR
-        warnings.push(
-          `入点在关键帧上、但前面还有别的片段，且这段太短拆不出"重编码头+拷贝尾"：整段重编码保证接缝可解码`,
-        );
+        warnOnce('precise-seam-whole',
+          '有片段的入点在关键帧上、但前面还有别的片段，且太短拆不出"重编码头+拷贝尾"：'
+          + '这些段整段重编码以保证接缝可解码', ki + 1);
         plan.push({
           kind: 'reencode', role: 'whole', start, duration: wholeDur,
           snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, autoPrecise: true,
@@ -444,7 +471,7 @@ function buildPlan(keeps, opts) {
     }
 
     if (keyframes.length === 0) {
-      warnings.push(`没有可用关键帧索引：区间 ${start.toFixed(3)}s–${end.toFixed(3)}s 整段重编码以保证剪辑精确`);
+      warnOnce('no-keyframes', '没有可用关键帧索引：这些区间整段重编码以保证剪辑精确', ki + 1);
       plan.push({
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
         snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki,
@@ -456,10 +483,9 @@ function buildPlan(keeps, opts) {
     // 没有对应的同编码重编码器时，重编码段与拷贝段混拼会把帧率/时长全弄乱
     // （实测 mpeg2 .ts：5.9s 选区拼出 35.8s、avg_frame_rate 60/1）。整段重编码，编码改变。
     if (!sameCodec) {
-      warnings.push(
-        `入点 ${start.toFixed(3)}s 不在关键帧上，而源编码没有同编码的重编码器：`
-        + `这一段整段重编码，导出编码会与源不同（有损，且不流拷贝）`,
-      );
+      warnOnce('no-same-codec',
+        '有片段的入点不在关键帧上，而源编码没有同编码的重编码器：这些段整段重编码，'
+        + '导出编码会与源不同（有损，且不流拷贝）', ki + 1);
       plan.push({
         kind: 'reencode', role: 'whole', start, duration: wholeDur,
         snapFrom: keep.start, keepEnd: keep.end, keepIndex: ki, codecChange: true,
@@ -517,13 +543,15 @@ function buildPlan(keeps, opts) {
 
   const trimmedN = plan.reduce((a, p) => Math.max(a, p.trimmed || 0), 0);
   if (trimmedN > 0) {
-    warnings.push(
+    warnOnce('bframe-trim',
       `源含双向预测帧（B 帧，重排 ${trimmedN} 帧）：流拷贝只能按解码序收尾，`
-      + `每个裁剪末端会少导 ${trimmedN} 帧（约 ${(trimmedN / (fpsNum || 30) * 1000).toFixed(0)}ms）——`
-      + '宁可短也不把你已经删掉的素材带回来；要末端也一帧不差只有一条路——这一段一直切到源尾'
-      + '（实测把出点挪到关键帧上免不掉这个余量：2s→4s 两个关键帧之间照样少给 2 帧）',
-    );
+      + `每个裁剪末端会少导 ${trimmedN} 帧（约 ${(trimmedN / (fpsNum || 30) * 1000).toFixed(0)}ms）`
+      + '——宁可短也不把你已经删掉的素材带回来',
+      plan.filter((p) => p.trimmed > 0).map((p) => p.keepIndex + 1));
   }
+
+  // 归并收尾：同类原因只留一条，段号统一附在句尾
+  flushWarnings();
 
   /**
    * 这里曾经有「按段内关键帧数把被剥 RASL 从帧数预期里扣掉」的记账（2026-10-17 删除）。

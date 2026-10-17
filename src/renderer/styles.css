@@ -12,6 +12,14 @@
   --err: #e5534b;
   --keep: #2f6f4f;
   --keep-line: #57b981;
+  /* 选中态与多选态的强调色（2026-10-18 引入）：时间轴与右侧片段栏共用同一组，
+     两处观感必须一致。选中的青绿要"亮但不刺眼"，比纯白有层次；
+     多选的冷蓝与它色相拉开，两者同时出现也不会看错。 */
+  --sel: #6ef0c0;
+  --sel-soft: rgba(110, 240, 192, .35);
+  --sel-glow: rgba(110, 240, 192, .5);
+  --sel-halo: rgba(110, 240, 192, .16);
+  --multi: #9fd4ff;
 }
 
 * { box-sizing: border-box; }
@@ -208,29 +216,44 @@ html, body {
 /* 整块胶片都是拖拽改顺序的把手，所以光标直接给"可抓"的指示。
    **默认必须安静**（2026-10-18 改）：以前未选中也挂一圈绿色描边 + 内高光，
    一条时间轴上每块都在喊，选中态只多一圈更浅的绿，等于没有对比。
-   现在未选中只有极淡的暗边 + 轻微压暗（聚光灯），选中态才用白描边 + 顶部亮条 + 提亮。 */
+   现在未选中只有极淡的暗边 + 轻微压暗（聚光灯），选中态才亮起来。 */
 .seg {
   position: absolute; top: 0; height: 100%;
   background: linear-gradient(180deg, rgba(20, 24, 28, .10), rgba(20, 24, 28, .62));
   border: 1px solid rgba(255, 255, 255, .07); border-radius: 5px; cursor: grab; overflow: hidden;
   box-shadow: 0 1px 3px rgba(0, 0, 0, .5);
-  filter: brightness(.92);
+  filter: brightness(.92) saturate(.94);
   transition: border-color .1s, box-shadow .1s, filter .1s;
 }
 .seg:active { cursor: grabbing; }
 .seg:hover { border-color: rgba(255, 255, 255, .3); filter: brightness(1.04); }
 
-/* 选中：唯一"亮起来"的块。白描边 + 顶部亮条 + 双层外发光 + 恢复亮度。
-   三处同时变（边框/顶部条/亮度），任何底色、任何缩放下都跳得出来。 */
+/* 选中：不再用纯白（2026-10-18，用户反馈"纯白太素"）。
+   改用**青绿强调色**做主色：描边 + 顶部亮条 + 底部投影都是同一色系，
+   再叠一层外发光与提亮。有色彩层次，又和"组色"（时间轴左侧的组标识）不冲突——
+   选中说的是"你正在编辑这一段"，组色说的是"这段和谁一起导出"，两个维度各说各的。 */
 .seg.sel {
-  border-color: #ffffff;
-  box-shadow: 0 0 0 1px #ffffff, 0 0 12px 2px rgba(255, 255, 255, .38), 0 2px 10px rgba(0, 0, 0, .6);
-  filter: brightness(1.16) saturate(1.08);
+  border-color: var(--sel, #6ef0c0);
+  box-shadow:
+    0 0 0 1px var(--sel, #6ef0c0),
+    0 0 14px 2px var(--sel-glow, rgba(110, 240, 192, .5)),
+    0 0 28px 6px var(--sel-halo, rgba(110, 240, 192, .16)),
+    inset 0 0 12px rgba(110, 240, 192, .14);
+  filter: brightness(1.2) saturate(1.14);
   z-index: 3;
 }
+/* 顶部亮条：从选中色渐变到透明，比一条死白线更有质感 */
 .seg.sel::before {
   content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px;
-  background: #ffffff; box-shadow: 0 0 8px rgba(255, 255, 255, .85); pointer-events: none;
+  background: linear-gradient(90deg, var(--sel, #6ef0c0), var(--sel-soft, rgba(110, 240, 192, .35)), var(--sel, #6ef0c0));
+  box-shadow: 0 0 10px var(--sel, #6ef0c0);
+  pointer-events: none;
+}
+/* 底部再来一条同色细线：上下夹住 = 整块被"框"住，比单边更明确 */
+.seg.sel::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--sel-soft, rgba(110, 240, 192, .35));
+  pointer-events: none;
 }
 .seg.moving { opacity: .35; border-style: dashed; }
 .seg .label {
@@ -244,22 +267,33 @@ html, body {
   border-color: var(--grp, #4fc3d9);
   background-image: linear-gradient(var(--grp-tint, rgba(79, 195, 217, .13)), var(--grp-tint, rgba(79, 195, 217, .13)));
 }
+/* 选中的组内块：保持选中色做主调，组色退到左上角一个小点（两个维度同时可见） */
 .seg.grp.sel {
-  border-color: #ffffff;
-  box-shadow: 0 0 0 1px #ffffff, 0 0 12px 2px rgba(255, 255, 255, .38), 0 2px 10px rgba(0, 0, 0, .6);
+  border-color: var(--sel, #6ef0c0);
+  box-shadow:
+    0 0 0 1px var(--sel, #6ef0c0),
+    0 0 14px 2px var(--sel-glow, rgba(110, 240, 192, .5)),
+    0 0 28px 6px var(--sel-halo, rgba(110, 240, 192, .16)),
+    inset 0 0 12px rgba(110, 240, 192, .14);
 }
-/* 多选：Ctrl/Shift 点出来的那几段。要能一眼数清"这次要并几段"——
-   用虚线白框 + 顶部虚线条，与"单选实心白框"区分开，两者同时出现也不混淆 */
+/* 多选：故意用**虚线 + 冷蓝**，与"单选实心青绿"一眼分开——
+   两者经常同时出现（正要把几段并成一组），必须不混淆 */
 .seg.multi {
-  border-color: rgba(255, 255, 255, .85);
+  border-color: var(--multi, #9fd4ff);
   border-style: dashed;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, .28), 0 0 8px 1px rgba(255, 255, 255, .2);
-  filter: brightness(1.12);
+  box-shadow: 0 0 0 1px rgba(159, 212, 255, .4), 0 0 10px 1px rgba(159, 212, 255, .28);
+  filter: brightness(1.14);
 }
 .seg.multi::before {
   content: ""; position: absolute; left: 0; right: 0; top: 0; height: 3px;
-  background: repeating-linear-gradient(90deg, #fff 0 5px, transparent 5px 10px);
+  background: repeating-linear-gradient(90deg, var(--multi, #9fd4ff) 0 5px, transparent 5px 10px);
   pointer-events: none;
+}
+/* 单选 + 多选同时命中的那块（它是多选集合里的一员，也是"当前段"）：
+   实心青绿描边 + 虚线蓝顶条，两个身份都看得见 */
+.seg.sel.multi {
+  border-color: var(--sel, #6ef0c0);
+  border-style: solid;
 }
 .seg .grp-badge {
   position: absolute; right: 5px; top: 2px; font-size: 10px; font-weight: 700;
@@ -267,9 +301,9 @@ html, body {
   pointer-events: none; text-shadow: 0 1px 3px #000, 0 0 6px rgba(0, 0, 0, .9); opacity: 0;
 }
 .seg.grp .grp-badge { opacity: 1; }
-.seg.sel .grp-badge, .seg.multi .grp-badge { top: 5px; }
+.seg.sel .grp-badge, .seg.multi .grp-badge { top: 6px; }
 .seg.grp .label { right: 36px; }
-.seg.sel .label, .seg.multi .label { top: 5px; }
+.seg.sel .label, .seg.multi .label { top: 6px; }
 
 .seg .drop { position: absolute; bottom: 3px; left: 5px; font-size: 10px; color: var(--accent-2); pointer-events: none; }
 .seg .handle { position: absolute; top: 0; bottom: 0; width: 11px; cursor: col-resize; z-index: 2; }
@@ -338,21 +372,31 @@ html, body {
 .info dd.ok { color: var(--ok); }
 .info dd.warn { color: var(--warn); }
 
-.keeps { list-style: none; margin: 6px 0 0; padding: 0; max-height: 220px; overflow-y: auto; }
+/* 一行放下全部信息（2026-10-18 用户反馈"文本太多"）：序号 · 起点 · 时长 · 代价 · 组徽章。
+   旧布局让"源区间 + 代价"独占一整行，11 段就是 22 行时间码。
+   列宽用 minmax(0,…) 并让代价/徽章 auto 固定：右栏不宽时**优先压时间码**，
+   绝不把最右边的代价标签裁掉（前一版就是被裁了才发现的）。 */
+.keeps { list-style: none; margin: 6px 0 0; padding: 0; max-height: 260px; overflow-y: auto; }
 .keeps li {
-  display: grid; grid-template-columns: auto 1fr auto auto; gap: 2px 6px;
+  display: grid; grid-template-columns: auto minmax(0, 1fr) auto auto auto; gap: 2px 7px;
   align-items: center; padding: 5px 6px; border-radius: 5px;
   border: 1px solid transparent; cursor: pointer; font-size: 12px;
   position: relative;
 }
 .keeps li:hover { background: var(--bg-2); }
-/* 选中：白描边 + 提亮，与时间轴同一套语言（未选中要安静，选中才跳出来） */
+/* 选中：与时间轴同一套语言（青绿强调色 + 提亮）。未选中安静，选中才亮起来。
+   片段栏底色本来就深，所以这里用"左侧粗条 + 描边 + 提亮"，比纯描边更清楚。 */
 .keeps li.sel {
-  background: #26332c; border-color: #ffffff;
-  box-shadow: 0 0 0 1px rgba(255, 255, 255, .5), 0 0 10px rgba(255, 255, 255, .12);
+  background: linear-gradient(90deg, rgba(110, 240, 192, .16), rgba(110, 240, 192, .05) 70%);
+  border-color: var(--sel, #6ef0c0);
+  box-shadow: 0 0 0 1px rgba(110, 240, 192, .35), 0 0 12px rgba(110, 240, 192, .16);
 }
-/* 多选：虚线白框，与"单选实心白框"区分 */
-.keeps li.multi { border-color: rgba(255, 255, 255, .7); border-style: dashed; background: #232c27; }
+.keeps li.sel .idx { color: var(--sel, #6ef0c0); font-weight: 700; }
+/* 多选：虚线 + 冷蓝，与"单选实心青绿"一眼分开（两者经常同时出现） */
+.keeps li.multi {
+  border-color: var(--multi, #9fd4ff); border-style: dashed;
+  background: rgba(159, 212, 255, .07);
+}
 
 /* 分组行：左侧一条该组颜色的竖条 + 极淡底纹，扫一眼就能分出"这几行是一伙的"。
    竖条用 ::before 画在行的左缘，不占布局宽度，也不和网格列打架。 */
@@ -369,22 +413,47 @@ html, body {
 }
 
 .keeps li .idx { color: var(--fg-dim); }
-.keeps li .tc { white-space: nowrap; }
-.keeps li .len { color: var(--fg-dim); }
+.keeps li .tc { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.keeps li .len { color: var(--fg-dim); text-align: right; }
 /* 组徽章：小药丸，颜色 = 该组颜色。没分组的行留空（不画"无"这种噪音） */
 .keeps li .gchip {
   font-size: 10px; font-weight: 700; line-height: 1.5; padding: 0 6px;
   border: 1px solid var(--line); border-radius: 9px; white-space: nowrap;
 }
 .keeps li .gchip.none { border: 0; padding: 0; width: 0; }
-.keeps li .snap { grid-column: 1 / -1; color: var(--fg-dim); font-size: 11px; }
-/* 入点不在关键帧上就要重编码一小段：这是有损的，得跟"纯拷贝"区分开 */
-.keeps li .snap.lossy { color: var(--warn); }
+/* 代价标签：一行内的短标签（纯拷贝=绿，有损=橙，待计划=灰）。
+   颜色沿用既有语义（和自检里的 ✓/✗、预估行的警告同色系），不新增要学的色。 */
+.keeps li .cost {
+  font-size: 10px; line-height: 1.6; padding: 0 5px; white-space: nowrap;
+  color: var(--ok); border: 1px solid rgba(79, 180, 119, .35); border-radius: 4px;
+  background: rgba(79, 180, 119, .08);
+}
+.keeps li .cost.lossy {
+  color: var(--warn); border-color: rgba(224, 163, 60, .38); background: rgba(224, 163, 60, .09);
+}
+.keeps li .cost.pending { color: var(--fg-dim); border-color: var(--line); background: transparent; }
 .keeps li .x { color: var(--fg-dim); border: 1px solid var(--line); border-radius: 4px; padding: 0 5px; }
 .keeps li .x:hover { color: var(--err); border-color: #6b3330; }
 .keeps .empty-row { display: block; color: var(--fg-dim); padding: 8px 6px; font-size: 12px; }
 
+/* 警告条目（2026-10-18）：可折叠、逐条成行。旧写法把同因的近十条长句直接铺开，
+   读起来是一堵墙（用户反馈"文本实在太多"）。现在条目多时默认只露一行，点开看全文。 */
+.wrow {
+  display: flex; gap: 6px; align-items: flex-start; cursor: default;
+  font-size: 11px; line-height: 1.55; padding: 2px 0;
+}
+.wrow .wmark { flex: 0 0 auto; color: var(--warn); }
+.wrow .wtxt { min-width: 0; }
+/* clipped：单行截断 + 省略号；点开（移除该类）显示全文 */
+.wrow.clipped { cursor: pointer; }
+.wrow.clipped .wtxt {
+  display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.wrow.clipped:hover .wtxt { color: #ffe6b8; }
+
 .hints { font-size: 11px; color: var(--warn); margin-top: 6px; }
+.hints .hint-warns { display: flex; flex-direction: column; }
 /* 合并导出的说明不是警告，用中性色，别和上面的 ⚠ 混成一片。
    每行前面一个小色块 = 该组的颜色，和徽章/时间轴描边对得上 */
 .hints .hint-group { margin-top: 4px; display: flex; flex-direction: column; gap: 2px; }
@@ -403,10 +472,11 @@ html, body {
 
 .warnbox, .errbox {
   font-size: 12px; border-radius: 6px; padding: 8px 10px; margin: 8px 10px;
-  white-space: pre-wrap; word-break: break-word; max-height: 170px; overflow-y: auto;
+  max-height: 170px; overflow-y: auto;
 }
 .warnbox { background: #2a2314; border: 1px solid #6a5320; color: #f0d9a8; }
-.errbox { background: #2b1817; border: 1px solid #6b3330; color: #f2b3ae; }
+.errbox { background: #2b1817; border: 1px solid #6b3330; color: #f2b3ae; white-space: pre-wrap; word-break: break-word; }
+.warnbox .wrow { font-size: 12px; }
 
 .checks { list-style: none; margin: 8px 10px; padding: 0; font-size: 12px; }
 .checks li { display: flex; gap: 6px; padding: 2px 0; align-items: baseline; }

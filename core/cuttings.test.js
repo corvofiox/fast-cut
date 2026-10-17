@@ -344,7 +344,7 @@ test('吸附防重叠：乱序下吸附拷贝段与已排拷贝段重叠时整�
     assert.ok(ov <= 1e-6, `拷贝段 ${i}/${j} 重叠 ${ov}s`);
   }
   assert.ok(plan.some((p) => p.keepIndex === 2 && p.kind === 'reencode'), '重叠段必须重编码');
-  assert.ok(warnings.some((w) => /交叠/.test(w)), warnings.join('、'));
+  assert.ok(warnings.some((w) => /重叠/.test(w)), warnings.join('、'));
 });
 
 test('吸附防吞钳制（换编码源）：跨界时整段重编码，不混拼也不吞', () => {

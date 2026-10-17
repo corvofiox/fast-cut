@@ -1124,12 +1124,20 @@ function renderClips() {
     const idx = document.createElement('span');
     idx.className = 'idx';
     idx.textContent = String(i + 1);
+    /**
+     * 一行只放**起点**（2026-10-18 用户反馈"文本太多"，且代价标签被面板右缘裁掉）。
+     *
+     * 旧写法 `00:00.000 → 00:01.267  1.267s` 把起点、终点、时长全写出了，
+     * 而"终点 = 起点 + 时长"是冗余信息——右栏本来就不宽，这三分之一宽度直接导致
+     * 最右边的代价标签被裁。现在只留起点 + 时长，终点进悬停提示。
+     */
     const time = document.createElement('span');
     time.className = 'tc';
-    time.textContent = `${tcShort(c.ps)} → ${tcShort(c.pe)}`;
+    time.textContent = tcShort(c.ps);
     const len = document.createElement('span');
     len.className = 'len tc';
     len.textContent = `${(c.end - c.start).toFixed(3)}s`;
+    const rowTitle = `第 ${i + 1} 段\n成片 ${tcShort(c.ps)} → ${tcShort(c.pe)}\n源 ${tcShort(c.start)} → ${tcShort(c.end)}（${(c.end - c.start).toFixed(3)}s）`;
     // 组徽章单独一列（不是塞进说明文字里）：扫一眼就能数清"这组几段、是第几个文件"
     const badge = document.createElement('span');
     badge.className = 'gchip';
@@ -1144,19 +1152,28 @@ function renderClips() {
       badge.classList.add('none');
     }
     li.append(idx, time, len, badge);
-
     const cost = costMap()[i];
-    const src = document.createElement('span');
-    src.className = 'snap' + (cost && cost !== 'copy' ? ' lossy' : '');
-    const label = { copy: '纯拷贝', head: '入点小段重编码', whole: '整段重编码', codec: '整段换编码' }[cost] || '待计划';
-    src.textContent = `源 ${tcShort(c.start)}–${tcShort(c.end)} · ${label}`;
-    src.title = {
+    /**
+     * 代价做成第一行末尾的一个小标签（2026-10-18 用户反馈"文本太多"）。
+     *
+     * 旧写法第二行整行写 `源 00:26:58.607–00:29:53.485 · 入点小段重编码`——第一行已经写了
+     * 成片区间，第二行再把源区间抄一遍，11 段就是 22 行时间码，真正要一眼扫到的
+     * "这段要不要重编码"反而被埋了。现在：源区间进悬停提示，代价压缩成一个短标签。
+     * 颜色沿用既有语义（纯拷贝=绿、有损=橙），不新增要学的颜色。
+     */
+    const lossy = cost && cost !== 'copy';
+    const chip = document.createElement('span');
+    chip.className = 'cost' + (lossy ? ' lossy' : '') + (cost ? '' : ' pending');
+    chip.textContent = { copy: '纯拷贝', head: '入点重编码', whole: '整段重编码', codec: '换编码' }[cost] || '待计划';
+    const costFull = {
       copy: '整段流拷贝（不转码）',
       head: '入点那一小段有损重编码，其余仍流拷贝',
       whole: '这一整段在同一个 GOP 内：有损重编码',
       codec: '整段重编码并更换编码格式',
-    }[cost] || '';
-    li.appendChild(src);
+    }[cost] || '计划还没算出来';
+    chip.title = `${rowTitle}\n源 ${tcShort(c.start)}–${tcShort(c.end)} · ${costFull}`;
+    li.append(chip);
+    li.title = chip.title;
 
     li.addEventListener('click', (e) => {
       if (e.ctrlKey || e.metaKey || e.shiftKey) { selectClip(i, true); return; }
@@ -1188,10 +1205,13 @@ function renderClips() {
   }
   const hints = $('planHints');
   hints.innerHTML = '';
-  for (const w of (state.plan && state.plan.warnings) || []) {
-    const div = document.createElement('div');
-    div.textContent = `⚠ ${w}`;
-    hints.appendChild(div);
+  const planWarns = (state.plan && state.plan.warnings) || [];
+  if (planWarns.length) {
+    // 与导出完成后的警告框同一套渲染：条目多时可折叠，别让 8 条同因长句铺成一面墙
+    const box = document.createElement('div');
+    box.className = 'hint-warns';
+    showWarnings(box, planWarns);
+    hints.appendChild(box);
   }
   // 有分组时把"哪几段拼进同一个文件"直接写出来：分组是用户自己做的编辑，
   // 但导出前必须能一眼核对（分组跨了很远的两段时尤其容易记错）。
@@ -1394,7 +1414,7 @@ async function runExport() {
     showChecks(res.results);
     const warnList = res.warnings || [];
     if (warnList.length) {
-      $('warnings').textContent = warnList.map((w) => `⚠ ${w}`).join('\n');
+      showWarnings($('warnings'), warnList);
       $('warnings').classList.remove('hidden');
     }
     $('resultRow').classList.remove('hidden');
@@ -1465,6 +1485,36 @@ function onProgress(evt) {
 function pctForItem() {
   const { index, total, ratio } = state.cut;
   return 2 + ((index + ratio) / Math.max(1, total)) * 86;
+}
+
+/**
+ * 警告的渲染（2026-10-18 改）：不再是一坨文字，改为**可折叠的条目**。
+ *
+ * 起因：用户切 11 段，其中 8 段同因，旧写法把 8 条近乎相同的长句直接铺开，读起来是一堵墙。
+ * 内核已把同因聚合成一条（见 cuttings.warnOnce），这里再补两件事：
+ *  1. 条目多了才折叠（>3 条），默认只露一行，点一下展开全文——想细看时不挡路；
+ *  2. 每条带一个"⚠"标记并各自成行，段号 `（第 3、5、7 段）` 自然落在同一行。
+ * 警告本来就不多时（≤3 条）不折叠：免得为看一句话还要点两下。
+ */
+function showWarnings(box, list) {
+  box.innerHTML = '';
+  const collapse = list.length > 3;
+  for (const w of list) {
+    const row = document.createElement('div');
+    row.className = 'wrow' + (collapse ? ' clipped' : '');
+    const mark = document.createElement('span');
+    mark.className = 'wmark';
+    mark.textContent = '⚠';
+    const txt = document.createElement('span');
+    txt.className = 'wtxt';
+    txt.textContent = w;
+    row.append(mark, txt);
+    if (collapse) {
+      row.title = '点击展开/收起全文';
+      row.addEventListener('click', () => row.classList.toggle('clipped'));
+    }
+    box.appendChild(row);
+  }
 }
 
 function showChecks(results) {
