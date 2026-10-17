@@ -69,7 +69,8 @@ function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000, bi
       clearTimeout(timer);
       if (code === 0) resolve({ code, stdout: binary ? Buffer.concat(stdout) : stdout, stderr });
       else {
-        const err = new Error(`${bin} 退出码 ${code}\n${tail(stderr)}`);
+        const hint = explainExit(code, stderr);
+        const err = new Error(`${bin} 退出码 ${code}${hint ? '\n' + hint : ''}\n${tail(stderr)}`);
         // 调用方（导出自检的解码判据）要按 stderr 分辨"真报错"与封装层碎语，
         // 光看 message 会把"ffmpeg 退出码 69"那行也当成一条错误。
         err.stderr = stderr;
@@ -77,6 +78,30 @@ function run(bin, args, { onProgress, signal, timeoutMs = 6 * 60 * 60 * 1000, bi
       }
     });
   });
+}
+
+/**
+ * ffmpeg 退出码 + stderr → 一句人话。
+ *
+ * 用户看到的原始形态是 `ffmpeg.exe 退出码 4294967268`（-28 的无符号写法）加一片
+ * `No space left on device`，完全看不出该做什么。这里把最常见的几种翻成可执行的建议；
+ * 认不出来就返回空串（保持原样，不猜）。
+ */
+function explainExit(code, stderr) {
+  const s = String(stderr || '');
+  // Node 在 Windows 上把退出码当无符号给（-28 → 4294967268），两种写法都认
+  const signed = code > 0x7fffffff ? code - 0x100000000 : code;
+  if (signed === -28 || /No space left on device/i.test(s)) {
+    return '磁盘空间不足：写中间文件或产物时盘满了（中间文件与产物都放在输出目录所在磁盘）。'
+      + '清出空间或换一个更大的输出目录后重试。';
+  }
+  if (/Permission denied|Access is denied/i.test(s)) {
+    return '没有写入权限：换一个可写的输出目录，或检查该文件是否被其他程序占用。';
+  }
+  if (/Invalid data found when processing input/i.test(s)) {
+    return '读到了无法解析的数据：源文件可能损坏，或中途被其他程序改动过。';
+  }
+  return '';
 }
 
 function kill(child) {
@@ -402,5 +427,5 @@ async function probeHasRasl(ffmpegPath, file, keyframes = [], duration = 0) {
 
 module.exports = {
   run, parseProgress, probeMedia, probeKeyframes, normalizeProbe, sourceSubtitleCues,
-  probeHasRasl,
+  probeHasRasl, explainExit,
 };

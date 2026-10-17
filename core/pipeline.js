@@ -97,25 +97,81 @@ async function loadSource(file, opts = {}) {
   return loaded;
 }
 
-/** 预检磁盘空间。 */
-async function precheckSpace(outPath, media, keepSecs) {
-  const bytesNeeded = Math.ceil((media.bitRate || 8_000_000) / 8 * keepSecs * 1.05);
-  let free = null;
+/** 某个目录所在卷的可用字节数；取不到就返回 null（放行，别把"查不到"误判成"不够"）。 */
+async function freeBytesAt(dir) {
   try {
-    const s = await fsp.statfs(path.dirname(path.resolve(outPath)));
-    free = s.bavail * s.bsize;
+    const s = await fsp.statfs(dir);
+    return s.bavail * s.bsize;
   } catch {
-    return { ok: true, bytesNeeded, free: null };
+    return null;
   }
-  if (free !== null && free < bytesNeeded) {
-    return {
-      ok: false,
-      bytesNeeded,
-      free,
-      message: `磁盘空间不足：需要约 ${fmtBytes(bytesNeeded)}，可用 ${fmtBytes(free)}`,
-    };
+}
+
+/**
+ * 预检磁盘空间：把**每个真要落盘的目录**分别按峰值算清楚。
+ *
+ * 峰值构成（这些文件在同一时刻都还在盘上）：
+ *  · 工作副本——源是 mkv/ts 时要先整片纯拷成 mp4，**大小 ≈ 整份源**；
+ *  · 全部中间段（≈ 保留总时长）；
+ *  · 最终产物（≈ 保留总时长）。
+ * 所以中间文件目录要 workBytes + outBytes，产物目录要 outBytes；两者同卷就是
+ * workBytes + 2 × outBytes。
+ *
+ * 老实现有两个洞，2026-10-17 由一次真实失败暴露（4 小时 27GB 素材、输出盘剩 230GB，
+ * 却在导出时报 `No space left on device`）：
+ *  1. 只按"产物一个文件"估，漏了工作副本（那份 27GB）；
+ *  2. 只查产物目录所在卷，而中间文件当时写在系统临时盘——爆的是没人检查的那个盘。
+ */
+async function precheckSpace(outPath, media, opts = {}) {
+  const bps = ((media.bitRate || 8_000_000) / 8) * 1.05;
+  const outBytes = Math.ceil(bps * Math.max(0, opts.keepSecs || 0));
+  const workBytes = Math.ceil(bps * Math.max(0, opts.workSecs || 0));
+
+  const outDir = path.dirname(path.resolve(outPath));
+  const tmpBase = opts.tmpBase ? path.resolve(opts.tmpBase) : outDir;
+  const needByDir = new Map();
+  const add = (dir, bytes) => needByDir.set(dir, (needByDir.get(dir) || 0) + bytes);
+  add(outDir, outBytes);                 // 最终产物
+  add(tmpBase, workBytes + outBytes);    // 工作副本 + 全部中间段
+
+  for (const [dir, need] of needByDir) {
+    const free = await freeBytesAt(dir);
+    if (free !== null && free < need) {
+      return {
+        ok: false,
+        bytesNeeded: need,
+        free,
+        dir,
+        message: `磁盘空间不足：${dir} 需要约 ${fmtBytes(need)}`
+          + `（中间文件＋产物要同时落在这块盘上），当前可用 ${fmtBytes(free)}。`
+          + '请换一个空间更大的输出目录，或先清理该磁盘后重试。',
+      };
+    }
   }
-  return { ok: true, bytesNeeded, free };
+  // 全部目录都够（或查不到可用量）：把总量带回去给上层做展示
+  return { ok: true, bytesNeeded: [...needByDir.values()].reduce((a, b) => a + b, 0), free: null };
+}
+
+/**
+ * 中间文件目录：**放在输出文件同一卷**（2026-10-17 修）。
+ *
+ * 以前用 `os.tmpdir()`——Windows 上是 `C:\Users\<用户>\AppData\Local\Temp`。
+ * 于是"输出盘还有 230GB"完全不起作用：归一工作副本（**整份源大小**，实测用户那单
+ * 是 27GB）加全部中间段都写系统盘，系统盘一满 ffmpeg 就报 `No space left on device`
+ * （退出码 -28），而预检只看输出盘，等于放行了一个注定失败的导出。
+ *
+ * 放同卷还有两个好处：最终拼接不再跨卷复制；预检查的就是真正要写的那块盘。
+ * 输出目录不可写时（权限/只读/网络盘）退回系统临时目录——那时 precheckSpace
+ * 会按 tmpBase 单独把那个卷也查一遍。
+ */
+async function makeTempDir(anchorPath, prefix = '.fast-cut-tmp-') {
+  const base = path.dirname(path.resolve(anchorPath));
+  try {
+    await fsp.mkdir(base, { recursive: true });
+    return await fsp.mkdtemp(path.join(base, prefix));
+  } catch {
+    return fsp.mkdtemp(path.join(os.tmpdir(), 'fast-cut-'));
+  }
 }
 
 /**
@@ -214,8 +270,8 @@ async function exportSegments(loaded, segments, opts) {
     : null;
   const cutFps = media.video?.fps;
 
-  await fsp.mkdir(path.dirname(path.resolve(outPath)), { recursive: true });
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fast-cut-'));
+  // 中间文件落在**输出盘**（见 makeTempDir 注释：以前写系统临时盘，大素材必爆）
+  const tmpDir = await makeTempDir(outPath);
   const partFiles = [];
   const ext = path.extname(outPath) || '.mp4';
   // 输出文件名在切割前就确定，取消时才能把半成品全部清掉。
@@ -239,7 +295,11 @@ async function exportSegments(loaded, segments, opts) {
 
   // 归一化：多段拼接时先把源整片纯拷进 MP4 工作副本（原因见 willNormalize 注释）
   const normalize = willNormalize(media, plan.length, stripSubs);
-  const space = await precheckSpace(outPath, media, totalKeep + (normalize ? (media.duration || 0) : 0));
+  const space = await precheckSpace(outPath, media, {
+    keepSecs: totalKeep,
+    workSecs: normalize ? (media.duration || 0) : 0,
+    tmpBase: tmpDir,
+  });
   if (!space.ok) throw new Error(space.message);
   onProgress({ phase: 'prepare', keepSecs: totalKeep, segments: keeps });
 
@@ -667,10 +727,20 @@ async function probePureCopySeams(loaded, opts = {}) {
   const uniq = [...new Set(starts)];
   if (uniq.length < 2) return { ...none, detail: '可采样点不足 2 个，跳过' };
 
-  const tmpDir = await fsp.mkdtemp(path.join(os.tmpdir(), 'fast-cut-probe-'));
+  let tmpDir;
+  try {
+    tmpDir = await makeTempDir(file, '.fast-cut-probe-');
+  } catch (err) {
+    /* 建不出临时目录（两个卷都写不了）：保守要求接缝缓解，别因为探针跑不了就交出坏产物 */
+    return {
+      safe: false, segmentsOk: true, concatOk: false, segs: 0, ms: 0,
+      detail: `探针无法建临时目录：${String(err.message).split('\n')[0].slice(0, 80)}`,
+    };
+  }
   try {
     const parts = [];
     let segBad = '';
+    let cutFail = '';
     for (let i = 0; i < uniq.length; i++) {
       // 单条区间走吸附模式 → 拿到真实的纯拷贝计划项（含 frames），再只取拷贝段
       const { plan } = planFor(loaded, [{ start: uniq[i] + 0.4, end: Math.min(uniq[i] + 0.4 + segSec, dur - 0.05) }],
@@ -678,13 +748,29 @@ async function probePureCopySeams(loaded, opts = {}) {
       const copy = plan.find((p) => p.kind === 'copy');
       if (!copy || !(copy.duration > 0.3)) continue;
       const out = path.join(tmpDir, `s${i}.mp4`);
-      await run(bins.ffmpeg, argsForSegment(copy, media, out, { fps, copyTs: 'make_zero', dumpParams: false }));
+      try {
+        await run(bins.ffmpeg, argsForSegment(copy, media, out, { fps, copyTs: 'make_zero', dumpParams: false }));
+      } catch (err) {
+        cutFail = String(err.message).split('\n')[0].slice(0, 100);
+        break;
+      }
       // 单段自解：这一层决定"接缝缓解够不够"
       if (!segBad) {
         const e = await decodeNoise(bins.ffmpeg, out);
         if (e) segBad = e;
       }
       parts.push(out);
+    }
+    /**
+     * 样段**切不出来**（磁盘满 / 权限 / 编码器异常）与"这份源没有可测的多段拷贝形态"
+     * 必须分开对待：前者是**未知**，只能保守要求接缝缓解（代价是接缝处一小段重编码），
+     * 绝不能返回"安全"——那会静默跳过缓解、交出可能解不开的产物（2026-10-17 记）。
+     */
+    if (cutFail) {
+      return {
+        safe: false, segmentsOk: true, concatOk: false, segs: parts.length, ms: Date.now() - t0,
+        detail: `试切样段失败，无法判定接缝：${cutFail}`,
+      };
     }
     if (parts.length < 2) return { ...none, detail: `只切出 ${parts.length} 段，跳过`, segs: parts.length };
     if (segBad) {
@@ -743,4 +829,6 @@ function fmtBytes(n) {
 module.exports = {
   loadSource, probeSource, scanKeyframes, exportSegments, createToken, planFor, numbered, groupByKeep,
   probePureCopySeams,
+  // 下面两个导出只为单测（空间预检与中间目录选址都是"错了就丢一晚导出"的地方）
+  precheckSpace, makeTempDir,
 };
