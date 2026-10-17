@@ -52,6 +52,12 @@ function createTimeline(options) {
   let fitted = false;              // 内容第一次进来时把视口对齐到成片总长
   let thumbs = null;               // 导入时整片抽的那一遍：{ dir, step, count, height }
   let thumbImgs = [];              // 与 thumbs.count 同序的 Image，加载完才画
+  /**
+   * 当前这套 `thumbs` / `thumbImgs` 属于第几个源（多素材，2026-10-18）。
+   * 单素材恒为 0；多素材时只有属于这个源的片段才拿它画胶片——
+   * 否则第二段会画出第一份素材的画面（用户报的"预览乱码"）。
+   */
+  let filmSrcIndex = null;
   let fps = 30;                    // 抽帧间隔不能细于一帧
   let snapKeyframes = true;        // 关键帧磁吸开关：false = 只吸片段边界（播放头自由走）
   let levels = new Map();          // step -> { step, dir, imgs: Map<格号, Image> }，按缩放动态抽的层级
@@ -499,17 +505,42 @@ function createTimeline(options) {
     filmStats = { step: null, cells: 0, minCell: 0, maxCell: 0, maxScale: 0 };
     const pxSec = pxPerSec();
     // 总览那一遍的格子一旦拉到几百像素就没意义了（会糊成一大片），那种缩放交给动态层级
-    if (thumbs && thumbs.step * pxSec <= FILM_CELL * 4) drawRow(thumbs.step, (i) => thumbImgs[i]);
+    if (thumbs && thumbs.step * pxSec <= FILM_CELL * 4) drawRow(thumbs.step, (clip, i) => summaryImgOf(clip, i));
     const lv = pickLevel();
     if (!lv) return;
     // 统计只记最上面那一层 —— 那才是用户真正看到的画面
     filmStats = { step: lv.step, cells: 0, minCell: 0, maxCell: 0, maxScale: 0 };
-    drawRow(lv.step, (i) => lv.imgs.get(i));
+    drawRow(lv.step, (clip, i) => levelImgOf(clip, i));
+  }
+
+  /**
+   * 取某一格胶片图 —— **必须带片段所属的源**（多素材，2026-10-18）。
+   *
+   * 胶片是按源抽的（每份素材一套格子图），而时间轴上可能有来自不同素材的片段。
+   * 旧实现让所有片段共用一套 `thumbImgs` / `lv.imgs`：第二段的格号被拿去第一份
+   * 素材的图数组里取，画出来就是**另一份素材的画面**——这正是用户报的"预览乱码"。
+   *
+   * 没有该源图时返回 null（跳过这一格），由上层在换源后补画；宁可短暂空着，
+   * 也绝不拿别的素材的帧顶上。
+   */
+  function summaryImgOf(clip, i) {
+    return filmSrcIndex != null && filmSrcIndexOf(clip) === filmSrcIndex ? thumbImgs[i] : null;
+  }
+
+  function levelImgOf(clip, i) {
+    const lv = pickLevel();
+    if (!lv) return null;
+    const set = lv.imgsBySrc && lv.imgsBySrc.get(filmSrcIndexOf(clip));
+    return set ? set.get(i) : null;
+  }
+
+  function filmSrcIndexOf(clip) {
+    return Number.isInteger(clip && clip.srcIndex) ? clip.srcIndex : 0;
   }
 
   function drawRow(step, imgAt) {
-    forEachTile(step, (i, dx, dw) => {
-      const img = imgAt(i);
+    forEachTile(step, (clip, i, dx, dw) => {
+      const img = imgAt(clip, i);
       if (!img || !img.complete || !img.naturalWidth) return;
       paintCell(img, dx, dw);
       filmDrawn++;
@@ -522,9 +553,12 @@ function createTimeline(options) {
   }
 
   /**
-   * 只遍历视口内的格子：(格号, 左边界 px, 宽 px)。
+   * 只遍历视口内的格子：(片段, 格号, 左边界 px, 宽 px)。
    * 必须按视口夹一遍 —— 放大到一屏不到一秒时，一个长片段自身就有几十万个格子，
    * 从片段头遍历到片段尾会把每一次 render 都拖成一次灾难。
+   *
+   * **带上片段本身**（多素材，2026-10-18）：取图要按片段所属的源去取，
+   * 否则第二段会画成第一份素材的画面。
    */
   function forEachTile(step, fn) {
     if (!step) return;
@@ -542,7 +576,7 @@ function createTimeline(options) {
         const dx0 = tToX(c.ps + (s0 - c.start));
         const dx1 = tToX(c.ps + (s1 - c.start));
         if (dx1 - dx0 < 0.5) continue;
-        fn(i, dx0, dx1 - dx0);
+        fn(c, i, dx0, dx1 - dx0);
       }
     }
   }
@@ -969,6 +1003,7 @@ function createTimeline(options) {
       thumbs = next && next.count ? { ...next } : null;
       if (!thumbs) {
         thumbImgs = [];
+        filmSrcIndex = null;
         filmDrawn = 0;
         for (const lv of levels.values()) for (const img of lv.imgs.values()) img.src = '';
         levels.clear();
@@ -976,7 +1011,17 @@ function createTimeline(options) {
         render();
         return;
       }
-      if (!prev || prev.dir !== thumbs.dir) thumbImgs = [];
+      /**
+       * 多素材（2026-10-18）：每次只喂**一份素材**的总览图，记下它是第几个源。
+       * 单素材时恒为 0，行为与改造前完全一致。
+       * 换素材时旧图作废（dir 变了），避免两份素材的格子混在一张时间轴上。
+       */
+      const si = Number.isInteger(next.srcIndex) ? next.srcIndex : 0;
+      if (!prev || prev.dir !== thumbs.dir || si !== filmSrcIndex) {
+        thumbImgs = [];
+        filmSrcIndex = si;
+        filmSig = '';
+      }
       if (thumbImgs.length > thumbs.count) thumbImgs.length = thumbs.count;
       for (let i = 0; i < thumbs.count; i++) {
         const old = thumbImgs[i];
@@ -994,12 +1039,15 @@ function createTimeline(options) {
     /**
      * 动态层级的一批格子到货：`{ step, dir, have: [格号…] }`，格号就是 `floor(源时间/step)`。
      * 同一档会分好几次推（边抽边推），所以这里是往 Map 里补，不是替换。
+     *
+     * **多素材**：同一档下每份素材各有自己的目录与格号，图集按源分开存
+     * （`imgsBySrc`）。旧实现只有单份 `imgs`，第二段素材的格子会被画成第一份的画面。
      */
     setLevel(next) {
       if (!next || !next.step || !Array.isArray(next.have)) return;
       let lv = levels.get(next.step);
       if (!lv) {
-        lv = { step: next.step, dir: next.dir, imgs: new Map() };
+        lv = { step: next.step, dir: next.dir, imgs: new Map(), imgsBySrc: new Map(), dirs: new Map() };
         levels.set(next.step, lv);
         while (levels.size > FILM_ROWS) {
           const oldest = levels.keys().next().value;
@@ -1008,14 +1056,22 @@ function createTimeline(options) {
           levels.delete(oldest);
         }
       }
+      const si = Number.isInteger(next.srcIndex) ? next.srcIndex : 0;
+      // 该源在这一档的图集（每源一份目录，格号互不相干）
+      if (!lv.imgsBySrc.has(si)) lv.imgsBySrc.set(si, new Map());
+      const set = lv.imgsBySrc.get(si);
+      if (next.dir) lv.dirs.set(si, next.dir);
+      // `imgs` 只保留"主源"的视图，供老调用方（filmReady 等）继续用
+      const mirror = si === 0 ? lv.imgs : null;
       let added = 0;
       for (const i of next.have) {
-        if (lv.imgs.has(i)) continue;
+        if (set.has(i)) continue;
         const img = new Image();
         img.onload = scheduleFilmRender;
         img.onerror = scheduleFilmRender;
-        img.src = thumbUrl(lv.dir, `t${String(i).padStart(7, '0')}.jpg`);
-        lv.imgs.set(i, img);
+        img.src = thumbUrl(next.dir || lv.dir, `t${String(i).padStart(7, '0')}.jpg`);
+        set.set(i, img);
+        if (mirror && !mirror.has(i)) mirror.set(i, img);
         added++;
       }
       if (added) render();
@@ -1027,8 +1083,10 @@ function createTimeline(options) {
       if (!lv) return false;
       let need = 0;
       let got = 0;
-      forEachTile(step, (i) => {
-        const img = lv.imgs.get(i);
+      // 多素材：每一格要按**它所属的源**去查，否则会拿主源的图判"已就绪"
+      forEachTile(step, (clip, i) => {
+        const set = lv.imgsBySrc && lv.imgsBySrc.get(filmSrcIndexOf(clip));
+        const img = set && set.get(i);
         need++;
         if (img && img.complete && img.naturalWidth) got++;
       });

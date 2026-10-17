@@ -34,6 +34,11 @@ const state = {
   thumbs: null,        // { dir, step, count } 时间轴胶片条
   cut: { index: 0, total: 1, ratio: 0 },
   outputs: [],
+  /**
+   * 确认框的接管点（自动化测试用）。null = 用原生 confirm。
+   * 原生 confirm 是模态的，会把渲染进程卡住，自检脚本没法自己点"确定"。
+   */
+  confirmHook: null,
 };
 
 /**
@@ -350,14 +355,37 @@ async function importFile(file) {
   }
 }
 
+/**
+ * 需要用户点头的确认框。
+ *
+ * 抽成函数是为了让**自动化测试能接管**（`state.confirmHook`）：
+ * 原生 `window.confirm` 是模态的，Electron 里会卡住整个渲染进程——
+ * 自检脚本跑到"替换素材"那一步会永久停在这个对话框上（实测，
+ * 表现为进程一直不退出、需要人工点确定）。测试把 hook 设成恒 true 即可。
+ * 正常使用时 hook 为 null，行为与直接调用 `window.confirm` 完全一致。
+ */
+function askConfirm(message) {
+  if (typeof state.confirmHook === 'function') return !!state.confirmHook(message);
+  return window.confirm(message);
+}
+
 async function applySource(src) {
   const replacing = !!state.src && state.src.file !== src.file;
   if (replacing && state.clips.length > 1 &&
-      !window.confirm('更换源文件会丢掉当前的分割与删除记录，继续？')) return;
+      !askConfirm('更换源文件会丢掉当前的分割与删除记录，继续？')) return;
 
   state.src = src;
-  // 替换导入 = 从"只有这一份素材"重新开始（旧的多素材列表整个丢掉，上面的 confirm 已确认过）
-  state.sources = [{ id: '0', file: src.file, media: src.media }];
+  /**
+   * 替换导入 = 从"只有这一份素材"重新开始（旧的多素材列表整个丢掉，上面的 confirm 已确认过）。
+   *
+   * **`state.sources[0]` 必须就是 `state.src` 这个对象本身**，不能另造一个。
+   * `switchPlayerTo` 用对象身份判断"是否已经挂着这份素材"：如果这里是新造的
+   * `{file, media}`，那么单素材时 `srcAtProgram()` 返回 `state.src`、`pc.src` 却是
+   * `state.sources[0]`，两者永不相等 → 每次 seek 都重新加载 `<video>`，
+   * 画面跟不上播放头（实测 smoke 报"<video> 停在 2.5s"、拖序也失效）。
+   */
+  state.sources = [src];
+  src.id = '0';
   state.sel = 0;
   state.rate = 1;
   state.plan = null;
@@ -383,6 +411,12 @@ async function applySource(src) {
 
   updateInfo();
   syncSourcesToTimeline();
+  /**
+   * 绑定播放器文件时**必须同时更新 `pc.src` 账本**（2026-10-18）。
+   * 直接写 `player.src` 而不记帐，会让 `switchPlayerTo` 以为"还挂在上一份素材"，
+   * 于是下一次跨源时要么重复 reload、要么判定已经切过而实际没切——预览就错乱。
+   */
+  pc.src = state.sources[0];
   $('player').src = fileUrl(src.file);
   syncTimeline();
   pullThumbs(src.file);
@@ -455,15 +489,50 @@ async function pickAndAppend() {
  * state.src 就位之前到达而被丢掉（换素材、走缓存的第二次导入尤其容易撞上）。
  */
 function pullThumbs(file) {
-  tl.setThumbs(null);
+  /**
+   * 切源时**不要先清空**时间轴胶片（2026-10-18）。
+   * 旧实现每次 `tl.setThumbs(null)`：跨源拖动时两边的胶片被反复清空再重铺，
+   * 中间那几秒时间轴是空白/错位的——用户看到的就是"预览乱码"。
+   * 现在优先用手头已缓存的那份直接铺上，没有才等新的。
+   */
+  const si = (state.sources || []).findIndex((s) => s.file === file);
+  const cached = state.thumbsByFile && state.thumbsByFile[file];
+  if (cached && si >= 0) {
+    state.thumbs = cached;
+    tl.setThumbs({ ...cached, srcIndex: si });
+  }
   window.fc.getThumbs(file).then((payload) => applyThumbs(payload));
 }
 
 function applyThumbs(payload) {
-  if (!payload || !state.src || payload.file !== state.src.file) return;
+  if (!payload) return;
+  /**
+   * 接受**任何已导入素材**的推送（多素材，2026-10-18）。
+   *
+   * 旧判据写死 `payload.file !== state.src.file`（`state.src` 永远是第一份素材），
+   * 于是切到第二段之后，属于第二份素材的胶片推送被当成"过期数据"直接丢掉——
+   * 时间轴胶片条一直停在前一份素材的画面上，看起来就是"预览错乱"。
+   */
+  const si = (state.sources || []).findIndex((s) => s.file === payload.file);
+  if (si < 0) return;
   if (payload.error) { toast(`时间轴预览图生成失败：${payload.error}`, 'warn', 6000); return; }
-  state.thumbs = payload;
-  tl.setThumbs(payload);
+  // 按文件记账：多素材时各有一份，切过去时立刻能铺上，不必重新抽
+  state.thumbsByFile = state.thumbsByFile || {};
+  state.thumbsByFile[payload.file] = payload;
+  // 胶片按源区分：告诉时间轴"这套总览图属于第几个源"
+  // （时间轴只给属于这个源的片段画它，绝不拿这份的图去画另一份素材的片段）
+  tl.setThumbs({ ...payload, srcIndex: si });
+  if (payload.file === activeFile()) state.thumbs = payload;
+}
+
+/**
+ * 当前"正在看"的那份素材的文件路径（多素材）。
+ *
+ * 胶片条与动态抽帧都是**按源**推送的，校验基准不能写死第一份素材。
+ */
+function activeFile() {
+  const s = (tl ? srcAtProgram(tl.currentProgramTime()) : null) || state.src;
+  return s ? s.file : null;
 }
 
 /**
@@ -475,35 +544,80 @@ function askFilm(want) {
   if (filmTimer) clearTimeout(filmTimer);
   filmTimer = setTimeout(() => {
     filmTimer = null;
-    if (state.src) window.fc.requestFilm({ file: state.src.file, ...want });
+    /**
+     * 多素材（2026-10-18）：可见区域里可能同时有**多份素材**的片段，
+     * 每份都要抽自己那一档的格子。旧实现只按 `state.src.file`（第一份）要帧，
+     * 于是第二段的画面只能拿第一份素材的格子顶上——这就是"乱码"的直接来源。
+     */
+    const seen = new Set();
+    for (const si of visibleSourceIndices()) {
+      const s = state.sources[si];
+      if (!s || seen.has(s.file)) continue;
+      seen.add(s.file);
+      window.fc.requestFilm({ file: s.file, ...want, srcIndex: si });
+    }
   }, 160);
 }
 
+/** 视口里可见片段涉及哪些源（主源永远排在最前，保持既有行为）。 */
+function visibleSourceIndices() {
+  const out = [];
+  const push = (i) => { if (!out.includes(i)) out.push(i); };
+  push(0);
+  try {
+    const v = tl.view();
+    for (const c of state.clips) {
+      if (c.pe < v.t0 - 0.001 || c.ps > v.t1 + 0.001) continue;
+      push(srcIndexOf(c));
+    }
+  } catch { /* 时间轴还没就绪，只抽主源 */ }
+  return out;
+}
+
 function applyFilm(payload) {
-  if (!payload || !state.src || payload.file !== state.src.file) return;
-  if (payload.error) { toast(`这一档预览图抽失败了：${payload.error}`, 'warn', 6000); return; }
-  tl.setLevel(payload);
+  if (!payload) return;
+  const si = Number.isInteger(payload.srcIndex)
+    ? payload.srcIndex
+    : (state.sources || []).findIndex((s) => s.file === payload.file);
+  if (si < 0) return;
+  if (payload.error) {
+    // 同一份素材的抽帧失败只提示一次，避免跨源拖动时刷屏
+    toast(`这一档预览图抽失败了：${payload.error}`, 'warn', 6000);
+    return;
+  }
+  tl.setLevel({ ...payload, srcIndex: si });
 }
 
 /** 后台扫描回包：补上关键帧刻度，并放开导出。 */
 function onScanResult(payload) {
-  if (!state.src || payload.file !== state.src.file) return;
-  state.scanning = false;
+  // 多素材：回包可能属于任一份素材，按文件找到它，而不是只认第一份
+  const which = (state.sources || []).find((s) => s.file === payload.file);
+  if (!which) return;
+  /**
+   * `state.scanning` 只反映"**主源**还没扫完"（2026-10-18）。
+   *
+   * 旧代码里它就是"当前这份素材是否在扫"。多素材改造时我一度改成"任一份缺关键帧
+   * 就算在扫"，于是追加一份素材后即使主源已扫完也会被重新置为 true，
+   * 导出按钮被一直禁用（实测 smoke 报"导入后即可导出且预估正确 ✗"）。
+   * 追加源的扫描由 `appendSources` 自己按需处理（时长已知即可预览），不该挡住主源导出。
+   */
+  if (which === state.src) state.scanning = false;
   if (!payload.ok) {
     showError(`关键帧扫描失败：${payload.message}`);
     toast('关键帧扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
     updateExportEnabled();
     return;
   }
-  state.src.media.keyframes = payload.keyframes;
-  state.src.media.lastKeyframe = payload.lastKeyframe;
-  if (payload.duration) state.src.media.duration = payload.duration;
-  tl.setSource(state.src.media);
+  which.media.keyframes = payload.keyframes;
+  which.media.lastKeyframe = payload.lastKeyframe;
+  if (payload.duration) which.media.duration = payload.duration;
+  // 关键帧刻度是"所有源合并"的，必须整体重建（只刷某一源会让别的源刻度消失）
+  syncSourcesToTimeline();
   updateInfo();
   syncTimeline();
   const headN = countCost('head');
-  const copyN = state.plan && state.plan.plan ? state.plan.plan.filter((p) => p.kind === 'copy').length : 0;
-  toast(`关键帧扫描完成：${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
+  toast(`关键帧扫描完成：${baseName(payload.file)} ${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
+  updateExportEnabled();
 }
 
 function defaultOutDir(file) {
@@ -581,14 +695,48 @@ function seekProgram(pt) {
   const i = tl.clipIndexAtProg(clamped);
   pb.index = i >= 0 ? i : 0;
   const srcT = tl.progToSrc(clamped);
-  // 多素材：播放头跨到另一份素材上时，必须先把 <video> 切到那个文件再 seek
+  /**
+   * 多素材：播放头跨到另一份素材上时，必须先把 <video> 切到那个文件再 seek。
+   *
+   * **不能在这里直接写 `pc.src = want`**（2026-10-18 修）：`pc.src` 记录的是
+   * "播放器实际挂着的文件"，只有 `switchPlayerTo` 真换了 `video.src` 才该更新它。
+   * 之前那一行是手误——它把记录改成"已经是新源"，于是下一次切到同一源时
+   * `switchPlayerTo` 判定"已经切过"直接返回，`video.src` 却还停在旧文件上：
+   * 预览拿旧文件的时间基对着新源的时刻播，画面就糊成几秒乱码。
+   */
   const want = srcAtProgram(clamped);
-  switchPlayerTo(want);
-  pc.src = want;
-  $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
+  const switched = switchPlayerTo(want);
+  // 刚换过文件时 <video> 还没加载完，立刻写 currentTime 会被丢弃，
+  // 所以等元数据就绪再定位（与 tick 里跨源处理同一套做法）。
+  if (switched) {
+    queueSeekAfterLoad(clamped, srcT, want);
+  } else {
+    $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
+  }
   tl.setProgramTime(clamped);
   lastSnap = null;        // 键盘 / 按钮移动播放头，谈不上磁吸
   onTimeUpdate();
+}
+
+/**
+ * 换过 `<video src>` 之后，等媒体元数据就绪再写 currentTime。
+ *
+ * 直接写会丢：浏览器要先解析新文件头，`readyState` 到 1 之前 `currentTime` 的赋值
+ * 可能被忽略或立刻被重置到 0 —— 用户看到的就是"跳回片头"或"画面不动"。
+ * 用 `loadedmetadata` 一次性回调；同时兜一个超时，避免文件异常时永远不等。
+ */
+function queueSeekAfterLoad(progT, srcT, src) {
+  const p = $('player');
+  const put = () => {
+    try {
+      p.currentTime = clamp(srcT, 0, (src?.media?.duration) || 0);
+    } catch { /* 元数据还没到时忽略，下一次 seek 会补上 */ }
+  };
+  if (p.readyState >= 1) { put(); return; }
+  p.addEventListener('loadedmetadata', put, { once: true });
+  // 兜底：某些容器（或已被缓存的短片段）可能不触发 loadedmetadata
+  clearTimeout(pc.seekTimer);
+  pc.seekTimer = setTimeout(put, 1200);
 }
 
 /**
@@ -597,8 +745,11 @@ function seekProgram(pt) {
  * `<video>` 一次只能播一个文件，而时间轴是"多份素材首尾相接"的成片时间轴。
  * 所以播放头跨源时必须换 `src` —— 换完要重新 seek 到该源内的时刻。
  * 单素材时 `pc.src === state.src` 恒成立，这段就完全不动作。
+ *
+ * **`pc.src` 只在真正改了 `video.src` 时才更新**。它是"播放器实际挂着什么"的账本，
+ * 任何人绕过 `switchPlayerTo` 去写它，都会让下一次判断失真（切源失效 → 乱码）。
  */
-const pc = { src: null };
+const pc = { src: null, seekTimer: 0 };
 
 /** 把播放器切到某个源（同一份就什么都不做，避免 reload 打断播放）。 */
 function switchPlayerTo(src) {
@@ -622,8 +773,9 @@ function onScrub(srcT, progT, snap) {
   if (state.rate < 0) haltPlayback();
   // 拖到别的素材上时先换文件，再按该源内的时刻定位
   const want = srcAtProgram(progT);
-  switchPlayerTo(want);
-  $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
+  const switched = switchPlayerTo(want);
+  if (switched) queueSeekAfterLoad(progT, srcT, want);
+  else $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
   const i = tl.clipIndexAtProg(progT);
   if (i >= 0) pb.index = i;
   lastSnap = snap || null;
@@ -638,8 +790,10 @@ function onTimeUpdate() {
   const pt = state.rate < 0 ? tl.currentProgramTime() : playheadProgram();
   const srcT = tl.progToSrc(pt);
   $('timecode').innerHTML = `${tcShort(pt)} <span class="sep">/</span> ${tcShort(programTotal())}`;
-  const fps = state.src ? fpsOf(state.src.media) : 30;
-  $('frameNo').textContent = state.src ? `帧 ${Math.round(srcT * fps)}` : '帧 --';
+  // 帧号按**播放头所在那份素材**的帧率折算：多素材可能帧率不同（30 与 24 混剪）
+  const at = state.src ? (srcAtProgram(pt) || state.src) : null;
+  const fps = at ? fpsOf(at.media) : 30;
+  $('frameNo').textContent = at ? `帧 ${Math.round(srcT * fps)}` : '帧 --';
   tl.setProgramTime(pt);
   if (p.paused) updateHud();      // 沿用本次落位的磁吸结果重画，别把它抹掉
 }
@@ -851,8 +1005,7 @@ function tick() {
     const want = srcOfClip(next);
     if (switchPlayerTo(want)) {
       // 换 src 是异步加载：等元数据就绪后再 seek，否则 currentTime 会被立刻忽略
-      const targetT = next.start + 0.5 / fps;
-      p.addEventListener('loadedmetadata', () => { p.currentTime = targetT; }, { once: true });
+      queueSeekAfterLoad(next.ps, next.start + 0.5 / fps, want);
       onTimeUpdate();
       if (!p.paused) rafId = requestAnimationFrame(tick);
       return;

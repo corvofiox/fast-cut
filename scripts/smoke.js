@@ -188,6 +188,14 @@ async function main() {
 
   await waitFor('document.readyState === "complete"', win);
   await waitFor('__smoke.ready()', win);
+  /**
+   * 接管所有确认框（2026-10-18）。
+   *
+   * 必须**在第一次导入之前**装好：原生 `window.confirm` 是模态的，
+   * 一旦弹出来整个渲染进程就停在那里等鼠标，自检脚本无法继续，
+   * 表现为"进程挂着不退出、要人工点确定"。自动化的前提是全程无需人工介入。
+   */
+  await js(win, '__smoke.state.confirmHook = () => true; "ok"');
 
   const env = await js(win, 'window.fc.env()');
   check('检测到 ffmpeg', !!env.ok, env.version);
@@ -1200,6 +1208,72 @@ async function main() {
   await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(SRC)}`, win);
   await wait(600);
 
+  // 15-film) 多素材胶片按源取图（2026-10-18 用户报"跨源后预览乱码"）
+  // 判据是取色：第二段必须是第二份素材的颜色，而不是第一份的。
+  const pair = ensureColorPair();
+  await js(win, `__smoke.importFile(${JSON.stringify(pair.a)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(pair.a)}`, win);
+  await waitFor('__smoke.state.scanning === false', win, 30000);
+  await wait(600);
+  await js(win, `__smoke.appendSources([${JSON.stringify(pair.b)}]); 'ok'`);
+  await wait(2000);
+  await js(win, `__smoke.tl.fit(); __smoke.seekProgram(3); 'ok'`);
+  await wait(1500);
+  const filmPix = JSON.parse(await js(win, `(() => {
+    const c = document.getElementById('tlCanvas');
+    const g = c.getContext('2d');
+    const total = __smoke.programTotal();
+    /**
+     * 采样 y 取车道竖直中线，不要取贴近下沿。
+     * 胶片条下沿压着分组色条与渐变遮罩，取 height-22 会掺进界面配色
+     * （实测第一段读到 R149/B120，看着像"红蓝混了"，其实画面是对的）。
+     */
+    const y = Math.round(c.height * 0.62);
+    /**
+     * 采样点要落在片段**内部**、且避开两段交界：
+     * 交界附近是渐隐/过渡带（实测在 0.85 处取到 R0/B254，而 0.15 处取到 R249/B254
+     * ——前者正确、后者被第二段的蓝色渗过来了）。所以各取 20% 与 80%，
+     * 并对 3 个相邻像素取多数色，避免单点噪点。
+     */
+    const rgb = (t) => {
+      const x0 = Math.round(__smoke.tl.timeToX(t));
+      let r = 0, b = 0;
+      for (let dx = -2; dx <= 2; dx++) {
+        const d = g.getImageData(Math.max(0, x0 + dx), y, 1, 1).data;
+        r += d[0]; b += d[2];
+      }
+      return { r: Math.round(r / 5), b: Math.round(b / 5) };
+    };
+    return JSON.stringify({ a: rgb(total * 0.2), b: rgb(total * 0.8) });
+  })()`));
+  check('胶片按源取图：第二段是第二份素材的画面，不是第一份的',
+    filmPix.a.r > filmPix.a.b + 40 && filmPix.b.b > filmPix.b.r + 40,
+    `第一段 R${filmPix.a.r}/B${filmPix.a.b}（应偏红）· 第二段 R${filmPix.b.r}/B${filmPix.b.b}（应偏蓝）`);
+  // 用户的动作：从第二段挪回第一段，两边仍各是各的画面
+  await js(win, `__smoke.seekProgram(__smoke.programTotal() * 0.85); 'ok'`);
+  await wait(700);
+  await js(win, `__smoke.seekProgram(__smoke.programTotal() * 0.15); 'ok'`);
+  await wait(1100);
+  const filmPix2 = JSON.parse(await js(win, `(() => {
+    const c = document.getElementById('tlCanvas');
+    const g = c.getContext('2d');
+    const total = __smoke.programTotal();
+    const y = Math.round(c.height * 0.62);
+    const rgb = (t) => {
+      const x0 = Math.round(__smoke.tl.timeToX(t));
+      let r = 0, b = 0;
+      for (let dx = -2; dx <= 2; dx++) {
+        const d = g.getImageData(Math.max(0, x0 + dx), y, 1, 1).data;
+        r += d[0]; b += d[2];
+      }
+      return { r: Math.round(r / 5), b: Math.round(b / 5) };
+    };
+    return JSON.stringify({ a: rgb(total * 0.2), b: rgb(total * 0.8) });
+  })()`));
+  check('从第二段挪回第一段后，两边胶片仍各是各的素材',
+    filmPix2.a.r > filmPix2.a.b + 40 && filmPix2.b.b > filmPix2.b.r + 40,
+    `第一段 R${filmPix2.a.r}/B${filmPix2.a.b} · 第二段 R${filmPix2.b.r}/B${filmPix2.b.b}`);
+
   await longFileCheck(win);
   finish(win);
 }
@@ -1222,6 +1296,31 @@ function ensureHevcSource() {
     '-c:a', 'aac', '-shortest', out,
   ], { stdio: 'ignore' });
   return out;
+}
+
+/**
+ * 多素材胶片归属用例的两份素材：**颜色必须不同**（红 / 蓝）。
+ *
+ * 用户报的"走带从第二段挪回第一段时预览乱码"，根因是时间轴胶片一律用第一份素材的
+ * 图去画所有片段，于是第二段显示的是第一份素材的画面。判据只能是"取色对不对"——
+ * 两份都做成 testsrc 时亮度一模一样，采样等于什么都没验（这个坑踩过一次）。
+ */
+function ensureColorPair() {
+  const dir = path.join(ROOT, 'tmp');
+  const a = path.join(dir, 'smoke-red.mp4');
+  const b = path.join(dir, 'smoke-blue.mp4');
+  const ffmpeg = resolveBin('ffmpeg', [path.join(ROOT, 'vendor', 'ffmpeg')]);
+  for (const [file, color] of [[a, 'red'], [b, 'blue']]) {
+    if (fs.existsSync(file) && fs.statSync(file).size > 10000) continue;
+    execFileSync(ffmpeg, [
+      '-hide_banner', '-loglevel', 'error', '-y',
+      '-f', 'lavfi', '-i', `color=c=${color}:size=320x180:rate=30:duration=6`,
+      '-f', 'lavfi', '-i', 'sine=frequency=440:duration=6',
+      '-c:v', 'libx264', '-preset', 'ultrafast', '-g', '60', '-pix_fmt', 'yuv420p',
+      '-c:a', 'aac', '-ar', '44100', '-ac', '1', '-shortest', file,
+    ], { stdio: 'ignore' });
+  }
+  return { a, b };
 }
 
 /**

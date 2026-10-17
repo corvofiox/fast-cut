@@ -289,7 +289,7 @@ const FILM_MAX_TILES = 48;          // 一次最多抽这么多格，够铺两�
  * 格子号 = floor(源时间 / step)，文件名带格子号，于是同一档换窗口只补差集，
  * 往回拖也不用重抽。一次请求最多 48 格，每格一次精确 seek，恒定几百毫秒。
  */
-async function doFilmLevel(loaded, step, from, to) {
+async function doFilmLevel(loaded, step, from, to, srcIndex = null) {
   const duration = Number(loaded.media.duration) || 0;
   if (!duration) return;
   let i0 = Math.max(0, Math.floor(from / step));
@@ -305,7 +305,12 @@ async function doFilmLevel(loaded, step, from, to) {
   const nameOf = (i) => path.join(dir, `t${String(i).padStart(7, '0')}.jpg`);
   const have = [];
   for (let i = i0; i <= i1; i++) if (fs.existsSync(nameOf(i))) have.push(i);
-  const send = (final) => emit('fc:film', { file: loaded.file, step, dir, have: have.slice(), final });
+  /**
+   * 回包必须带上 `srcIndex`（多素材，2026-10-18）：渲染层要按源分组存放格子图，
+   * 否则第二段素材的帧会被塞进第一份素材的图集里——画出来就是别的素材的画面。
+   */
+  const tag = Number.isInteger(srcIndex) ? { srcIndex } : {};
+  const send = (final) => emit('fc:film', { file: loaded.file, step, dir, have: have.slice(), final, ...tag });
   send(have.length === i1 - i0 + 1);
   const missing = [];
   for (let i = i0; i <= i1; i++) if (!have.includes(i)) missing.push(i);
@@ -752,9 +757,10 @@ function registerIpc(getWindow) {
     const to = Number(req.to);
     if (!Number.isFinite(step) || step < FILM_MIN_STEP || step > FILM_MAX_STEP) return;
     if (!Number.isFinite(from) || !Number.isFinite(to) || to <= from) return;
-    doFilmLevel(loaded, Number(step.toFixed(6)), from, to).catch((err) => {
+    doFilmLevel(loaded, Number(step.toFixed(6)), from, to, req.srcIndex).catch((err) => {
       emit('fc:film', {
         file: abs, step, dir: '', have: [], final: true,
+        ...(Number.isInteger(req.srcIndex) ? { srcIndex: req.srcIndex } : {}),
         error: String((err && err.message) || err).slice(0, 200),
       });
     });
