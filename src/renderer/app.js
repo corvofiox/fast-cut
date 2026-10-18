@@ -682,9 +682,25 @@ function gopStats(keyframes) {
 
 // ---------------------------------------------------------------- 预览与播放头
 
+/**
+ * 播放器当前画面所在的成片时间。
+ *
+ * **换源刚发生时不可用**（2026-10-18）：跨到另一份素材后，`<video>` 换了 `src`，
+ * `currentTime` 会先回到 0 再被 seek 到目标位置。这个窗口里如果拿 0 去反推：
+ *   `成片时间 = c.ps + (0 - c.start)`
+ * 就会算出离目标很远的位置，播放头于是被画到别处闪一下——正是用户报的
+ * "从第二段拖动走带回到第一段时，第一段另一个地方闪过另一个走带"
+ * （实测播放头 495→8→445，只闪约 15~35ms，肉眼正好是"闪一下"）。
+ *
+ * 换源未落位时**沿用上一次已知的位置**，不要用任何推算值：
+ * 用 `c.ps` 也不行——此时 `pb.index` 可能还停在旧片段上，
+ * 它会算出一个看似合法、实则错误的时刻（实测仍然闪到 0）。
+ */
 function playheadProgram() {
   const c = state.clips[pb.index];
   if (!c) return 0;
+  // 换源未落位：此时的 currentTime 是新文件的 0，不代表任何成片位置
+  if (pc.unsettled) return clamp(pc.lastProg != null ? pc.lastProg : c.ps, 0, programTotal());
   return clamp(c.ps + (Number($('player').currentTime) - c.start), 0, programTotal());
 }
 
@@ -711,9 +727,12 @@ function seekProgram(pt) {
   if (switched) {
     queueSeekAfterLoad(clamped, srcT, want);
   } else {
+    // 明确的一次跳转同样要作废在途的异步定位，否则旧目标稍后触发会把播放头拉走
+    cancelPendingSeek();
     $('player').currentTime = clamp(srcT, 0, (want?.media?.duration) || 0);
   }
   tl.setProgramTime(clamped);
+  pc.lastProg = clamped;      // 记住这次落位，换源窗口期沿用它
   lastSnap = null;        // 键盘 / 按钮移动播放头，谈不上磁吸
   onTimeUpdate();
 }
@@ -724,19 +743,56 @@ function seekProgram(pt) {
  * 直接写会丢：浏览器要先解析新文件头，`readyState` 到 1 之前 `currentTime` 的赋值
  * 可能被忽略或立刻被重置到 0 —— 用户看到的就是"跳回片头"或"画面不动"。
  * 用 `loadedmetadata` 一次性回调；同时兜一个超时，避免文件异常时永远不等。
+ *
+ * **迟到的定位必须能被后来的拖动作废**（2026-10-18，用户报"跨段拖回来时
+ * 第一段某处闪过另一个走带"）：
+ * 实体操作里 `loadedmetadata` / 兜底定时器是异步的，可能在用户已经**继续拖动**
+ * 之后才触发；那时它写的还是**旧目标时刻**，`onTimeUpdate` 再拿这个错位的
+ * `currentTime` 反推成片时间，播放头就会被画到别处闪一下（实测 495→8→445，
+ * 只闪约 30ms，肉眼正好是"另一个走带一闪而过"）。
+ * 所以每次登记都带一个递增票号，只有**最新**那次有资格写 currentTime。
  */
+let seekTicket = 0;
+
 function queueSeekAfterLoad(progT, srcT, src) {
   const p = $('player');
+  const mine = ++seekTicket;
+  /**
+   * 标记"换源后尚未落位"：这期间 `<video>.currentTime` 是新文件的 0，
+   * 不能拿它反推播放头位置（否则播放头会闪到片头，见 playheadProgram 注释）。
+   * 用计数器而不是布尔，避免连续两次换源时先结束的那次把标志提前清掉。
+   */
+  pc.unsettled = (pc.unsettled || 0) + 1;
+  const done = () => {
+    if (mine === seekTicket) pc.unsettled = 0;
+    else pc.unsettled = Math.max(0, (pc.unsettled || 1) - 1);
+  };
   const put = () => {
+    if (mine !== seekTicket) return;      // 已被更新的定位取代，别用旧目标去覆盖
     try {
       p.currentTime = clamp(srcT, 0, (src?.media?.duration) || 0);
     } catch { /* 元数据还没到时忽略，下一次 seek 会补上 */ }
+    // 落位后（或至少尝试过）就恢复正常的反推
+    done();
   };
   if (p.readyState >= 1) { put(); return; }
   p.addEventListener('loadedmetadata', put, { once: true });
   // 兜底：某些容器（或已被缓存的短片段）可能不触发 loadedmetadata
   clearTimeout(pc.seekTimer);
   pc.seekTimer = setTimeout(put, 1200);
+}
+
+/**
+ * 作废所有在途的定位回调。
+ *
+ * 拖动开始（以及任何"用户接管播放头"的动作）都要调一次：在途的
+ * `loadedmetadata` 与兜底定时器此刻已经过期，放着不管就会在拖动途中断言旧时刻。
+ */
+function cancelPendingSeek() {
+  seekTicket++;
+  clearTimeout(pc.seekTimer);
+  pc.seekTimer = 0;
+  pc.unsettled = 0;
 }
 
 /**
@@ -749,7 +805,7 @@ function queueSeekAfterLoad(progT, srcT, src) {
  * **`pc.src` 只在真正改了 `video.src` 时才更新**。它是"播放器实际挂着什么"的账本，
  * 任何人绕过 `switchPlayerTo` 去写它，都会让下一次判断失真（切源失效 → 乱码）。
  */
-const pc = { src: null, seekTimer: 0 };
+const pc = { src: null, seekTimer: 0, unsettled: 0, lastProg: null };
 
 /** 把播放器切到某个源（同一份就什么都不做，避免 reload 打断播放）。 */
 function switchPlayerTo(src) {
@@ -771,6 +827,16 @@ function onScrub(srcT, progT, snap) {
   if (!state.src) return;
   // 手动拖播放头 = 接管：倒带循环还在跑的话会跟手指抢位置，先掐掉
   if (state.rate < 0) haltPlayback();
+  /**
+   * 用户的手指/鼠标是最高优先级的定位来源（2026-10-18）。
+   *
+   * 先作废所有在途的异步定位：跨源拖动时每次 move 都可能排队一个
+   * "等元数据再 seek"，如果旧的排队回调在用户已经拖到别处之后才触发，
+   * 它会把 currentTime 拉回旧目标，播放头就在另一处闪一下（实测 495→8→445）。
+   */
+  cancelPendingSeek();
+  // 手指指向的位置就是权威位置：记下来，供换源窗口期沿用
+  pc.lastProg = progT;
   // 拖到别的素材上时先换文件，再按该源内的时刻定位
   const want = srcAtProgram(progT);
   const switched = switchPlayerTo(want);

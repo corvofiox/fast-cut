@@ -1274,6 +1274,54 @@ async function main() {
     filmPix2.a.r > filmPix2.a.b + 40 && filmPix2.b.b > filmPix2.b.r + 40,
     `第一段 R${filmPix2.a.r}/B${filmPix2.a.b} · 第二段 R${filmPix2.b.r}/B${filmPix2.b.b}`);
 
+  // 15-hop) 跨源拖动时播放头不许闪到别处（2026-10-18 用户报"第一段某处闪过另一个走带"）
+  //     根因：换源后 <video>.currentTime 会先归 0，拿它反推成片时间就算出错误位置，
+  //     播放头被画到另一处闪 15~35ms。判据：拖动全程 left 不得大幅回退。
+  await js(win, `__smoke.seekProgram(__smoke.programTotal() * 0.8); 'ok'`);
+  await wait(700);
+  await js(win, `(() => {
+    window.__hop = [];
+    window.__hopOn = true;
+    (function loop() {
+      if (!window.__hopOn) return;
+      const ph = document.getElementById('tlPlayhead');
+      window.__hop.push({ left: parseFloat(ph.style.left) || 0 });
+      requestAnimationFrame(loop);
+    })();
+    return 'ok';
+  })()`);
+  await js(win, `(() => {
+    const box = document.getElementById('timeline');
+    const r = box.getBoundingClientRect();
+    const total = __smoke.programTotal();
+    const from = __smoke.tl.timeToX(total * 0.8);
+    const to = __smoke.tl.timeToX(total * 0.2);
+    const at = (px) => r.left + px;
+    const fire = (type, px) => box.dispatchEvent(new PointerEvent(type, {
+      pointerId: 93, clientX: at(px), clientY: r.top + 12,
+      bubbles: true, cancelable: true, isPrimary: true,
+      buttons: type === 'pointerup' ? 0 : 1,
+    }));
+    fire('pointerdown', from);
+    let i = 0;
+    const timer = setInterval(() => {
+      i += 1;
+      fire('pointermove', from + ((to - from) * i) / 20);
+      if (i >= 20) { clearInterval(timer); fire('pointerup', to); }
+    }, 25);
+    return 'ok';
+  })()`);
+  await wait(1500);
+  await js(win, 'window.__hopOn = false; "ok"');
+  const hop = JSON.parse(await js(win, 'JSON.stringify(window.__hop)'));
+  let backJumps = 0;
+  for (let i = 2; i < hop.length; i++) {
+    if (hop[i].left - hop[i - 1].left < -60) backJumps++;
+  }
+  check('跨源拖动时播放头不闪到别处（不出现第二个走带）',
+    hop.length > 5 && backJumps === 0,
+    `采样 ${hop.length} 帧 · 大幅回退 ${backJumps} 次`);
+
   await longFileCheck(win);
   finish(win);
 }
