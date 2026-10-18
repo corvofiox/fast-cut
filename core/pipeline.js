@@ -273,10 +273,26 @@ function planFor(loadedOrSources, segments, opts = {}) {
     // **一条区间可能产出多个计划项**（精确模式 = 重编码头 + 拷贝尾），必须按数组收集，
     // 不能用 Map 以 keepIndex 为键——那样后一项会把前一项覆盖掉（实测重编码头整段丢失，
     // 3 条区间 10s 变成 4s，只剩拷贝尾段）。
+    /**
+     * `outGroup` 必须在**这里**按全局序号重打（2026-10-18 多素材）。
+     *
+     * `buildPlan` 是按源分别调用的，每个源只看到自己的 keeps，于是两个源的首条区间
+     * 都会被打成 `k0`——「每段一个文件」于是把两份素材并成同一个文件
+     * （实测两段素材只产出 1 个文件、内容还是混的）。合并之后按全局 keepIndex 重算，
+     * 分组边界才与用户在时间轴上看到的片段一一对应。
+     */
+    const anyGroup = keeps.some((k) => k && k.group != null);
     for (const p of subPlan) {
       const gi = items[p.keepIndex] ? items[p.keepIndex].gi : p.keepIndex;
+      const k = keeps[gi];
       const arr = planByGi.get(gi);
-      const one = { ...p, keepIndex: gi, srcIndex: si, sourceId: src.id };
+      const one = {
+        ...p,
+        keepIndex: gi,
+        srcIndex: si,
+        sourceId: src.id,
+        outGroup: (!anyGroup || !k || k.group == null) ? `k${gi}` : `g${k.group}`,
+      };
       if (arr) arr.push(one);
       else planByGi.set(gi, [one]);
     }

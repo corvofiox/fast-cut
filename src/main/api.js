@@ -487,7 +487,21 @@ function previewPlan(payload) {
 }
 
 /** 数组顺序不再等于源顺序 = 用户拖动改过位置，必须走"按顺序逐段导出"这条路。 */
+/**
+ * 数组顺序不再等于源顺序 = 用户拖动改过位置，必须走"按顺序逐段导出"这条路。
+ *
+ * **多素材时（2026-10-18）判据不能只看 `start`**：不同素材的时间轴各自从 0 起，
+ * 它们的 `start` 之间没有可比性。实测把第二段素材的片段拖到第一段前面后，
+ * 三段 `start` 全是 0，这个函数返回 false → 主进程以为"没改过顺序"，
+ * 走规整流程把片段**按源重新排序**打回原样——用户拖了顺序，导出却还是旧顺序
+ * （实测产物内容 红/蓝/红，期望 蓝/红/红）。
+ *
+ * 所以：**只要涉及多个源，就以数组顺序为准**（多素材的顺序是用户显式摆的，
+ * 而且各源时间不可比，规整排序本来也无从下手）。
+ */
 function isReordered(segments) {
+  const srcs = new Set(segments.map((s) => (Number.isInteger(s && s.srcIndex) ? s.srcIndex : 0)));
+  if (srcs.size > 1) return true;
   for (let i = 1; i < segments.length; i++) {
     if (segments[i].start < segments[i - 1].start - 1e-6) return true;
   }

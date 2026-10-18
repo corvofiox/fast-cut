@@ -908,6 +908,14 @@ async function main() {
   // 用 6 段来造：1+2 一组、4+5 一组，中间各夹一段未分组的——
   // 这样"组2 → 第 3 个文件"才是真的（组号恰好等于文件号的形状验不出这个 bug）。
   await js(win, `(() => {
+    /**
+     * 这一项验的是「每段一个文件」下的文件序号，**必须显式打开 split**
+     * （2026-10-18）：分组边界只在 split 时才保住相邻区间，拼接模式下
+     * 6 段会被并成 1 组，这条断言就永远拿不到"组2 → 第 3 个文件"的形状。
+     * 以前它依赖上一项用例留下的勾选状态，前一项一变就偶发失败（实测踩到）。
+     * 自检的每一项都应该自带前提，不靠别人的残留状态。
+     */
+    __smoke.setOption('optSplit', true);
     const d = __smoke.state.src.media.duration;
     const w = d / 6;
     __smoke.state.clips = Array.from({ length: 6 }, (_, i) => ({ start: i * w, end: (i + 1) * w }));
@@ -927,6 +935,10 @@ async function main() {
     listStarts: [...document.querySelectorAll('#keepList li')].map((e) => e.classList.contains('grp-start')),
     hint: [...document.querySelectorAll('#planHints .hint-grow')].map((e) => e.textContent),
     map: __smoke.state.plan.fileNoOfGroup,
+    groups: __smoke.state.plan.groups,
+    split: document.getElementById('optSplit').checked,
+    keeps: (__smoke.state.plan.keeps || []).length,
+    oGroups: (__smoke.state.plan.plan || []).map((p) => p.outGroup).join(','),
     // 文本瘦身（2026-10-18 用户反馈"文本太多"）：一行一段、代价短标签、警告条目可折叠
     rowKids: [...document.querySelectorAll('#keepList li')].map((e) => e.children.length),
     costs: [...document.querySelectorAll('#keepList li .cost')].map((e) => e.textContent),
@@ -945,7 +957,7 @@ async function main() {
     `时间轴 ${JSON.stringify(gnum.segColors)} · 片段栏 ${JSON.stringify(gnum.listColors)}`);
   check('提示里的文件序号是真的（组2 夹在中间时段应是第 3 个文件）',
     gnum.map && gnum.map['2'] === 3 && gnum.hint.some((t) => /组2 · 第 3 个文件/.test(t)),
-    `映射 ${JSON.stringify(gnum.map)} · 提示 ${JSON.stringify(gnum.hint)}`);
+    `映射 ${JSON.stringify(gnum.map)} · 组数 ${gnum.groups} · split ${gnum.split} · keeps ${gnum.keeps} · og ${gnum.oGroups} · 提示 ${JSON.stringify(gnum.hint)}`);
   check('两组相邻时片段栏有组间分隔（不只靠颜色）',
     gnum.listStarts[0] === true && gnum.listStarts[3] === true,
     JSON.stringify(gnum.listStarts));
@@ -1321,6 +1333,56 @@ async function main() {
   check('跨源拖动时播放头不闪到别处（不出现第二个走带）',
     hop.length > 5 && backJumps === 0,
     `采样 ${hop.length} 帧 · 大幅回退 ${backJumps} 次`);
+
+  // 15-owner) 多素材下"片段的归属"不能在任何编辑动作里丢失（2026-10-18）
+  //     切分/合并/改顺序都在重建片段对象，漏掉 srcIndex 就会让那段去别的素材取画面。
+  //     改顺序还额外有一坑：不同素材的 start 不可比，按 start 判断"是否改过顺序"会
+  //     得出"没改过"，于是导出按源重排，把用户拖的顺序打回去。
+  await js(win, `__smoke.importFile(${JSON.stringify(pair.a)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(pair.a)}`, win);
+  await waitFor('__smoke.state.scanning === false', win, 30000);
+  await wait(600);
+  await js(win, `__smoke.appendSources([${JSON.stringify(pair.b)}]); 'ok'`);
+  await wait(1800);
+  // 在第 5s（源 0 内部）切一刀，检查两半都继承 srcIndex
+  await js(win, `__smoke.seekProgram(5); __smoke.splitAtPlayhead(); 'ok'`);
+  await wait(500);
+  const own1 = JSON.parse(await js(win, 'JSON.stringify(__smoke.state.clips.map((c) => c.srcIndex))'));
+  check('切分后两半都继承来源（不丢 srcIndex）',
+    own1.every((x) => Number.isInteger(x)), JSON.stringify(own1));
+  // 把第二段素材的片段拖到最前，检查导出的顺序真的跟着换
+  await js(win, `__smoke.reorderClip(2, 0); 'ok'`);
+  await wait(600);
+  const own2 = JSON.parse(await js(win, 'JSON.stringify(__smoke.state.clips.map((c) => c.srcIndex))'));
+  check('拖到最前后来源标记跟着走', own2[0] === 1, JSON.stringify(own2));
+  await js(win, `(() => {
+    __smoke.setOption('optSplit', false);
+    __smoke.setOption('optPrecise', true);
+    __smoke.setContainer('mp4');
+    const s = document.getElementById('outCodec');
+    if (s) { s.value = 'h264'; s.dispatchEvent(new Event('change')); }
+    __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'owner-order');
+    return 'ok';
+  })()`);
+  await wait(1200);
+  res = await runExport(win);
+  check('多素材改顺序后导出通过自检', res.ok && res.outputs.length === 1, res.detail);
+  if (res.outputs && res.outputs.length) {
+    // 用颜色验内容：现在第 0 段是源 1（蓝），第 1 段是源 0（红）
+    const px = (t) => {
+      const png = path.join(ROOT, 'tmp', 'smoke-order.png');
+      execFileSync(resolveBin('ffmpeg', [path.join(ROOT, 'vendor', 'ffmpeg')]),
+        ['-y', '-v', 'error', '-ss', String(t), '-i', res.outputs[0], '-frames:v', '1', png], { stdio: 'ignore' });
+      const buf = execFileSync(resolveBin('ffmpeg', [path.join(ROOT, 'vendor', 'ffmpeg')]),
+        ['-v', 'error', '-i', png, '-vf', 'scale=1:1', '-f', 'rawvideo', '-pix_fmt', 'rgb24', '-']);
+      return { r: buf[0], b: buf[2] };
+    };
+    const p0 = px(2);
+    const p1 = px(7);
+    check('改顺序后导出的内容真的换了顺序（首段是第二份素材）',
+      p0.b > p0.r + 40 && p1.r > p1.b + 40,
+      `2s R${p0.r}/B${p0.b}（应偏蓝）· 7s R${p1.r}/B${p1.b}（应偏红）`);
+  }
 
   await longFileCheck(win);
   finish(win);

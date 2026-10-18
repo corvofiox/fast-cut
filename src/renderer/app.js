@@ -1196,7 +1196,18 @@ function splitAtPlayhead() {
   const c = state.clips[i];
   if (!c) return;
   if (srcT - c.start < MIN_KEEP || c.end - srcT < MIN_KEEP) { toast('离片段边界不足一帧，不再分割', 'warn'); return; }
-  state.clips.splice(i, 1, { start: c.start, end: srcT }, { start: srcT, end: c.end });
+  /**
+   * 切分出来的两半必须**原样继承**原来的归属（2026-10-18）：
+   *  - `srcIndex`：丢了它，这两半会被当成"主源"的素材——跨素材时切开第二段，
+   *    左半会去第一份素材里取画面（导出也是切错文件）。
+   *  - `group`：丢了它，切一刀就把用户分好的组拆散（分割不该改变"和谁一起导出"）。
+   * 两半的区间内容不变，只是被一个切点分开，归属自然应当一致。
+   */
+  const left = { start: c.start, end: srcT };
+  const right = { start: srcT, end: c.end };
+  if (Number.isInteger(c.srcIndex)) { left.srcIndex = c.srcIndex; right.srcIndex = c.srcIndex; }
+  if (c.group != null) { left.group = c.group; right.group = c.group; }
+  state.clips.splice(i, 1, left, right);
   relayout();
   state.sel = i + 1;
   pb.index = i + 1;
@@ -1269,7 +1280,26 @@ function mergeBoundary(i) {
     toast('这两段在源里不相邻（中间被删过），不能合并', 'warn');
     return;
   }
-  state.clips.splice(i, 2, { start: a.start, end: b.end });
+  /**
+   * **不同素材的两段绝不能合并**（2026-10-18）。
+   *
+   * 判据只看"源时间是否相接"，而两份素材的时间轴各自从 0 起——第一段的尾部
+   * 与第二份素材的头部在数值上完全可能相接（都可能是 6.0）。合并后只剩一个
+   * `srcIndex`，另一个素材的那半会被静默丢掉或切错文件。
+   * 素材来源是硬边界，跟"源里是否相邻"无关。
+   */
+  const sa = Number.isInteger(a.srcIndex) ? a.srcIndex : 0;
+  const sb = Number.isInteger(b.srcIndex) ? b.srcIndex : 0;
+  if (sa !== sb) {
+    toast('这两段来自不同的素材，不能合并', 'warn');
+    return;
+  }
+  const merged = { start: a.start, end: b.end, srcIndex: sa };
+  // 分组跟着合并结果走：两段同一组时保留该组，否则视为未分组
+  const ga = a.group == null ? null : a.group;
+  const gb = b.group == null ? null : b.group;
+  if (ga != null && ga === gb) merged.group = ga;
+  state.clips.splice(i, 2, merged);
   relayout();
   state.sel = i;
   pushHistory();
