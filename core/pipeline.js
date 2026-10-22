@@ -507,12 +507,28 @@ async function exportSegments(loadedOrSources, segments, opts) {
     // （多 0.36s 静音，自检"音画一致"必挂）。`make_zero` 把音频也拉回 0，
     // 拼接后逐包贴合（2.6279 vs 2.6800）。VFR 段本来就全部重编码，不用顾虑
     // disabled 那点"接缝多一帧"的小账。
-    const zeroFree = familyOfFormat(src.media.format) === 'mov' && familyOfExt(partExt) === 'mov'
-      && !media.video?.vfr;
-    const copyTs = zeroFree ? 'disabled' : 'make_zero';
-    if (!zeroFree && plan.some((p) => p.kind === 'copy')) {
-      warnings.push('这次导出无法让拷贝段的时间戳严格按帧对齐（源或目标容器不允许）'
-        + (media.video?.vfr ? '，或源是可变帧率' : '')
+    /**
+     * 时间戳策略必须**按段自己的源**算，不能用一个全局值（2026-10-23 修）。
+     *
+     * 以前只拿主源（`srcPool[0]`）判断 `zeroFree`：主源是 mp4 且目标也是 mp4 时
+     * 判定"可以不归零"，于是**所有**段的拷贝段都用 `-avoid_negative_ts disabled`。
+     * 可第二份素材是 MKV 时，读 MKV 恰恰需要归零才不丢报文时间戳——
+     * 实测 6s(mp4) + 10.023s(mkv) 拼出来只有 14s / 420 帧（计划 480 帧），
+     * 第二份素材的段凭空少了 2 秒。
+     * 现在每段取自己源的时间戳策略：谁的源不是 mov 族，谁就 make_zero。
+     */
+    const copyTsOf = (srcIndex) => {
+      const one = srcPool[srcIndex] || srcPool[0];
+      const ok = familyOfFormat(one.media.format) === 'mov' && familyOfExt(partExt) === 'mov'
+        && !one.media.video?.vfr;
+      return ok ? 'disabled' : 'make_zero';
+    };
+    const anyMakeZero = plan.some((p) => p.kind === 'copy' && copyTsOf(p.srcIndex) === 'make_zero');
+    if (anyMakeZero) {
+      const nonMov = (sources || []).length > 1
+        ? '（其中有素材不是 MP4 封装）'
+        : (media.video?.vfr ? '，或源是可变帧率' : '');
+      warnings.push('这次导出无法让拷贝段的时间戳严格按帧对齐（源或目标容器不允许）' + nonMov
         + '——接缝处可能多带 1~2 帧画面：产物内容仍是按你选的区间切的');
     }
 
@@ -537,7 +553,9 @@ async function exportSegments(loadedOrSources, segments, opts) {
        */
       const needNorm = normalizeTo && needsForce(item.srcIndex) ? normalizeTo : null;
       const args = argsForSegment(item, { ...srcOfItem.media, file: srcOfItem.file }, partFile, {
-        crf, fps: cutFps, dropSubtitles: dropSubtitles || stripSubs, copyTs,
+        crf, fps: cutFps, dropSubtitles: dropSubtitles || stripSubs,
+        // 时间戳策略按**这一段自己的源**决定（见 copyTsOf 注释）
+        copyTs: copyTsOf(item.srcIndex),
         dumpParams: mixedCodecs,
         normalize: needNorm,
         // 归一化时编码器必须由目标编码决定（否则 hevc 源会重编码成 hevc，与 h264 段拼不起来）

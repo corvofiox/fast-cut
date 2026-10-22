@@ -1384,6 +1384,36 @@ async function main() {
       `2s R${p0.r}/B${p0.b}（应偏蓝）· 7s R${p1.r}/B${p1.b}（应偏红）`);
   }
 
+  // 15-subext) 换容器后缀要当场变；带字幕的素材拼 mp4 不许报
+  //     "Could not find tag for codec"（2026-10-23 用户实测报错）
+  await js(win, `__smoke.importFile(${JSON.stringify(SRC)}); 'ok'`);
+  await waitFor(`__smoke.state.src && __smoke.state.src.file === ${JSON.stringify(SRC)}`, win);
+  await waitFor('__smoke.state.scanning === false', win, 30000);
+  await wait(500);
+  await js(win, `__smoke.setContainer('mkv'); 'ok'`);
+  await wait(150);
+  const extMkv = await js(win, 'document.getElementById("outExt").textContent');
+  check('换封装后文件名后缀当场跟着变（不等计划回包）',
+    String(extMkv).trim().toLowerCase() === '.mkv', extMkv);
+  await js(win, `__smoke.setContainer('source'); 'ok'`);
+  await wait(150);
+
+  // 第一份无字幕、第二份带 ASS：mp4 装不下，必须整条省略而不是报错
+  await js(win, `__smoke.appendSources([${JSON.stringify(ensureSubtitleSource())}]); 'ok'`);
+  await wait(2200);
+  await js(win, `(() => {
+    __smoke.setOption('optSplit', false);
+    __smoke.setOption('optPrecise', true);
+    __smoke.setContainer('mp4');
+    __smoke.setOut(${JSON.stringify(OUT_DIR)}, 'mixed-sub');
+    return 'ok';
+  })()`);
+  await wait(1400);
+  res = await runExport(win);
+  const tagErr = /Could not find tag|not currently supported in container/.test(res.detail || '');
+  check('只有第二份素材带字幕时，拼 mp4 不报"装不下"（字幕整条省略）', !tagErr, res.detail);
+  check('带字幕素材拼接仍然通过自检（时长/帧数没被字幕轨带歪）', res.ok, res.detail);
+
   await longFileCheck(win);
   finish(win);
 }

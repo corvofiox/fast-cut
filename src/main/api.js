@@ -398,7 +398,8 @@ function previewPlan(payload) {
   const loaded = sources[0];
   const segments = sanitizeSegments(payload.segments);
   // 先定目标封装：字幕装不装得下会影响自检的比对口径
-  const target = targetFor(payload.container, loaded, path.resolve(String(loaded.file)));
+  // 传**全部源**：字幕能不能塞进目标容器要按所有素材的字幕轨并集判断
+  const target = targetFor(payload.container, sources, path.resolve(String(loaded.file)));
   const split = !!payload.split;
 
   /**
@@ -562,7 +563,18 @@ function extForSource(media, file) {
  * 只认白名单里的 id；装不下的字幕轨在这里一次算清：参数拼装据此排除字幕流，
  * 自检据此核对"该省略的确实省略了"，界面据此提前告诉用户，谁都不偷偷做事。
  */
-function targetFor(requested, loaded, abs) {
+/**
+ * 定目标容器与"要不要丢字幕"。
+ *
+ * **多素材（2026-10-23 修）**：以前只看第一个源的 `subtitleCodecs`。当第一份素材没字幕、
+ * 而追加的第二份带 ASS 字幕时，程序判定"不用丢字幕"，于是 mp4 目标下仍然
+ * `-c:s copy` 把 ASS 塞进 mp4，ffmpeg 报
+ * `Could not find tag for codec h264 in stream #2, codec not currently supported in container`
+ * （stream #2 是那条 ASS 轨）。结论必须**按所有源的字幕轨并集**来算。
+ */
+function targetFor(requested, loadedOrList, abs) {
+  const list = Array.isArray(loadedOrList) ? loadedOrList : [loadedOrList];
+  const loaded = list[0];
   const id = String(requested || 'source').toLowerCase();
   let ext;
   let container = null;
@@ -574,7 +586,9 @@ function targetFor(requested, loaded, abs) {
     ext = picked.ext;
     container = { family: picked.family, label: picked.label, ext: picked.ext };
   }
-  const droppedSubCodecs = unmuxableSubtitles(familyOfExt(ext), loaded.media.subtitleCodecs);
+  // 所有素材的字幕编码取并集：任何一份装不下，就得整条省略
+  const allSubCodecs = [...new Set(list.flatMap((s) => (s.media && s.media.subtitleCodecs) || []))];
+  const droppedSubCodecs = unmuxableSubtitles(familyOfExt(ext), allSubCodecs);
   return { ext, container, dropSubtitles: droppedSubCodecs.length > 0, droppedSubCodecs };
 }
 
@@ -587,7 +601,7 @@ async function startExport(win, payload) {
   const segments = sanitizeSegments(payload.segments);
   const outDir = path.resolve(String(payload.outDir || ''));
   if (!fs.existsSync(outDir)) throw new Error(`输出目录不存在：${outDir}`);
-  const target = targetFor(payload.container, loaded, abs);
+  const target = targetFor(payload.container, sources, abs);
   const ext = target.ext;
   const outPath = path.join(outDir, sanitizeBaseName(payload.baseName) + ext);
 
@@ -712,8 +726,13 @@ function registerIpc(getWindow) {
       bundled: !!bundledFfmpegDir(),
       settings: { ...state.settings },
       extensions: VIDEO_EXTENSIONS,
-      /** 可以 remux 成的容器（界面据此填下拉，判据仍只在 core/containers.js 里） */
-      containers: EXPORT_CONTAINERS.map(({ id, label }) => ({ id, label })),
+      /**
+       * 可以 remux 成的容器（界面据此填下拉，判据仍只在 core/containers.js 里）。
+       * `ext` 必须一起回传（2026-10-23）：界面要在选容器的**当下**就把文件名后缀
+       * 改成 `.mkv`/`.mov`，不能等异步的计划回包。以前只给了 id/label，
+       * 渲染层只能靠 id 猜后缀，于是后缀一直停在 `.mp4`。
+       */
+      containers: EXPORT_CONTAINERS.map(({ id, label, ext }) => ({ id, label, ext })),
     };
   });
 

@@ -407,7 +407,7 @@ async function applySource(src) {
   $('empty').classList.add('hidden');
   $('outDir').value = defaultOutDir(src.file);
   $('outName').value = `${baseName(src.file)}-cut`;
-  $('outExt').textContent = extOf(src.file);
+  syncOutExt();          // 后缀跟着"当前选中的封装"走（可能不是跟随源）
 
   updateInfo();
   syncSourcesToTimeline();
@@ -618,6 +618,25 @@ function onScanResult(payload) {
   const headN = countCost('head');
   toast(`关键帧扫描完成：${baseName(payload.file)} ${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
   updateExportEnabled();
+}
+
+/**
+ * 把文件名后缀同步成"当前选中的封装"。
+ *
+ * 唯一事实来源是容器的扩展名：跟随源 → 源的扩展名；指定容器 → 那个容器的扩展名。
+ * 这条不依赖计划（计划是异步的），所以换下拉框的瞬间就能看到正确后缀。
+ */
+function syncOutExt() {
+  const el = $('outExt');
+  if (!el) return;
+  const id = containerChoice();
+  if (!id || id === 'source') {
+    el.textContent = state.src ? extOf(state.src.file) : '.mp4';
+    return;
+  }
+  // 优先用主进程回传的权威 ext（容器定义只有一处，界面不再自己猜）
+  const c = ((state.env && state.env.containers) || []).find((x) => x.id === id);
+  el.textContent = (c && c.ext) || (state.plan && state.plan.container && state.plan.container.ext) || `.${id}`;
 }
 
 function defaultOutDir(file) {
@@ -2352,7 +2371,18 @@ function bindUi() {
     refreshPlan();
   });
 
-  $('outContainer').addEventListener('change', refreshPlan);   // 换容器会改后缀，也可能装不下字幕
+  /**
+   * 换容器（2026-10-23 修）：**后缀必须当场跟着变**，不能等计划异步回来。
+   *
+   * 以前只写了 `refreshPlan`，后缀全靠计划回包里的 `container.ext` 去刷；
+   * 计划还在路上（或这次没算出计划）时，文件名后缀就停在导入时的源后缀上——
+   * 用户把封装选成 MKV，输入框却还写着 `.mp4`。后缀是"你即将写出什么文件"的
+   * 直接承诺，必须由选择本身立刻决定。
+   */
+  $('outContainer').addEventListener('change', () => {
+    syncOutExt();
+    refreshPlan();
+  });
   // 换编码会改变"哪些源需要重编码"，必须重算计划（代价标签、估时、红字都跟着变）
   $('outCodec')?.addEventListener('change', () => { refreshPlan(); });
 
