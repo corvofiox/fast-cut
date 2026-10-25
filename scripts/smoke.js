@@ -563,13 +563,13 @@ async function main() {
   check('L 正放并逐档加快', r1.rate === 1 && !r1.paused && rUp.rate === 4 && rUp.tag === '4×',
     `1× → 2× → ${rUp.rate}×，速率标记 "${rUp.tag}"`);
 
-  // 快进到 16× 封顶，再按要报"已经是最快"
-  await js(win, '__smoke.stepRate(1, false); __smoke.stepRate(1, false); __smoke.stepRate(1, false); "ok"');
+  // 快进到 8× 封顶（2026-10-25 去掉 16× 档），再按要报"已经是最快"且不再变
+  await js(win, '__smoke.stepRate(1, false); __smoke.stepRate(1, false); __smoke.stepRate(1, false); __smoke.stepRate(1, false); "ok"');
   await wait(200);
   const rMax = await js(win, '__smoke.state.rate');
-  check('快进封顶 16×', rMax === 16, `顶到 ${rMax}×`);
+  check('快进封顶 8×（再多按也不再加快）', rMax === 8, `顶到 ${rMax}×`);
 
-  // 反向切档：正在 16× 正放时按 J，必须从 -1× 起倒，而不是一下跳到 -16×
+  // 反向切档：正在 8× 正放时按 J，必须从 -1× 起倒，而不是一下跳到 -8×
   await js(win, `(() => {
     window.__evlog = [];
     const p = document.getElementById('player');
@@ -584,7 +584,7 @@ async function main() {
   const rRev1 = JSON.parse(await js(win,
     'JSON.stringify({ rate: __smoke.state.rate, paused: document.getElementById("player").paused, tag: document.getElementById("rateTag").textContent, pt: __smoke.tl.currentProgramTime() })'));
   check('J 从正放切到倒带时从 -1× 起步', rRev1.rate === -1 && rRev1.paused && rRev1.tag === '-1×',
-    `16× 正放 → 按 J → ${rRev1.rate}×（80ms 时 pt=${mid.pt}）`);
+    `8× 正放 → 按 J → ${rRev1.rate}×（80ms 时 pt=${mid.pt}）`);
 
   // 倒带真的在往回走：等一会儿，播放头必须比刚才更靠前（时间更小）
   const revBefore = await js(win, '__smoke.tl.currentProgramTime()');
@@ -1413,6 +1413,28 @@ async function main() {
   const tagErr = /Could not find tag|not currently supported in container/.test(res.detail || '');
   check('只有第二份素材带字幕时，拼 mp4 不报"装不下"（字幕整条省略）', !tagErr, res.detail);
   check('带字幕素材拼接仍然通过自检（时长/帧数没被字幕轨带歪）', res.ok, res.detail);
+
+  // 16-seam) 接缝处不该反复 seek（2026-10-25 用户报"高速播放时，播一段卡一会儿"）
+  //     根因：以前无条件在每个片段边界写 currentTime，而一次 seek 要 78~117ms。
+  //     1× 时一段要播几百毫秒，这点开销被淹没；倍速一高，一段只播几十毫秒，
+  //     seek 比播放这一段还久。用户切分但没删除时片段在源上首尾相接，本不需要跳。
+  //
+  //     ⚠ **不要用"真播最高倍速"来验这件事**：高倍速解码会让 Chromium 不停丢帧重绘，
+  //     叠加前面的多轮导出负载会把 GPU 压到触发 Windows 显卡超时重置（TDR），
+  //     现象是黑屏、严重时死机——我为这个断言实测连续两次把机器跑黑屏
+  //     （这也是后来把倍速封顶从 16× 降到 8× 的直接原因）。
+  //     所以这里只验判断函数本身：零播放、零 GPU 风险，且照样能防回归。
+  const seams = JSON.parse(await js(win, `JSON.stringify({
+    contiguous: __smoke.seamNeedsSeek({ start: 0, end: 2 }, { start: 2, end: 5 }),
+    tinyGap: __smoke.seamNeedsSeek({ start: 0, end: 2 }, { start: 2.0004, end: 5 }),
+    gap: __smoke.seamNeedsSeek({ start: 0, end: 2 }, { start: 5, end: 7 }),
+    reorder: __smoke.seamNeedsSeek({ start: 5, end: 8 }, { start: 0, end: 3 }),
+    missing: __smoke.seamNeedsSeek({ start: 0, end: 2 }, null),
+  })`));
+  check('接缝判断：源上连续不跳，有间隙/乱序才跳',
+    seams.contiguous === false && seams.tinyGap === false && seams.gap === true
+    && seams.reorder === true && seams.missing === false,
+    JSON.stringify(seams));
 
   await longFileCheck(win);
   finish(win);

@@ -12,6 +12,12 @@ const $ = (id) => document.getElementById(id);
 
 const MIN_KEEP = 1 / 240;      // 小于一帧（240fps 上界）视为空
 const EPS = 1e-6;
+/**
+ * 判定"两个片段在源上是否连续"的容差（秒）。
+ * 时间轴按毫秒量化，接缝处可能差个千分之一秒；用 1ms 就够，
+ * 太大会把真正删过的小间隙误当成连续（那会让画面跳掉一小段内容）。
+ */
+const SAME_SOURCE_EPS = 1e-3;
 
 const state = {
   env: null,
@@ -907,8 +913,12 @@ function updateHud() {
  * 两张表都按"离 1× 越来越远"排，所以推进逻辑对两者是同一条：
  * 粗档找第一个比当前更大的倍率，细档找第一个比当前更小的。
  * 表里只有**倍率**，方向由按键决定（J 系一律取负）。
+ *
+ * **封顶 8×**（2026-10-25 用户定）：原来最高 16×，但 16× 解码会让 Chromium
+ * 不停丢帧重绘、把 GPU 压得很满（实测能把机器跑黑屏），而实际快进看片
+ * 8× 已经够用——再快眼睛也跟不上画面。所以去掉 16× 这一档。
  */
-const RATE_FAST = [1, 2, 4, 8, 16];
+const RATE_FAST = [1, 2, 4, 8];
 const RATE_SLOW = [1, 0.75, 0.5, 0.25];
 
 /**
@@ -1058,30 +1068,72 @@ function stepRate(dir, fine) {
     ? table.findIndex((r) => r < cur - 1e-6)
     : table.findIndex((r) => r > cur + 1e-6);
   if (j < 0) {
-    toast(dir > 0
-      ? (fine ? '已经是最慢的 0.25×' : '已经是最快的 16×')
-      : (fine ? '倒带已经是最慢的 0.25×' : '倒带已经是最快的 16×'), 'warn');
+    /**
+     * 到顶/到底的提示**从表里取值**，不写死数字（2026-10-25）：
+     * 之前写死"已经是最快的 16×"，后来档位封顶改成 8× 时文案就对不上了。
+     * 表是唯一事实来源，提示跟着表走。
+     */
+    const edge = fine ? Math.min(...table) : Math.max(...table);
+    toast(`${dir > 0 ? '' : '倒带'}已经是最${fine ? '慢' : '快'}的 ${edge}×`, 'warn');
     return;
   }
   applyRate(table[j] * dir);
 }
 
-/** 播放循环：跨过片段接缝时把 <video> 跳到下一段的源起点，到片尾就停。 */
+/**
+ * 接缝处是否需要 seek。
+ *
+ * 源上**连续**（本段源终点 == 下一段源起点）就不需要：播放器正播到这里，
+ * 往下自然就是下一段画面，跳一下纯属自找卡顿。
+ * 只有删过中间、或拖过顺序（源上不连续）才必须定位。
+ *
+ * 抽成独立函数还有个额外好处：**回归可以只验判断、不必真播放**。
+ * 用最高倍速真播放去验这件事会把 GPU 压到触发 Windows 显卡超时重置，
+ * 我实测因此连续两次黑屏死机，不值得。
+ */
+function seamNeedsSeek(cur, next) {
+  if (!cur || !next) return false;
+  return Math.abs(next.start - cur.end) > SAME_SOURCE_EPS;
+}
+
+/**
+ * 播放循环：跨过片段接缝时把 <video> 跳到下一段的源起点，到片尾就停。
+ *
+ * **接缝处能不跳就不跳**（2026-10-25，用户报"高速播放时，播一段会卡一会儿"）：
+ * 以前的实现**无条件**在每个片段边界写一次 `currentTime`。而一次 seek 实测要
+ * 78~117ms（重新定位关键帧、等数据、解码到目标帧）。1× 时一个片段要播几百毫秒到
+ * 几分钟，这点开销被淹没；倍速一高，一段可能只播几十毫秒，**seek 比播这一段还久**，
+ * 于是"播一段卡一会儿"，并且分段越多越慢
+ * （实测 16 段：1 段 1.54×、4 段 1.73×、12 段 2.15× 慢于理论时长）。
+ *
+ * 但这绝大多数是白费的：用户切分但没删除时，片段在源上**首尾相接**
+ * （[0,1][1,2][2,3]…），播放器本来就会连续往下播，根本不需要跳。
+ * 所以只有"下一段的源起点不等于本段的源终点"（删过中间 / 拖过顺序）时才 seek。
+ */
 function tick() {
   rafId = 0;
   if (!state.src) return;
   if (state.rate < 0) return;                 // 倒带走自己的泵，正放循环不掺和
   const p = $('player');
   if (p.paused) { onTimeUpdate(); return; }
-  const c = state.clips[pb.index];
-  if (!c) { p.pause(); return; }
-  // 帧率取**这一段所属源**的：多素材混剪时各源帧率可能不同（容差按谁算都行，但不能恒用主源）
-  const fps = fpsOf((srcOfClip(c) || {}).media || state.src.media);
-  const slack = (0.5 / fps) * Math.max(1, state.rate);     // 倍速下一帧跨度更大，容差跟着放大
-  if (p.currentTime >= c.end - slack) {
+
+  /**
+   * 一次 rAF 可能跨过好几个短片段（8× 下一帧就推进 0.13s，片段可能只有 0.05s），
+   * 所以这里循环推进，而不是一次只跳一段——否则会落后于时钟、越播越偏。
+   * `guard` 防止极端情况（大量零长片段）把这一帧拖死。
+   */
+  for (let guard = 0; guard < 64; guard++) {
+    const c = state.clips[pb.index];
+    if (!c) { p.pause(); return; }
+    // 帧率取**这一段所属源**的：多素材混剪时各源帧率可能不同
+    const fps = fpsOf((srcOfClip(c) || {}).media || state.src.media);
+    const slack = (0.5 / fps) * Math.max(1, state.rate);   // 倍速下一帧跨度更大，容差跟着放大
+    if (p.currentTime < c.end - slack) break;              // 还在本段内，正常继续
+
     const next = state.clips[pb.index + 1];
     if (!next) { p.currentTime = c.end; p.pause(); onTimeUpdate(); return; }
     pb.index += 1;
+
     /**
      * 跨到下一段时，如果它属于**另一个源**，必须先换 <video> 的 src 再 seek。
      * 不做这一步，播放器会拿上一份素材的画面去对下一段的源时刻——跨素材拼接时
@@ -1095,9 +1147,21 @@ function tick() {
       if (!p.paused) rafId = requestAnimationFrame(tick);
       return;
     }
+
+    /**
+     * 源上连续（本段源终点 == 下一段源起点）：**什么都不做**。
+     * 播放器正播到这里，往下自然就是下一段的画面，跳一下纯属自找卡顿。
+     */
+    if (!seamNeedsSeek(c, next)) continue;
+
+    // 源上不连续（删过中间 / 拖过顺序）：必须定位到下一段的源起点
     p.currentTime = next.start + 0.5 / fps;
-  } else if (p.currentTime < c.start - 0.05) {
-    p.currentTime = c.start + 0.5 / fps;
+    break;                                   // seek 是异步的，等它落地再继续判定
+  }
+
+  if (p.currentTime < (state.clips[pb.index] || {}).start - 0.05) {
+    const c = state.clips[pb.index];
+    if (c) p.currentTime = c.start + 0.5 / fps;
   }
   onTimeUpdate();
   if (!p.paused) rafId = requestAnimationFrame(tick);
@@ -2491,6 +2555,8 @@ window.__smoke = {
   rippleDeleteAfter,
   stepRate,
   pausePlayback,
+  // 接缝是否需要 seek（纯判断，不播放）：自检用它验"连续片段不该反复 seek"
+  seamNeedsSeek,
   mergeBoundary,
   deleteClipAtPlayhead,
   reorderClip,
