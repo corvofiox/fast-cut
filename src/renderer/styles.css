@@ -486,6 +486,10 @@ html, body {
 .checks li .name { flex: 0 0 auto; color: var(--fg); }
 .checks li .detail { color: var(--fg-dim); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .checks .title { color: var(--fg-dim); font-size: 11px; margin: 6px 0 2px; }
+/* 自检结论只留一行（2026-11-04）：通过给绿、未通过给红并加重，
+   不再把十几条 ✓ 全铺出来。 */
+.checks .title.ok { color: var(--ok); }
+.checks .title.bad { color: var(--err); font-weight: 600; }
 
 .result-row { display: flex; gap: 8px; margin: 8px 10px 12px; }
 

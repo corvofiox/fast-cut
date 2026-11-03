@@ -2084,20 +2084,36 @@ function showWarnings(box, list) {
   }
 }
 
+/**
+ * 自检结果只报**没通过**的条目（2026-11-04 用户反馈）。
+ *
+ * 旧实现把十几条全铺出来（✓ 容器一致 / ✓ 视频编码一致 / ✓ 分辨率一致 …），
+ * 导出一部片子就是一面墙，真正要看的"有没有问题"反而被埋掉。现在：
+ *   - 全过 → 只留一行「文件名 — 自检通过（N 项）」；
+ *   - 有不过 → 只列没过的条目（这时产物已经被删掉，用户必须看到原因）。
+ * 完整结果仍留在 lastChecks 里：自动化测试和排查从那儿取，不靠 DOM 反推。
+ */
+let lastChecks = [];
 function showChecks(results) {
+  lastChecks = Array.isArray(results) ? results : [];
   const ul = $('checks');
   ul.innerHTML = '';
-  (results || []).forEach((r) => {
+  for (const r of lastChecks) {
+    const list = r.checks || [];
+    const bad = list.filter((c) => !c.ok);
     const title = document.createElement('li');
-    title.className = 'title';
-    title.textContent = `${String(r.file).split(/[\\/]/).pop()} — ${r.ok ? '通过' : '未通过'}`;
+    title.className = `title ${bad.length ? 'bad' : 'ok'}`;
+    title.textContent = bad.length
+      ? `${baseName(r.file)} — 未通过（${bad.length}/${list.length} 项）`
+      : `${baseName(r.file)} — 自检通过（${list.length} 项）`;
     ul.appendChild(title);
-    for (const c of r.checks || []) {
+    // 只渲染没过的；通过的条目用户不需要逐条读
+    for (const c of bad) {
       const li = document.createElement('li');
-      li.className = c.ok ? 'ok' : 'bad';
+      li.className = 'bad';
       const st = document.createElement('span');
       st.className = 'st';
-      st.textContent = c.ok ? '✓' : '✕';
+      st.textContent = '✕';
       const name = document.createElement('span');
       name.className = 'name';
       name.textContent = c.name;
@@ -2108,7 +2124,7 @@ function showChecks(results) {
       li.append(st, name, detail);
       ul.appendChild(li);
     }
-  });
+  }
 }
 
 async function cancelExport() {
@@ -2576,6 +2592,11 @@ window.__smoke = {
   programTotal,
   keptSeconds,
   runExport,
+  /**
+   * 最近一次导出的**完整**自检结果（含通过的条目）。
+   * 界面上只渲染没过的条目，测试要验"某条通过项存在"时从这里取，别去 DOM 里翻。
+   */
+  lastChecks: () => lastChecks,
   setOption(id, on) {
     const el = $(id);
     el.checked = !!on;

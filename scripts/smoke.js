@@ -67,6 +67,17 @@ function probeOf(file) {
   } catch (e) { return '探针=读取失败：' + (e && e.message); }
 }
 
+/**
+ * 最近一次导出的**完整**自检结果，拼成 `✓名称 细节 | ✗名称 细节`。
+ *
+ * 界面从 2026-11-04 起只渲染没通过的条目，所以"某条通过项存在"这类断言
+ * 必须走 `__smoke.lastChecks()` 这个钩子，不能再去 DOM 里翻。
+ */
+async function checkText(win) {
+  return js(win, '(__smoke.lastChecks() || []).map((r) => (r.checks || [])'
+    + '.map((c) => (c.ok ? "✓" : "✗") + c.name + (c.detail ? " " + c.detail : "")).join(" | ")).join(" | ")');
+}
+
 
 async function waitFor(code, win, timeoutMs = 15000) {
   const until = Date.now() + timeoutMs;
@@ -890,9 +901,9 @@ async function main() {
     check('界面预估的成片时长 = 实际产物，且不吞掉已删素材',
       Math.abs(promise.shown - real) <= 0.25 && Math.abs(promise.plan - real) <= 0.25,
       `预估 ${promise.shown}s · 计划 ${promise.plan.toFixed(3)}s · 实际 ${real.toFixed(3)}s（允差 0.25s）`);
-    const names = JSON.parse(await js(win, `JSON.stringify([...document.querySelectorAll('#checks li')].map((li) => li.textContent))`));
+    const names = await checkText(win);
     check('自检里有「帧数符合切割计划」这条硬判据',
-      names.some((t) => t.includes('帧数符合切割计划')), names.join('、').slice(0, 200));
+      String(names).includes('帧数符合切割计划'), String(names).slice(0, 200));
   }
 
   // 「每段一个文件」的分组数必须来自**预览计划**（和导出一致），不能拿 keepIndex 数凑。
@@ -1184,8 +1195,7 @@ async function main() {
   await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'remux'); 'ok'`);
   await wait(200);
   res = await runExport(win);
-  const remuxChecks = await js(win,
-    `[...document.querySelectorAll('#checks li')].map((li) => (li.classList.contains('bad') ? '✗' : '✓') + li.textContent).join(' | ')`);
+  const remuxChecks = await checkText(win);
   check('remux 成 MKV 通过自检',
     res.ok && extShown === '.mkv' && /容器为所选封装/.test(remuxChecks) && !/容器一致/.test(remuxChecks),
     `后缀 ${extShown} · ${String(remuxChecks).replace(/\s+/g, ' ').slice(0, 100)}`);
@@ -1200,8 +1210,7 @@ async function main() {
   await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'remux-sub'); 'ok'`);
   await wait(200);
   res = await runExport(win);
-  const subChecks = await js(win,
-    `[...document.querySelectorAll('#checks li')].map((li) => (li.classList.contains('bad') ? '✗' : '✓') + li.textContent).join(' | ')`);
+  const subChecks = await checkText(win);
   check('字幕装不下时整条省略且仍通过自检',
     warned && res.ok && /容器为所选封装/.test(subChecks) && /✓字幕轨已按所选容器省略/.test(subChecks)
       && /音轨数量一致/.test(subChecks) && !/字幕轨数量一致/.test(subChecks),
