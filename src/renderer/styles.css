@@ -512,7 +512,8 @@ button.m-row:hover, label.m-row:hover { background: #23272e; }
 .m-label { color: var(--fg); font-size: 12px; }
 .m-label.dim { color: var(--fg-dim); }
 .m-sub { grid-column: 1 / -1; color: #626d7d; font-size: 11px; line-height: 1.5; }
-.m-row.on .m-sub { color: var(--warn); }
+/* 勾选框行的副说明**不随勾选变色**（2026-11-04 用户反馈）：两个勾选框必须长得一样。
+   代价说明已经写在正文里（"代价是切点附近一小段要重新压缩"），不靠颜色区分。 */
 /* 多素材参数不一致：需要用户去选的那两行标红（2026-10-18）。
    红字只出现在"真的必须你动手"的项上——不选就导不出，所以用描边把它拎出来，
    而不是在面板底部堆一段没人看的说明。 */
@@ -549,8 +550,11 @@ button.m-row:hover, label.m-row:hover { background: #23272e; }
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 7px;
 }
 .m-field input[type="text"]:focus { outline: none; border-color: #3b4250; }
-/* 容器下拉与输入框同一长相，只多一个原生箭头 */
+/* 容器下拉与输入框同一长相，只多一个原生箭头。
+   宽度必须写死（2026-11-04 用户反馈）：不写就按最长选项自动撑开，
+   "封装容器"与"编码格式"两个下拉于是长短不一，看着像没对齐。 */
 .m-select {
+  width: 190px;
   font: 12px/1.4 "Cascadia Mono", Consolas, monospace; color: var(--fg);
   background: var(--bg); border: 1px solid var(--line); border-radius: 4px; padding: 4px 6px;
   cursor: pointer;

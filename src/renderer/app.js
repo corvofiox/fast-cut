@@ -2424,8 +2424,14 @@ function bindUi() {
   });
 
   $('optPrecise').addEventListener('change', () => {
-    // 勾选框行染警告黄（唯一"勾上就有代价"的选项），并按新模式重算计划与预估
-    $('optPrecise').closest('.m-row').classList.toggle('on', $('optPrecise').checked);
+    /**
+     * 两个勾选框的视觉必须一致（2026-11-04 用户反馈）。
+     *
+     * 旧实现只给「精确模式」这一行加 `on`，于是勾上时副说明变警告黄、而「每段一个文件」
+     * 勾上时不变——同样是勾选，一个变色一个不变，看着像坏了一半。既然"勾上就有代价"
+     * 这件事已经写在副说明的正文里（"代价是切点附近一小段要重新压缩"），
+     * 就不再靠颜色区分，两行都保持常色。
+     */
     syncTimeline(false);
     refreshPlan();
   });
