@@ -32,10 +32,10 @@ test('入点不在关键帧上：切成 重编码入点段 + 流拷贝其余，�
   assert.ok(!warnings.some((w) => /前移|吸附|回溯/.test(w)), `不该再出现吸附类警告：${warnings.join('、')}`);
 });
 
-test('入点正好落在关键帧上：整段流拷贝，一秒都不多编', () => {
+test('入点正好落在关键帧上：原样搬过去（不重新压缩），一秒都不多编', () => {
   const { plan } = buildPlan([{ start: 4, end: 6 }], OPTS);
   assertPlan(plan, [['copy', 4, 2]]);
-  assert.match(plan[0].note, /整段流拷贝/);
+  assert.match(plan[0].note, /原样搬过去/);
 });
 
 test('多条保留区间各自成计划', () => {
@@ -241,7 +241,7 @@ test('含双向预测（B 帧）的源：拷贝段按解码序留余量，时长
   assert.ok(Math.abs(plan[0].duration - 5.5) < 1e-6, `占位时长应为窗口 5.5s，实际 ${plan[0].duration}`);
   assert.strictEqual(plan[0].frames, Math.round(5.5 * 30) - 2);
   assert.strictEqual(plan[0].trimmed, 2);
-  assert.ok(warnings.some((w) => /双向预测/.test(w)), warnings.join('、'));
+  assert.ok(warnings.some((w) => /结尾会少 \d+ 帧/.test(w)), warnings.join('、'));
 });
 
 test('接到源尾的区间不用留 B 帧余量（后面本来没有帧）', () => {
@@ -290,11 +290,11 @@ test('frameStart：入点向上落到帧网格，原点与无帧率两种情况�
 // 上一条保留段的出点，跨不过去就自动降级为局部精确。
 const SNAP = { ...OPTS, precise: false };
 
-test('吸附：入点前移到最近关键帧，整段流拷贝，snapFrom 保留用户原始入点', () => {
+test('吸附：切点对齐到最近关键帧，原样搬过去，snapFrom 保留用户原始入点', () => {
   const { plan, warnings } = buildPlan([{ start: 3.4, end: 5.2 }], SNAP);
   assertPlan(plan, [['copy', 2, 3.2]]);
   assert.strictEqual(plan[0].snapFrom, 3.4, 'UI 显示"少掉多少"要用原始入点');
-  assert.match(plan[0].note, /前移/);
+  assert.match(plan[0].note, /多带|对齐到关键帧/);
   assert.ok(warnings.length === 0, `不该有警告：${warnings.join('、')}`);
 });
 
@@ -328,7 +328,7 @@ test('吸附防吞钳制：回溯会吞已排段的内容时，该段整段重�
     assert.ok(ov <= 1e-6, `拷贝段 ${i}/${j} 重叠 ${ov}s`);
   }
   // 不管走"起点重合"还是"落进内部"，警告都必须说明"不能吸附"且给出代价
-  assert.ok(warnings.some((w) => /同一个关键帧|重合|交叠/.test(w) && /整段重编码|局部精确/.test(w)),
+  assert.ok(warnings.some((w) => /同一个关键帧|重合|交叠/.test(w) && /整段重编码|局部精确|重新压缩/.test(w)),
     warnings.join('、'));
 });
 

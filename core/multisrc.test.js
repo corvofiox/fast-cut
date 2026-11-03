@@ -98,7 +98,7 @@ test('forceWholeReencode（参数不一致）优先于"入点在关键帧上"', 
   });
   assert.strictEqual(plan.length, 1);
   assert.strictEqual(plan[0].kind, 'reencode', '参数不一致必须整段重编码');
-  assert.match(plan[0].note, /参数与其它素材不一致/, plan[0].note);
+  assert.match(plan[0].note, /格式和别的素材不一样/, plan[0].note);
 });
 
 test('forceWholeReencodeNative（关键帧不可独立起段）与参数不一致是两条独立判据', () => {
@@ -106,5 +106,5 @@ test('forceWholeReencodeNative（关键帧不可独立起段）与参数不一�
     keyframes: [0, 2, 4], fps: 30, duration: 10, precise: true, forceWholeReencodeNative: true,
   });
   assert.strictEqual(plan[0].kind, 'reencode');
-  assert.match(plan[0].note, /关键帧不可独立起段/, plan[0].note);
+  assert.match(plan[0].note, /关键帧不能单独起段/, plan[0].note);
 });

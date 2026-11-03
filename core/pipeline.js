@@ -449,8 +449,7 @@ async function exportSegments(loadedOrSources, segments, opts) {
   if (!dropSubtitles && (media.subtitleCodecs || []).length) {
     subDocs = await extractSubtitleDocs(bins, file, media, tmpDir);
     if (!subDocs) {
-      warnings.push('源含字幕轨，但它不是可重排的文本字幕（只支持 SRT/ASS）：仍按分段流拷贝处理，'
-        + '自检会逐条比对字幕落点，对不上就拒绝交付');
+      warnings.push('这条字幕不是 SRT/ASS，没法跟着剪：导出后会逐条核对，对不上就不交付');
     }
   }
   const stripSubs = !!subDocs;
@@ -482,20 +481,20 @@ async function exportSegments(loadedOrSources, segments, opts) {
       try {
         const w = await makeWorkingCopy(bins, s.file, s.media, tmpDir, token);
         if (sources.length > 1) {
-          warnings.push(`${path.basename(s.file)} 不是 MP4 封装：已把它纯拷成 MP4 工作副本再切（否则按段归零时间戳会丢报文时间戳，实测 MKV 源直接切出的段 pts 为空，拼不了）`);
+          warnings.push(`${path.basename(s.file)} 不是 MP4：已先转成 MP4 工作副本再切`);
         } else {
-          warnings.push('源不是 MP4 封装：多段拼接前已把它纯拷成 MP4 工作副本，否则按段归零时间戳会丢报文时间戳（实测 MKV 源直接切出的段 pts 为空，拼不了）');
+          warnings.push('源不是 MP4：拼接前已先转成 MP4 工作副本');
         }
         return w;
       } catch (err) {
         if (isCancelled(err)) throw err;
         const detail = String(err.message || err).split('\n')[0].slice(0, 90);
-        if (sources.length > 1) warnings.push(`${path.basename(s.file)} 封装归一失败（${detail}），改用源文件直接切割`);
-        else warnings.push(`封装归一失败（${detail}），改用源文件直接切割`);
+        if (sources.length > 1) warnings.push(`${path.basename(s.file)} 转换封装失败（${detail}），改用源文件直接切`);
+        else warnings.push(`转换封装失败（${detail}），改用源文件直接切`);
         return one;
       }
     }));
-    if (sources.length === 1) onProgress({ phase: 'normalize', note: '先把源封装归一成 MP4（纯拷贝，不重编码）' });
+    if (sources.length === 1) onProgress({ phase: 'normalize', note: '先把封装统一成 MP4（不重新压缩）' });
     const src = srcPool[0];
     // 中间段优先写 MP4（原因见 partsAsMp4）；只有必须把字幕带在段里时才沿用目标容器。
     const partExt = partsAsMp4(media, ext, carrySubsInParts) ? '.mp4' : ext;
@@ -528,8 +527,8 @@ async function exportSegments(loadedOrSources, segments, opts) {
       const nonMov = (sources || []).length > 1
         ? '（其中有素材不是 MP4 封装）'
         : (media.video?.vfr ? '，或源是可变帧率' : '');
-      warnings.push('这次导出无法让拷贝段的时间戳严格按帧对齐（源或目标容器不允许）' + nonMov
-        + '——接缝处可能多带 1~2 帧画面：产物内容仍是按你选的区间切的');
+      warnings.push('这次导出没法让接缝严格对齐到帧' + nonMov
+        + '——接缝处可能多带 1~2 帧画面，内容仍是你选的区间');
     }
 
     // 混拼（重编码段与流拷贝段并存）时，拷贝段要把源参数集内嵌进关键帧包：

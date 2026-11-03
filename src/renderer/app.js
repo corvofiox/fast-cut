@@ -321,7 +321,7 @@ async function refreshEnv() {
   const badge = $('verBadge');
   if (badge) badge.textContent = `v${state.env.appVersion || '0.1.0'}`;
   if (state.env.ok) {
-    $('emptyNote').textContent = '导入只读取文件信息（ffprobe 探流 + 扫关键帧），不转码、不复制、不上传。';
+    $('emptyNote').textContent = '导入只读取文件信息，不转码、不复制、不上传。';
   } else {
     $('emptyNote').textContent = '没有可用的内置 ffmpeg，请把 Fast Cut 完整解压后再运行，或重新下载安装包。';
     toast('内置 ffmpeg 不可用：请完整解压 Fast Cut 目录', 'warn');
@@ -426,7 +426,7 @@ async function applySource(src) {
   $('player').src = fileUrl(src.file);
   syncTimeline();
   pullThumbs(src.file);
-  if (state.scanning) toast('已开始预览；正在后台扫描关键帧，长视频可能要等一会儿', 'warn');
+  if (state.scanning) toast('正在后台扫描关键帧，长视频要等一会儿', 'warn');
 }
 
 /**
@@ -610,7 +610,7 @@ function onScanResult(payload) {
   if (which === state.src) state.scanning = false;
   if (!payload.ok) {
     showError(`关键帧扫描失败：${payload.message}`);
-    toast('关键帧扫描失败：无法判断哪些段能整段流拷贝，导出会把每段都重编码', 'warn');
+    toast('关键帧扫描失败，导出会把每段都重新压缩', 'warn');
     updateExportEnabled();
     return;
   }
@@ -621,8 +621,7 @@ function onScanResult(payload) {
   syncSourcesToTimeline();
   updateInfo();
   syncTimeline();
-  const headN = countCost('head');
-  toast(`关键帧扫描完成：${baseName(payload.file)} ${payload.keyframes.length} 个（其中 ${headN} 段需重编码入点）；用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
+  toast(`已扫描 ${baseName(payload.file)}：${payload.keyframes.length} 个关键帧，用时 ${(payload.ms / 1000).toFixed(2)} 秒`);
   updateExportEnabled();
 }
 
@@ -650,28 +649,31 @@ function defaultOutDir(file) {
   return i > 0 ? file.slice(0, i) : file;
 }
 
+/**
+ * 源信息面板（2026-11-03 精简）。
+ *
+ * 这里原来有 13 行，其中"像素格式 yuv420p10le""码率 9.79 Mbps"是纯技术参数：
+ * 用户既看不懂也用不上（真正会影响导出的参数，导出面已经用红字拦下来了）。
+ * 现在只留用户能用来做判断的：什么文件、多大、多长、什么编码、几轨声音/字幕。
+ */
 function updateInfo() {
   const m = state.src && state.src.media;
   if (!m) return;
   const v = m.video || {};
   const rows = [
     ['文件', (String(m.file).split(/[\\/]/).pop() || '').slice(0, 28), ''],
-    ['容器', m.format || '?', ''],
-    ['视频', `${v.codec || '?'}${v.profile ? ` ${v.profile}` : ''}`, ''],
+    ['编码', `${v.codec || '?'}${v.profile ? ` ${v.profile}` : ''}`, ''],
     ['分辨率', `${v.width}×${v.height}`, ''],
-    ['像素格式', v.pixFmt || '?', ''],
     ['帧率', v.fps ? `${v.fps.toFixed(v.fps % 1 ? 3 : 2)} fps` : '?', m.video && m.video.vfr ? 'warn' : ''],
     ['源时长', tc(m.duration), ''],
     ['大小', fmtBytes(m.sizeBytes), ''],
-    ['码率', m.bitRate ? `${(m.bitRate / 1e6).toFixed(2)} Mbps` : '?', ''],
   ];
-  const audios = (m.audioTracks || []).map((a) => `${a.codec}${a.channels ? ` ${a.channels}ch` : ''}`).join(' / ');
-  rows.push(['音轨', `${(m.audioTracks || []).length} 条${audios ? `：${audios}` : ''}`, '']);
+  const audios = [...new Set((m.audioTracks || []).map((a) => `${a.codec}${a.channels ? ` ${a.channels}ch` : ''}`))];
+  const audioN = (m.audioTracks || []).length;
+  rows.push(['音轨', audioN ? `${audioN} 条${audios.length ? ` · ${audios.join(' / ')}` : ''}` : '无', '']);
   rows.push(['字幕轨', String(m.subtitleTracks || 0), '']);
   if (m.rotation) rows.push(['旋转', `${m.rotation}°`, '']);
-  const kfCount = (m.keyframes || []).length;
-  const gap = gopStats(m.keyframes);
-  rows.push(['关键帧', state.scanning ? '扫描中…' : `${kfCount} 个${gap ? ` · 间隔约 ${gap}` : ''}`, state.scanning ? 'warn' : '']);
+  rows.push(['关键帧', state.scanning ? '扫描中…' : `${(m.keyframes || []).length} 个${gopStats(m.keyframes) ? ` · 约每 ${gopStats(m.keyframes)}` : ''}`, state.scanning ? 'warn' : '']);
 
   const dl = $('info');
   dl.innerHTML = '';
@@ -688,21 +690,14 @@ function updateInfo() {
   }
 }
 
+/** 关键帧平均间隔（秒）。最长间隔不进面板——需要时由右侧警告直接说"会不会吞掉已删内容"。 */
 function gopStats(keyframes) {
   const kfs = keyframes || [];
   if (kfs.length < 2) return '';
-  let min = Infinity;
-  let max = 0;
   let sum = 0;
-  for (let i = 1; i < kfs.length; i++) {
-    const d = kfs[i] - kfs[i - 1];
-    min = Math.min(min, d);
-    max = Math.max(max, d);
-    sum += d;
-  }
+  for (let i = 1; i < kfs.length; i++) sum += kfs[i] - kfs[i - 1];
   const avg = sum / (kfs.length - 1);
-  const s = (x) => `${x.toFixed(x < 10 ? 2 : 1)}s`;
-  return max - min < 0.01 ? s(avg) : `${s(avg)}（最长 ${s(max)}）`;
+  return `${avg.toFixed(avg < 10 ? 2 : 1)}s`;
 }
 
 // ---------------------------------------------------------------- 预览与播放头
@@ -932,8 +927,8 @@ function toggleKeyframeSnap() {
   btn.classList.toggle('on', state.snapKf);
   btn.setAttribute('aria-pressed', String(state.snapKf));
   btn.title = state.snapKf
-    ? '播放头磁吸关键帧（拖动刻度条时自动吸到最近的关键帧）'
-    : '播放头自由拖动（不吸关键帧；片段边界仍会吸附）';
+    ? '拖动刻度条时吸到最近的关键帧'
+    : '自由拖动（片段边界仍会吸）';
   if (tl) tl.setKeyframeSnap(state.snapKf);
   // 开关一翻，上一次的磁吸结论就作废了：开着时留下的"磁吸·关键帧"必须撤掉
   lastSnap = null;
@@ -1018,7 +1013,7 @@ function applyRate(r) {
 function resumePlay() {
   const p = $('player');
   if (playheadProgram() >= programTotal() - 0.01) seekProgram(0);
-  p.play().catch(() => toast('无法播放：该编码可能不被内置预览器支持，导出不受影响', 'warn'));
+  p.play().catch(() => toast('预览解不了这种编码，导出不受影响', 'warn'));
 }
 
 function togglePlay() {
@@ -1564,13 +1559,13 @@ function showCodecRequired(compat) {
   box.innerHTML = '';
   const line1 = document.createElement('div');
   line1.className = 'note-strong';
-  line1.textContent = '这些素材的参数不一致，无法直接流拷贝拼接，请选择封装与编码格式';
+  line1.textContent = '这几段素材参数不一致，请选好封装和编码';
   const line2 = document.createElement('div');
   line2.textContent = diffs;
   const line3 = document.createElement('div');
   const base = compat.baseline;
   line3.textContent = base
-    ? `其余参数将统一到 ${base.width}×${base.height} @ ${base.fps}fps（基准取自参数最强的那份素材）`
+    ? `统一到 ${base.width}×${base.height} @ ${base.fps}fps`
     : '';
   box.append(line1, line2, line3);
   box.classList.remove('hidden');
@@ -1590,7 +1585,7 @@ function updateCodecHint() {
       box.innerHTML = '';
       const d = document.createElement('div');
       d.className = 'note-soft';
-      d.textContent = `素材参数一致（${compat.baseline?.width}×${compat.baseline?.height} @ ${compat.baseline?.fps}fps）——「跟随源」可全程流拷贝，零损失`;
+      d.textContent = `参数一致，可以全程不重新压缩（${compat.baseline?.width}×${compat.baseline?.height} @ ${compat.baseline?.fps}fps）`;
       box.appendChild(d);
       box.classList.remove('hidden');
     } else {
@@ -1608,8 +1603,8 @@ function updateCodecHint() {
   d.className = 'note-soft';
   const base = compat.baseline || {};
   d.textContent = reN
-    ? `${reN} 份素材参数与其它不一致，导出时整段重编码为 ${chosen}（有损），统一到 ${base.width}×${base.height} @ ${base.fps}fps`
-    : `将统一编码为 ${chosen}（所有素材都需重编码）`;
+    ? `${reN} 份素材要整段重新压缩为 ${chosen}，统一到 ${base.width}×${base.height} @ ${base.fps}fps`
+    : `全部素材重新压缩为 ${chosen}`;
   box.appendChild(d);
   box.classList.remove('hidden');
   $('rowCodec')?.classList.remove('need');
@@ -1714,23 +1709,21 @@ function renderClips() {
     li.append(idx, time, len, badge);
     const cost = costMap()[i];
     /**
-     * 代价做成第一行末尾的一个小标签（2026-10-18 用户反馈"文本太多"）。
+     * 代价做成第一行末尾的一个小标签（2026-10-18 用户反馈"文本太多"，2026-11-03 再去术语）。
      *
-     * 旧写法第二行整行写 `源 00:26:58.607–00:29:53.485 · 入点小段重编码`——第一行已经写了
-     * 成片区间，第二行再把源区间抄一遍，11 段就是 22 行时间码，真正要一眼扫到的
-     * "这段要不要重编码"反而被埋了。现在：源区间进悬停提示，代价压缩成一个短标签。
-     * 颜色沿用既有语义（纯拷贝=绿、有损=橙），不新增要学的颜色。
+     * 标签只留"要不要重新压缩"这一层信息：旧文案「纯拷贝 / 入点重编码 / 整段重编码」
+     * 是编码行话，用户看不懂"拷贝""重编码"在说谁。现在说人话，细节进悬停提示。
      */
     const lossy = cost && cost !== 'copy';
     const chip = document.createElement('span');
     chip.className = 'cost' + (lossy ? ' lossy' : '') + (cost ? '' : ' pending');
-    chip.textContent = { copy: '纯拷贝', head: '入点重编码', whole: '整段重编码', codec: '换编码' }[cost] || '待计划';
+    chip.textContent = { copy: '不压缩', head: '开头压缩', whole: '整段压缩', codec: '换编码' }[cost] || '待计划';
     const costFull = {
-      copy: '整段流拷贝（不转码）',
-      head: '入点那一小段有损重编码，其余仍流拷贝',
-      whole: '这一整段在同一个 GOP 内：有损重编码',
-      codec: '整段重编码并更换编码格式',
-    }[cost] || '计划还没算出来';
+      copy: '原样搬过去，不重新压缩',
+      head: '只把开头一小段重新压缩，其余原样搬',
+      whole: '整段重新压缩',
+      codec: '整段重新压缩并换编码',
+    }[cost] || '还在算';
     chip.title = `${rowTitle}\n源 ${tcShort(c.start)}–${tcShort(c.end)} · ${costFull}`;
     li.append(chip);
     li.title = chip.title;
@@ -1756,12 +1749,12 @@ function renderClips() {
   if (btnMerge) {
     btnMerge.disabled = nSel < 2;
     btnMerge.title = nSel < 2
-      ? '按住 Ctrl 点选至少两段，就能把这几段并成一次导出'
-      : `把选中的 ${nSel} 段并成一次导出（拼进同一个文件）`;
+      ? '按住 Ctrl 点选至少两段'
+      : `把选中的 ${nSel} 段拼进同一个文件`;
   }
   if (btnUnmerge) {
     btnUnmerge.disabled = !anyGroup;
-    btnUnmerge.title = anyGroup ? '拆开选中片段所在的分组' : '当前没有合并的分组';
+    btnUnmerge.title = anyGroup ? '拆开选中片段所在的组' : '当前没有合并的组';
   }
   const hints = $('planHints');
   hints.innerHTML = '';
@@ -1869,48 +1862,49 @@ function updateEstimate() {
   const lines = [
     `<b>${split ? outputFileCount() : 1} 个文件</b> · 成片 <b>${tc(estSecs)}</b> · <b>${fmtBytes(bytes)}</b>`,
   ];
+  /**
+   * 预估行只回答两个问题：**会出来什么**、**有没有代价**（2026-11-03 精简）。
+   *
+   * 这里曾经有 5 条 ✂ 开头的长句（"吸附会吞掉已删的间隙：已自动改为局部精确"、
+   * "整段在同一个 GOP 内"、"源编码没有同编码的重编码器"…）。它们全是**实现细节**：
+   * 用户看到 11 段就得到 5 行技术说明，真正要判断的"要不要重新压缩"反而被埋掉。
+   * 现在代价只留一行计数（哪几段、什么原因由右侧警告与片段上的标签各说一遍），
+   * 预估框回到"文件数 / 时长 / 体积 + 真有损失时的一句提醒"。
+   */
   const headN = countCost('head');
   const wholeN = countCost('whole');
   const codecN = countCost('codec');
-  const autoN = (() => {
-    const list = Array.isArray(parts) ? parts : [];
-    return new Set(list.filter((p) => p.autoPrecise).map((p) => p.keepIndex)).size;
-  })();
-  const snapN = (() => {
-    const list = Array.isArray(parts) ? parts : [];
-    return new Set(list.filter((p) => p.kind === 'copy' && p.role === 'whole' && /前移到关键帧|从 0 开始/.test(p.note || '')).map((p) => p.keepIndex)).size;
-  })();
-  if (!isPreciseMode()) {
-    // 吸附模式的预估：把"多带了什么"如实列出
-    const extra = (Array.isArray(parts) ? parts : []).reduce((a, p) => a + Math.max(0, (p.snapFrom != null ? p.snapFrom - p.start : 0)), 0);
-    if (extra > 0.05) lines.push(`⚠ 吸附关键帧：会多带开头共 ${extra.toFixed(3)}s（切点对准关键帧可避免，或勾「精确模式」）`);
-    if (autoN) lines.push(`✂ ${autoN} 段吸附会吞掉已删的间隙：已自动改为局部精确（入点小段重编码）`);
-  }
-  if (headN) lines.push(`✂ ${headN} 段入点那一小段重编码：其余仍流拷贝`);
-  if (wholeN) lines.push(`✂ ${wholeN} 段整段在同一个 GOP 内：有损重编码`);
-  const srcCodec = state.src.media.video && state.src.media.video.codec;
-  if (codecN) lines.push(`⚠ ${codecN} 段整段换编码重编码：源编码 ${esc(srcCodec || '?')} 没有同编码的重编码器`);
   const parts2 = (state.plan && state.plan.plan) || [];
-  const trimmed = parts2.reduce((a, p) => Math.max(a, p.trimmed || 0), 0);
-  if (trimmed) lines.push(`· 源含双向预测帧：拷贝段的末端留了 ${trimmed} 帧余量，不会把你删掉的素材带回来`);
+  const lossyN = headN + wholeN + codecN;
+  if (!isPreciseMode()) {
+    // 默认模式的代价是"开头多带一点"：这是唯一用户能感知、也只能在这里提前说的
+    const extra = parts2.reduce((a, p) => a + Math.max(0, (p.snapFrom != null ? p.snapFrom - p.start : 0)), 0);
+    if (extra > 0.05) lines.push(`⚠ 开头共多带 ${extra.toFixed(3)}s（勾「精确模式」可避免）`);
+  }
+  if (lossyN) {
+    const total = state.clips.length;
+    lines.push(lossyN >= total
+      ? `· 全部 ${total} 段都要重新压缩`
+      : `· ${lossyN} 段要重新压缩，其余原样搬过去`);
+  }
   const mode = state.plan && state.plan.subtitleMode;
   const subTracks = (state.src.media.subtitleCodecs || []).length;
   if (mode === 'unsupported' && parts2.length > 1) {
-    lines.push(`⚠ 源含 ${subTracks} 条字幕轨但不是可重排的文本字幕（只支持 SRT/ASS）：分段流拷贝会漏掉/串动字幕，导出会被自检拒绝。出路：让每个入点都落在关键帧上（实测整段流拷贝的那一刀字幕一条不缺），或改选会省略这条字幕轨的容器、把字幕当外挂文件另行处理`);
+    lines.push('⚠ 这条字幕没法跟着剪：让每个切点落在关键帧上，或换个能装字幕的容器');
   } else if (mode === 'retime') {
-    lines.push(`· ${subTracks} 条字幕轨按保留区间重新计时（文本重排，不改编码）`);
+    lines.push(`· ${subTracks} 条字幕跟着剪重新计时`);
   }
   if (planSecs != null && Math.abs(planSecs - keepSecs) > 0.05) {
-    lines.push(`· 计划比选区${planSecs > keepSecs ? '多' : '少'} ${Math.abs(planSecs - keepSecs).toFixed(3)}s（整帧取整）`);
+    lines.push(`· 成片比选区${planSecs > keepSecs ? '多' : '少'} ${Math.abs(planSecs - keepSecs).toFixed(3)}s（按整帧对齐）`);
   }
-  if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 疑似 VFR（标称与实测帧率差 1% 以上）：每段整段重编码为定帧率，时长与剪辑位置才准');
+  if (state.src.media.video && state.src.media.video.vfr) lines.push('⚠ 帧率不稳，会统一成固定帧率');
   // 换封装的代价必须在这里说清楚，而不是等 ffmpeg 报 "Could not find tag for codec"
   const cont = state.plan && state.plan.container;
   if (cont) {
     $('outExt').textContent = cont.ext;
     const dropped = cont.droppedSubtitles || [];
     if (dropped.length) {
-      lines.push(`⚠ ${esc(cont.label)} 装不下字幕轨（${esc(dropped.join('、'))}），将整条省略；要保留字幕请选 MKV`);
+      lines.push(`⚠ ${esc(cont.label)} 装不下字幕轨（${esc(dropped.join('、'))}），字幕会被丢掉；要保留请选 MKV`);
     }
   }
   box.innerHTML = lines.join('<br>');
@@ -1930,15 +1924,15 @@ function updateExportEnabled() {
   const secs = keptSeconds();
   const why = !state.src ? '先导入视频'
     : !(state.env && state.env.ok) ? '未找到可用的 ffmpeg'
-      : state.scanning ? '正在关键帧扫描，扫完才能确定哪些段能整段流拷贝'
+      : state.scanning ? '正在扫描关键帧，稍等'
         : !state.clips.length ? '素材全被删了，至少留一段'
           : secs < MIN_KEEP ? '剩余素材总长小于一帧，无法导出'
             : !$('outDir').value ? '先选择导出目录'
               : state.busy ? '导出进行中' : '';
   $('btnExport').disabled = !!why;
   $('btnExport').title = why || (isPreciseMode()
-    ? '精确模式：剪辑位置精确到帧，入点不回溯，拷贝段整段流拷贝'
-    : '吸附模式（默认）：切点前移到最近关键帧，整段流拷贝、零重编码');
+    ? '精确模式：切点精确到帧（切点附近会重新压缩）'
+    : '默认模式：切点自动对齐关键帧，不重新压缩');
 }
 
 // ---------------------------------------------------------------- 导出
@@ -2033,11 +2027,11 @@ function onProgress(evt) {
       setProgress(`准备导出 ${evt.segments.length} 段`, 2, `合计 ${Number(evt.keepSecs).toFixed(3)} s`);
       break;
     case 'normalize':
-      setProgress('封装归一（纯拷贝，不重编码）', 3, evt.note || '');
+      setProgress('整理封装（不重新压缩）', 3, evt.note || '');
       break;
     case 'cut':
       state.cut = { index: evt.index, total: evt.total || 1, ratio: 0 };
-      setProgress(`切割 ${evt.index + 1}/${evt.total}（${evt.kind === 'copy' ? '流拷贝' : '重编码'}）`,
+      setProgress(`切割 ${evt.index + 1}/${evt.total}`,
         pctForItem(), `${evt.range}${evt.note ? ` · ${evt.note}` : ''}`);
       break;
     case 'cut-progress':
@@ -2045,7 +2039,7 @@ function onProgress(evt) {
       setProgress(`切割 ${state.cut.index + 1}/${state.cut.total}`, pctForItem(), evt.range || '');
       break;
     case 'verify':
-      setProgress('自检中（比对源参数 + 解码校验）', 92, '');
+      setProgress('自检中', 92, '');
       break;
     case 'done':
       setProgress('导出完成', 100, '');
@@ -2120,7 +2114,7 @@ function showChecks(results) {
 async function cancelExport() {
   if (!state.busy) return;
   await window.fc.exportCancel();
-  setProgress('正在取消…', Number($('progressPct').textContent) || 0, '终止 ffmpeg 进程并清理半成品');
+  setProgress('正在取消…', Number($('progressPct').textContent) || 0, '清理半成品');
 }
 
 // ---------------------------------------------------------------- 快捷键面板
@@ -2180,6 +2174,7 @@ function comboOf(e) {
 const KEY_PRETTY = {
   arrowleft: '←', arrowright: '→', arrowup: '↑', arrowdown: '↓',
   backspace: 'Backspace', escape: 'Esc', ' ': 'Space', ctrl: 'Ctrl', shift: 'Shift', alt: 'Alt',
+  home: 'Home', end: 'End', pageup: 'PageUp', pagedown: 'PageDown', delete: 'Delete', insert: 'Insert',
 };
 
 function prettyKey(combo) {
@@ -2356,7 +2351,7 @@ function bindUi() {
   });
   p.addEventListener('error', () => {
     if (!state.src) return;
-    toast('预览器无法解码该视频（常见于 HEVC／AV1）。这只影响预览，导出不受影响：默认吸附模式下整段流拷贝；勾了「精确模式」则只重编码入点那一小段。', 'warn');
+    toast('预览解不了这种编码（常见于 HEVC／AV1），只影响预览，导出不受影响', 'warn');
   });
 
   $('btnImportEmpty').addEventListener('click', pickAndImport);

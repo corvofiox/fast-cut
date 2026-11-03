@@ -67,14 +67,14 @@ test('不同原因不互相吃掉：吸附与 B 帧两类各自留一条', () =>
   });
   assert.ok(warnings.length <= 4, `两类原因 → 最多几条，实际 ${warnings.length}：\n${warnings.join('\n')}`);
   assert.ok(warnings.some((w) => /关键帧|吸附/.test(w)), `应有一条讲吸附/关键帧：\n${warnings.join('\n')}`);
-  assert.ok(warnings.some((w) => /双向预测/.test(w)), `应有一条讲 B 帧余量：\n${warnings.join('\n')}`);
+  assert.ok(warnings.some((w) => /结尾会少 \d+ 帧/.test(w)), `应有一条讲结尾少几帧：\n${warnings.join('\n')}`);
 });
 
 test('聚合不吞信息：段号集合要覆盖实际受影响的段', () => {
   const { warnings, plan } = buildPlan(staggered(11), { ...OPT, precise: false, reorderDepth: 2 });
   const trimmedSegs = [...new Set(plan.filter((p) => p.trimmed > 0).map((p) => p.keepIndex + 1))].sort((a, b) => a - b);
-  const bframe = warnings.find((w) => /双向预测/.test(w));
-  assert.ok(bframe, '应有 B 帧余量警告');
+  const bframe = warnings.find((w) => /结尾会少 \d+ 帧/.test(w));
+  assert.ok(bframe, '应有结尾少几帧的警告');
   const listed = /（第 ([\d、]+) 段）$/.exec(bframe)[1].split('、').map(Number);
   assert.deepStrictEqual(listed, trimmedSegs, `警告列的段号要与计划里真被裁的段一致：${bframe}`);
 });

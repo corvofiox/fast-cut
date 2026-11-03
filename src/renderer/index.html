@@ -47,7 +47,7 @@
         <video id="player" preload="auto" playsinline></video>
         <div id="empty">
           <div class="empty-title">把视频文件拖进来</div>
-          <div class="empty-sub">只做裁剪 · 能拷就拷 · mp4 / mov / mkv / webm …</div>
+          <div class="empty-sub">只做裁剪，不重新压缩 · mp4 / mov / mkv / webm …</div>
           <button id="btnImportEmpty" class="btn primary big">选择文件</button>
           <div class="empty-note" id="emptyNote"></div>
         </div>
@@ -65,7 +65,7 @@
         <button id="btnRedo" class="btn icon tiny" title="重做 (Ctrl+Y)">↷</button>
         <button id="btnReset" class="btn icon tiny" title="恢复整条素材">↺</button>
         <span class="sep-line"></span>
-        <button id="btnSnapKf" class="btn icon tiny on" aria-pressed="true" title="播放头磁吸关键帧（拖动刻度条时自动吸到最近的关键帧）">磁吸</button>
+        <button id="btnSnapKf" class="btn icon tiny on" aria-pressed="true" title="拖动刻度条时吸到最近的关键帧">磁吸</button>
         <span class="sep-line"></span>
         <span id="hud" class="hud"></span>
         <div class="grow"></div>
@@ -84,7 +84,7 @@
       </div>
 
       <div id="tlFoot">
-        <div id="tlScroll" title="拖动滑块或点击轨道横向滚动"><i id="tlThumb"></i></div>
+        <div id="tlScroll" title="拖动或点击这里横向滚动"><i id="tlThumb"></i></div>
         <div id="zoomGroup">
           <button id="btnFit" class="btn tiny" title="整条时间线 (Ctrl+0)">适应</button>
         </div>
@@ -104,8 +104,8 @@
         <ul id="keepList" class="keeps"></ul>
         <div id="planHints" class="hints"></div>
         <div class="keep-tools">
-          <button id="btnMergeGroup" class="btn tiny" disabled title="按住 Ctrl 点选至少两段，就能把这几段并成一次导出">并成一段导出</button>
-          <button id="btnUnmergeGroup" class="btn tiny" disabled title="拆开选中片段所在的分组">拆开</button>
+          <button id="btnMergeGroup" class="btn tiny" disabled title="按住 Ctrl 点选至少两段">并成一段导出</button>
+          <button id="btnUnmergeGroup" class="btn tiny" disabled title="拆开选中片段所在的组">拆开</button>
           <span class="grow"></span>
           <span id="keepTotal" class="tc dim"></span>
         </div>
@@ -124,7 +124,7 @@
     <button class="m-row" id="btnImportAppend">
       <span class="m-label">追加导入…</span><kbd class="m-chip">Ctrl+Shift+O</kbd>
     </button>
-    <div class="modal-tip">「追加导入」把新素材接到轨道末尾，不动已有的片段。素材参数不一致时，导出前需要选择统一的封装与编码。</div>
+    <div class="modal-tip">「追加导入」把新素材接到末尾，不动已经剪好的片段。</div>
     <div class="m-foot"><span class="grow"></span><button class="btn" data-close="importMask">关闭</button></div>
   </div>
 </div>
@@ -132,16 +132,16 @@
 <div id="exportMask" class="modal-mask hidden">
   <section class="modal export">
     <h3>导出</h3>
-    <div class="modal-tip">默认吸附关键帧整段流拷贝（零损失、最快）；「精确模式」逐帧切点，入点那一小段有损重编码（CRF 18、同 profile）。</div>
+    <div class="modal-tip">默认不重新压缩：最快，也不掉画质。</div>
     <label class="m-row">
       <span class="m-label">精确模式</span>
       <input type="checkbox" id="optPrecise" />
-      <span class="m-sub">入点精确到帧，不吸附关键帧；代价是入点那一小段做<b>有损重编码</b></span>
+      <span class="m-sub">切点精确到帧；代价是切点附近一小段要重新压缩</span>
     </label>
     <label class="m-row">
       <span class="m-label">每段一个文件</span>
       <input type="checkbox" id="optSplit" />
-      <span class="m-sub">默认按顺序拼接成一个文件；勾选后每段一个文件（<code>-01</code> / <code>-02</code> / …）。在右侧把几段「并成一段导出」后，那一组算一个文件</span>
+      <span class="m-sub">勾选后每段单独一个文件（<code>-01</code> / <code>-02</code> …）</span>
     </label>
     <div class="m-row">
       <span class="m-label">输出目录</span>
@@ -153,17 +153,17 @@
     <div class="m-row" id="rowContainer">
       <span class="m-label">封装容器</span>
       <span class="m-field">
-        <select id="outContainer" class="m-select" title="只换封装，不重编码"></select>
+        <select id="outContainer" class="m-select" title="只换封装，不重新压缩"></select>
       </span>
     </div>
     <div class="m-row" id="rowCodec">
       <span class="m-label">编码格式</span>
       <span class="m-field">
-        <select id="outCodec" class="m-select" title="多段素材参数不一致时，必须选一个统一编码">
-          <option value="">跟随源（仅参数一致时可用）</option>
+        <select id="outCodec" class="m-select" title="素材参数不一致时，需要选一个统一编码">
+          <option value="">跟随源</option>
           <option value="h264">H.264（最通用）</option>
-          <option value="hevc">H.265 / HEVC（体积更小）</option>
-          <option value="av1">AV1（体积最小，编码慢）</option>
+          <option value="hevc">HEVC（体积更小）</option>
+          <option value="av1">AV1（体积最小，最慢）</option>
         </select>
       </span>
     </div>

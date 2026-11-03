@@ -99,7 +99,7 @@ async function ffmpegVersion(ffmpeg) {
 async function doLoad(file) {
   const bins = resolveBins();
   if (!bins.ffmpeg || !bins.ffprobe) {
-    throw new Error('未找到 ffmpeg / ffprobe。请安装 FFmpeg 并加入 PATH，或在"设置"里指定其 bin 目录。');
+    throw new Error('没找到内置的 ffmpeg：安装包可能不完整，请重新下载或完整解压后再运行。');
   }
   const abs = path.resolve(String(file));
   const cached = state.loaded.get(abs);
@@ -631,8 +631,8 @@ async function startExport(win, payload) {
   let reencodeSources = [];
   if (compat && !compat.uniform) {
     if (!payload.codec) {
-      throw new Error('这些素材的参数不一致（分辨率/帧率/编码/音频），无法直接流拷贝拼接：'
-        + '请在导出面板里选择**封装**与**编码格式**后重试。');
+      throw new Error('这几段素材参数不一致，不能直接拼：'
+        + '请先选好封装和编码格式再导出。');
     }
     const base = withTargetCodec(compat.baseline, targetCodec);
     normalizeTo = {
@@ -863,7 +863,7 @@ function registerIpc(getWindow) {
     type: 'info',
     title: 'Fast Cut',
     message: `Fast Cut v${app.getVersion()}`,
-    detail: '给录制视频做粗剪的 Windows 工具：轻、快、不掉画质。默认吸附关键帧、整段流拷贝（零重编码、最快）；勾选「精确模式」则切点逐帧精确，只重编码入点那一小段。不上传、不写源文件。',
+    detail: '给录屏做粗剪的小工具：快，而且默认不掉画质。不上传、不改源文件。',
     buttons: ['知道了'],
   }));
   ipcMain.handle('fc:app:quit', () => app.quit());
