@@ -30,6 +30,16 @@ const DIR = path.join(ROOT, 'tmp', 'codecs');
 const SEGS = [{ start: 0.5, end: 2.3 }, { start: 4.1, end: 6.7 }, { start: 8.0, end: 9.5 }];
 
 /**
+ * 判分必须用**随包那份** ffmpeg（2026-11-03，与 smoke 同一条理由）。
+ *
+ * core/ffmpegPath 的 COMMON_DIRS 把 `D:\Software\ffmpeg\bin` 排在随包版之前，而那里
+ * 11-03 02:56 换上了 ffmpeg 9.0.2。同一份产物，随包版只报无害的 dts 噪音（判通过），
+ * 9.0.2 报 `Could not find ref with POC`（判失败）——判分标准会随机器上装了什么而变，
+ * 绿灯就不可信了。这里钉死随包版，和发布物保持一致。
+ */
+process.env.FAST_CUT_FFMPEG_DIR = path.join(ROOT, 'vendor', 'ffmpeg');
+
+/**
  * 长素材专用区间（配合 fx.segs === 'long' 的素材）。
  * 每条区间都跨多个关键帧：入点不在关键帧上 → 重编码头段；后面还有长拷贝尾段。
  * 两三条这样的区间拼起来就是 R→C→R→C，正是混拼参数集错乱的必要形态。

@@ -678,6 +678,13 @@ async function startExport(win, payload) {
         : '';
       throw new Error(`自检未通过，已删除产物：\n${detail || '未知原因'}${hint}`);
     }
+    /**
+     * 接缝修补留痕（2026-11-03）：改了哪几段的接入点类型，写进主进程日志。
+     * 自检日志里能对上"这一刀动过码流"，出问题时不用再猜。
+     */
+    if (result.splice && result.splice.patched) {
+      console.log(`[splice] 接缝修补 ${result.splice.patched} 段：${result.splice.segments.join(', ')}`);
+    }
     return { ...result, outPath };
   } finally {
     state.job = null;

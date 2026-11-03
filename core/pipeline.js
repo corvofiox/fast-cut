@@ -16,8 +16,35 @@ const { probeMedia, probeKeyframes, run, sourceSubtitleCues, probeHasRasl } = re
 const { familyOfFormat, familyOfExt, byId, byExt } = require('./containers');
 const { parseSrt, parseAss, applyRetime, retime, isTextSubtitle } = require('./subtitles');
 const { argsForSegment, argsForConcat, concatListBody, listPathOf, fmtTime, keepsSourceCodec, pickVideoCodec, CODEC_OF_ENCODER } = require('./buildArgs');
+const { patchSegmentFirstKeyframe } = require('./hevcSplice');
 const { verifyExport } = require('./verify');
 const { ffmpegPath, ffprobePath } = require('./ffmpegPath');
+
+/**
+ * 取一个 MP4 里**首个视频包**在文件中的字节位置与长度（接缝修补用）。
+ * 取不到就返回 null——修补是可选的加固，不能因为它读不到就中断导出。
+ *
+ * 注意：必须按**字段名**取（JSON），不能用 csv。`-of csv=p=0` 是按 ffprobe 的
+ * 内部字段顺序输出的，不是按你请求的顺序——实测请求 `pos,size` 拿到的是
+ * `7264,258`，而实际 size=7264、pos=258，照 pos=7264 去读会读到一段垃圾，
+ * 修补于是静默不生效（2026-11-03 踩过一次）。
+ */
+async function firstVideoPacket(bins, file) {
+  try {
+    const { stdout } = await run(bins.ffprobe, [
+      '-v', 'error', '-select_streams', 'v:0',
+      '-show_entries', 'packet=pos,size', '-of', 'json',
+      '-read_intervals', '%+#1', file,
+    ]);
+    const first = (JSON.parse(stdout).packets || [])[0];
+    if (!first) return null;
+    const pos = Number(first.pos);
+    const size = Number(first.size);
+    return Number.isFinite(pos) && pos >= 0 && Number.isFinite(size) ? { pos, size } : null;
+  } catch {
+    return null;
+  }
+}
 
 /** 可取消令牌 */
 function createToken() {
@@ -436,6 +463,9 @@ async function exportSegments(loadedOrSources, segments, opts) {
   // 中间文件落在**输出盘**（见 makeTempDir 注释：以前写系统临时盘，大素材必爆）
   const tmpDir = await makeTempDir(outPath);
   const partFiles = [];
+  /** 接缝修补记账：把切点上的 CRA 改成 BLA 的段数（写进结果，供自检日志对账）。 */
+  let splicePatched = 0;
+  const spliceDetail = [];
   const ext = path.extname(outPath) || '.mp4';
   // 输出文件名在切割前就确定，取消时才能把半成品全部清掉。
   const groups = groupByKeep(plan);
@@ -562,6 +592,34 @@ async function exportSegments(loadedOrSources, segments, opts) {
       });
       onProgress({ phase: 'cut', index: i, total: plan.length, kind: item.kind, range: `${fmtTime(item.start)}→${fmtTime(item.start + item.duration)}`, note: item.note });
       await runWithProgress(bins.ffmpeg, args, item, onProgress, token);
+      /**
+       * 开放 GOP 的 HEVC 拷贝段：把切点上的 **CRA 改写成 BLA**（2026-11-03）。
+       *
+       * 不这么做，拼接后的接缝在严格解码器下会报"缺参考帧"（实测 `Could not find ref
+       * with POC 116`，`-xerror` 直接失败）：CRA 后面的 RASL 画面显示时刻早于切点，
+       * 参考的是上一个 GOP 的画面，而那批画面不在产物里。单独播这一段时封装层把负时间戳
+       * 的 RASL 标成丢弃，所以看不出问题；一拼接、重新计时，丢弃标记就丢了。
+       *
+       * 改成 BLA 是规范给"断链拼接"准备的做法：解码器据此置 NoRaslOutputFlag 并丢弃
+       * RASL——**帧一个不少、时间戳一个不动**，只是让码流自己说明"这里接不上"。
+       *
+       * 判据故意**不看探测结果**：patchPacket 自己会读首包的 NAL 类型，只有真的是 CRA
+       * 才改（IDR/BLA 原样放行）。这样关键帧缓存命中的导入（不跑扫描、没有 hasRasl）
+       * 也不会漏掉修补，闭合 GOP 的源则什么都不做。
+       * 只处理 ISO-BMFF（mp4/mov/m4v）中间段：修补靠 4 字节长度前缀定位 NAL，
+       * 这几个封装是同一套结构；mkv 等别的封装不猜（实测 .mov 输出曾因只放行 .mp4
+       * 而漏掉修补，矩阵 hevc-mov 两格因此打红）。
+       */
+      if (item.kind === 'copy'
+          && familyOfExt(partExt) === 'mov'
+          && (srcOfItem.media.video || {}).codec === 'hevc'
+          && item.start > 1e-3) {
+        const pk = await firstVideoPacket(bins, partFile);
+        if (pk) {
+          const r = patchSegmentFirstKeyframe(partFile, pk);
+          if (r.changed) { splicePatched++; spliceDetail.push(`seg${i}@${item.start.toFixed(2)}s`); }
+        }
+      }
       partFiles.push(partFile);
     }
     /**
@@ -751,7 +809,8 @@ async function exportSegments(loadedOrSources, segments, opts) {
     }
     onProgress({ phase: 'done', outputs, warnings, results });
 
-    return { outputs, warnings, results, keepSecs: totalKeep, ok: results.every((r) => r.ok) };
+    return { outputs, warnings, results, keepSecs: totalKeep, ok: results.every((r) => r.ok),
+      splice: { patched: splicePatched, segments: spliceDetail } };
   } catch (err) {
     if (isCancelled(err)) {
       for (const p of [...new Set([outPath, ...outNames])]) await safeRemove(p);
@@ -1079,6 +1138,18 @@ async function probePureCopySeams(loaded, opts = {}) {
       } catch (err) {
         cutFail = String(err.message).split('\n')[0].slice(0, 100);
         break;
+      }
+      /**
+       * 样段也要走**和导出完全一样**的接缝修补（2026-11-03）。
+       *
+       * 探针的职责是"预测真实导出的产物能不能解"，所以它必须复现生产路径。
+       * 以前它测的是"不修补的拼接"，导出却已经修补了——探针判"不安全"、导出其实没问题，
+       * 于是吸附模式白白多做一次开头重编码。探针与生产不一致，正是本轮
+       * "同一份产物两个结论"那类问题的根源，这里把它对齐。
+       */
+      if ((media.video || {}).codec === 'hevc' && copy.start > 1e-3) {
+        const pk = await firstVideoPacket(bins, out);
+        if (pk) patchSegmentFirstKeyframe(out, pk);
       }
       // 单段自解：这一层决定"接缝缓解够不够"
       if (!segBad) {
