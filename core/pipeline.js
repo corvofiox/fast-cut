@@ -1006,24 +1006,52 @@ async function probePureCopySeams(loaded, opts = {}) {
   const fps = Number(media?.video?.fps) > 0 ? Number(media.video.fps) : 30;
   const dur = Number(media?.duration) || 0;
   const none = { safe: true, segmentsOk: true, concatOk: true, detail: '', ms: 0, segs: 0 };
-  if (kfs.length < 3 || dur <= 0) return { ...none, detail: '关键帧/时长不足，跳过' };
+  /**
+   * 关键帧太少（<3）就没有"多段拼接"可测。旧实现当作安全放行——
+   * 短素材因此永远得不到接缝缓解。现在按"无法验证 = 不安全"处理（2026-11-03）。
+   */
+  if (kfs.length < 3 || dur <= 0) {
+    return { ...none, safe: false, concatOk: false, detail: `关键帧只有 ${kfs.length} 个，无法验证接缝：按"不安全"处理` };
+  }
   /**
    * 带字幕轨的源不能这么探：探针固定写 MP4 中间段，而 MP4 装不下 subrip/ass 的流拷贝
    * （实测 `Could not find tag for codec subrip`）——探针会自己失败，把好源误判成坏源。
    * 字幕在导出路径里另有处理（抽出来重排），与接缝问题无关，直接跳过探测。
    */
-  if ((media.subtitleCodecs || []).length) return { ...none, detail: '源带字幕轨，跳过探测（不影响接缝判断）' };
+  if ((media.subtitleCodecs || []).length) {
+    /* 已知限制（写进 detail 便于对账）：这类源探不了，只能按安全处理。 */
+    return { ...none, detail: '源带字幕轨，跳过接缝探测（未验证，按安全处理）' };
+  }
 
   const t0 = Date.now();
-  const usable = kfs.slice(0, Math.max(1, kfs.length - 1));
-  const step = Math.max(1, Math.floor(usable.length / (picks + 1)));
-  const starts = [];
-  for (let i = 1; i <= picks; i++) {
-    const k = usable[Math.min(usable.length - 1, i * step)];
-    if (Number.isFinite(k) && k + 0.4 < dur) starts.push(snap(k));
+  /**
+   * 采样起点：从所有关键帧里挑 picks 个**互不相同**的位置（2026-11-03 修）。
+   *
+   * 旧算法 `kfs.slice(0, n-1)` 配 `Math.floor(len/(picks+1))`，在关键帧少的短素材上会退化：
+   * 3 个关键帧（[0,4,8]）时 usable=[0,4]、step=1，三次取样全落在 usable[1]=4，
+   * 去重后只剩 1 个点 → 直接"跳过"。结果是这类素材**从来没被真正探过**，
+   * 兜底等于不存在（实测 tmp/smoke-hevc-gop4.mp4 正是这种形状，探针 5 次都是 0 秒跳过）。
+   */
+  const cand = [...new Set(kfs.filter((k) => Number.isFinite(k) && k + 0.4 < dur))];
+  let starts = cand;
+  if (cand.length > picks) {
+    const idx = [];
+    for (let i = 0; i < picks; i++) idx.push(Math.round(((i + 1) * (cand.length - 1)) / picks));
+    starts = [...new Set(idx.map((n) => cand[n]))];
   }
-  const uniq = [...new Set(starts)];
-  if (uniq.length < 2) return { ...none, detail: '可采样点不足 2 个，跳过' };
+  if (starts.length < 2) {
+    /**
+     * 连两个不同的起点都凑不出 → **无法验证**接缝。
+     * 这里绝不能返回 safe=true：那等于静默跳过缓解，可能交出解不开的产物
+     * （与 2026-10-17"样段切不出来不得判安全"同一条教训）。
+     * segmentsOk 仍留 true——"没测出来"不构成"单段就坏"的证据，
+     * 所以只要求接缝缓解，不升级成整段重编码。
+     */
+    return {
+      safe: false, segmentsOk: true, concatOk: false, segs: 0, ms: 0,
+      detail: `可采样起点只有 ${starts.length} 个，无法验证接缝：按"不安全"处理`,
+    };
+  }
 
   let tmpDir;
   try {
@@ -1039,9 +1067,9 @@ async function probePureCopySeams(loaded, opts = {}) {
     const parts = [];
     let segBad = '';
     let cutFail = '';
-    for (let i = 0; i < uniq.length; i++) {
+    for (let i = 0; i < starts.length; i++) {
       // 单条区间走吸附模式 → 拿到真实的纯拷贝计划项（含 frames），再只取拷贝段
-      const { plan } = planFor(loaded, [{ start: uniq[i] + 0.4, end: Math.min(uniq[i] + 0.4 + segSec, dur - 0.05) }],
+      const { plan } = planFor(loaded, [{ start: starts[i] + 0.4, end: Math.min(starts[i] + 0.4 + segSec, dur - 0.05) }],
         { precise: false });
       const copy = plan.find((p) => p.kind === 'copy');
       if (!copy || !(copy.duration > 0.3)) continue;

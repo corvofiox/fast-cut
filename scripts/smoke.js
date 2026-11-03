@@ -11,8 +11,8 @@ const path = require('path');
 const { execFileSync } = require('child_process');
 const { app, BrowserWindow } = require('electron');
 
-const { registerIpc } = require('../src/main/api');
-const { resolveBin } = require('../core/ffmpegPath');
+const { registerIpc, state } = require('../src/main/api');
+const { resolveBin, ffmpegPath } = require('../core/ffmpegPath');
 
 // J/K/L 要真的播起来才有速率可查
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -20,6 +20,18 @@ app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 const ROOT = path.join(__dirname, '..');
 const SRC = path.resolve(process.argv[2] || path.join(ROOT, 'tmp/t10.mp4'));
 const OUT_DIR = path.join(ROOT, 'tmp', 'smoke');
+
+/**
+ * 自检必须用**随包那份** ffmpeg 判分（2026-11-03）。
+ *
+ * 起因：本机 `D:\Software\ffmpeg\bin` 在 11-03 02:56 换上了 ffmpeg 9.0.2 的构建，
+ * 而 core/ffmpegPath 的 COMMON_DIRS 把它排在随包版之前。同一份产物：
+ *   随包版（N-113109）→ 只有 "non monotonically increasing dts"（自检白名单里的无害噪音）→ 通过；
+ *   9.0.2            → "Could not find ref with POC 116" → 失败。
+ * 判分标准会随"这台机器上装了哪个 ffmpeg"而变，绿灯就不可信了。这里钉死随包版，
+ * 并在日志头打印版本——哪天换了二进制，日志里一眼能看出来。
+ */
+process.env.FAST_CUT_FFMPEG_DIR = path.join(ROOT, 'vendor', 'ffmpeg');
 
 const failures = [];
 const steps = [];
@@ -31,6 +43,30 @@ function check(name, ok, detail) {
 }
 
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * 把这次导出的"计划形状"和"接缝探针结论"记进日志（2026-11-03）。
+ *
+ * 起因：HEVC 那项自检曾经连着通过 24 次、后来稳定失败，而日志只记 ✓/✗，
+ * 事后完全无法判断当时走的是哪条路径（整段重编码还是拷贝尾），只能考古。
+ * 这两个值决定了产物会不会有接缝，必须随结果一起留档。
+ */
+async function planShape(win) {
+  return js(win, 'JSON.stringify(((__smoke.state.plan && __smoke.state.plan.plan) || []).map((p) => p.kind + ":" + p.start.toFixed(2)))');
+}
+
+/** 主进程侧的探针结论：探针有没有真的跑、判成什么。 */
+function probeOf(file) {
+  try {
+    const hit = state.loaded.get(path.resolve(file));
+    const m = hit && hit.media;
+    if (!m) return '探针=无记录';
+    const p = m.seamProbe || {};
+    return `hasRasl=${m.hasRasl} segmentsOk=${m.segmentsOk} seamSafe=${m.seamSafe}`
+      + (p.detail ? ` 探针=${p.detail}` : (p.segs != null ? ` 探针segs=${p.segs}` : ''));
+  } catch (e) { return '探针=读取失败：' + (e && e.message); }
+}
+
 
 async function waitFor(code, win, timeoutMs = 15000) {
   const until = Date.now() + timeoutMs;
@@ -173,6 +209,20 @@ const HELPERS = `
 async function main() {
   fs.rmSync(OUT_DIR, { recursive: true, force: true });
   fs.mkdirSync(OUT_DIR, { recursive: true });
+
+  /**
+   * 判分用的二进制必须写进日志（2026-11-03）：判分标准换了人，绿灯就不可信了。
+   * 这里同时把版本记下来，并与"自检自己的解码命令"对齐，避免两边不是同一个 exe。
+   */
+  {
+    const exe = ffmpegPath();
+    let ver = '未知';
+    try {
+      ver = String(execFileSync(exe, ['-version'], { encoding: 'utf8' })).split('\n')[0].trim();
+    } catch { /* 版本取不到不算失败 */ }
+    steps.push(`· 自检用 ffmpeg：${exe}`);
+    steps.push(`· ${ver}`);
+  }
 
   const win = new BrowserWindow({
     width: 1320, height: 860, show: true, frame: false,   // 与正式版一致：自绘标题栏
@@ -1171,7 +1221,8 @@ async function main() {
   await js(win, `__smoke.setOut(${JSON.stringify(OUT_DIR)}, 'hevc-precise'); 'ok'`);
   await wait(300);
   res = await runExport(win);
-  check('HEVC 精确模式（入点在 GOP 中间、拷到源尾）通过自检', res.ok, res.detail);
+  check('HEVC 精确模式（入点在 GOP 中间、拷到源尾）通过自检', res.ok,
+    `${res.detail} · 计划 ${await planShape(win)} · ${probeOf(hevcSrc)}`);
 
   // 15-multi) 追加导入 + 跨素材拼接（2026-10-18）
   // 这一步覆盖的是"两份参数不同的素材拼成一个文件"，以及"参数不一致时先拦、选了编码才放行"。
